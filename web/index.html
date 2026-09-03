@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SRC 渗透 Agent · 控制台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>SRC 渗透 Agent</h1>
+  <div class="status" id="status">正在加载…</div>
+</header>
+
+<main>
+  <!-- 左：项目 / 工具箱 -->
+  <section class="panel">
+    <div class="tabs">
+      <div class="tab active" data-tab="proj">项目</div>
+      <div class="tab" data-tab="tools">工具箱</div>
+    </div>
+
+    <div id="tab-proj" style="display:flex;flex-direction:column;min-height:0;flex:1;">
+      <div class="panel-body" style="flex:1;" id="projectList"></div>
+      <div style="padding:10px;border-top:1px solid var(--border);flex-shrink:0;">
+        <div class="row"><input id="pName" placeholder="项目名称，如：补天-XX厂商"></div>
+        <div class="row"><input id="pTarget" placeholder="目标：企业名 / 域名"></div>
+        <button class="primary" style="width:100%" onclick="createProject()">新建项目</button>
+      </div>
+    </div>
+
+    <div id="tab-tools" style="display:none;flex-direction:column;min-height:0;flex:1;">
+      <div class="tool-search">
+        <input id="toolSearch" placeholder="搜索工具…" oninput="renderTools()">
+        <select id="toolKind" onchange="renderTools()" style="width:100%;margin-top:6px;">
+          <option value="launchable">本地工具（点击启动）</option>
+          <option value="scriptable">可编排工具（Agent 自动调用）</option>
+          <option value="web">网页工具</option>
+          <option value="all">全部</option>
+        </select>
+      </div>
+      <div class="panel-body" id="toolList"></div>
+    </div>
+  </section>
+
+  <!-- 中：任务与输出 -->
+  <section class="center">
+    <div class="panel steps">
+      <div class="panel-head">执行计划 <span class="badge" id="stepCount">0 步</span></div>
+      <div class="panel-body" id="stepList"><div class="empty">尚未执行任务</div></div>
+    </div>
+
+    <div id="confirmBox"></div>
+
+    <div class="panel" style="flex:1;">
+      <div class="panel-head">实时输出</div>
+      <div class="panel-body" style="padding:0;">
+        <div class="log" id="log" style="border-radius:0;border:none;height:100%;">等待任务…</div>
+      </div>
+    </div>
+
+    <div class="input-row">
+      <select id="modelSelect" onchange="switchModel(this.value)"
+              title="选择决策模型：本地 / 云端" style="flex:0 0 auto;max-width:220px;"></select>
+      <input id="taskInput" placeholder="例如：对 example.com 做信息收集与指纹识别"
+             onkeydown="if(event.key==='Enter')sendTask()">
+      <button class="primary" id="sendBtn" onclick="sendTask()">执行</button>
+    </div>
+  </section>
+
+  <!-- 右：漏洞与报告 -->
+  <section class="panel">
+    <div class="panel-head">
+      漏洞发现
+      <button class="sm" onclick="toggleFindingForm()">+ 添加</button>
+    </div>
+    <div id="findingForm" style="display:none;padding:10px;border-bottom:1px solid var(--border);flex-shrink:0;">
+      <div class="row"><input id="fTitle" placeholder="漏洞名称"></div>
+      <div class="row">
+        <select id="fSev"><option>高危</option><option>中危</option><option>低危</option><option>严重</option><option>信息</option></select>
+        <input id="fTarget" placeholder="影响目标">
+      </div>
+      <textarea id="fDetail" placeholder="漏洞描述"></textarea>
+      <textarea id="fEvidence" placeholder="复现步骤 / 回显证据" style="margin-top:6px;"></textarea>
+      <button class="primary" style="width:100%;margin-top:6px;" onclick="addFinding()">保存</button>
+    </div>
+    <div class="panel-body" id="findingList"><div class="empty">暂无记录</div></div>
+    <div style="padding:10px;border-top:1px solid var(--border);flex-shrink:0;display:flex;gap:6px;">
+      <button style="flex:1" onclick="viewReport()">查看报告</button>
+      <button class="primary" style="flex:1" onclick="exportReport()">导出</button>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

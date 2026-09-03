@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 运行时数据库
+*.db
+*.sqlite3
+*.sqlite
+
+# 日志与运行输出
+*.log
+*.out
+
+# 测试 / 探测临时产物（不要入库）
+probe_result.txt
+*_test_log.txt
+api_auth_test_results.json
+*.tmp
+
+# 本机个人配置 / 密钥模板 / 运行时状态 / 备份（不要入库）
+config.yaml
+data/runtime.json
+*.bak
