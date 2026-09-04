@@ -37,7 +37,21 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
-DEFAULT_BACKEND = "ollama"  # ollama | deepseek
+# 通用 Anthropic 兼容通道（claude code 系 / GLM 等任意 Anthropic 兼容端点）。
+# 优先从个人配置文件（%USERPROFILE%\.llm_anthropic.json，由控制台「设置」写入）读取，
+# 环境变量仅作兜底 seed，命名对齐 tinyctfer：ANTHROPIC_BASE_URL / AUTH_TOKEN / MODEL。
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "")
+ANTHROPIC_AUTH_TOKEN = os.getenv("ANTHROPIC_AUTH_TOKEN", "")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "")
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-5"  # 端点若不支持可在设置里改
+
+# ---------- 个人密钥目录（%USERPROFILE%，不进项目仓库） ----------
+USER_HOME = Path(os.environ.get("USERPROFILE", str(Path.home())))
+DEEPSEEK_KEY_FILE = USER_HOME / ".deepseek_api_key"      # 一行 Key（旧版，已被 providers 迁移接管）
+LLM_ANTHROPIC_FILE = USER_HOME / ".llm_anthropic.json"   # {"base_url","api_key","model"}（旧版，同上）
+LLM_PROVIDERS_FILE = USER_HOME / ".src_agent_llm.json"   # 通用供应商配置（现行）
+
+DEFAULT_BACKEND = "ollama"  # 供应商 id；可选 ollama / deepseek / anthropic / 任意自定义 id
 
 # ---------- 风险分级 ----------
 # L0 只读/本地分析 -> 自动执行
@@ -78,3 +92,17 @@ VULN_KEYWORDS = (
 REPLAY_MIN_INTERVAL = float(os.getenv("REPLAY_MIN_INTERVAL", "0.6"))  # 全局请求最小间隔（秒）
 REPLAY_MAX_BODY = 4000     # 回传给模型的最大响应体长度（字符）
 SCOPE_FILE = DATA_DIR / "scope.json"  # 授权域名白名单
+
+# 命令行工具执行前是否强制校验授权白名单（app/executor.py）。
+# 背景：白名单此前只在 HTTP 重放器（replayer）生效，命令行工具（executor）
+#   仅校验 target 格式、不校验目标是否在授权范围内，存在越权扫描缺口。
+# 取值：1=强制（默认，未授权目标直接拒绝执行，与重放器行为对齐）
+#       0=关闭（仅日志告警）——仅供临时排查，不建议长期关闭。
+# 注意：白名单为空时一律拒绝执行（含未配置 scope.json 的情况），
+#   宁可让工具跑不起来，也不能静默放行未授权目标。
+ENFORCE_SCOPE = os.getenv("ENFORCE_SCOPE", "1") == "1"
+
+# ---------- Python 代码执行通道（py_exec，Agent 直出代码） ----------
+PY_EXEC_TIMEOUT = int(os.getenv("PY_EXEC_TIMEOUT", "90"))    # 单段代码上限（秒），超时中断
+PY_EXEC_MAX_CHARS = 6000    # 单段代码最大字符数
+PY_EXEC_DIR = DATA_DIR / "scripts" / "exec"  # 代码留档目录（按目标分子目录）

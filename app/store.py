@@ -56,8 +56,16 @@ CREATE TABLE IF NOT EXISTS intel (
     data        TEXT,
     updated_at  REAL
 );
+CREATE TABLE IF NOT EXISTS facts (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT,
+    content     TEXT,
+    source      TEXT,
+    created_at  REAL
+);
 CREATE INDEX IF NOT EXISTS idx_steps_session ON steps(session_id);
 CREATE INDEX IF NOT EXISTS idx_findings_project ON findings(project_id);
+CREATE INDEX IF NOT EXISTS idx_facts_project ON facts(project_id);
 """
 
 
@@ -70,6 +78,9 @@ def _conn() -> sqlite3.Connection:
 def init_db() -> None:
     with _conn() as c:
         c.executescript(SCHEMA)
+        # 服务重启后内存里的 running 会话已丢，落库的 running 状态会永远卡住，
+        # 这里统一标记为 interrupted，避免前端显示「执行中」的僵尸会话。
+        c.execute("UPDATE sessions SET state='interrupted' WHERE state='running'")
 
 
 # ---------- 项目 ----------
@@ -99,9 +110,33 @@ def get_project(pid: str) -> dict | None:
     return dict(r) if r else None
 
 
+_FIELDS = ("name", "target", "note")
+
+
+def update_project(pid: str, **fields) -> dict | None:
+    """更新项目名称/目标/备注。只接受白名单字段，且跳过未传（None）的项。
+
+    返回更新后的项目；项目不存在时返回 None。
+    """
+    patch = {k: v for k, v in fields.items() if k in _FIELDS and v is not None}
+    if not patch:
+        return get_project(pid)
+    sets = ", ".join(f"{k}=?" for k in patch)
+    with _conn() as c:
+        cur = c.execute(f"UPDATE projects SET {sets} WHERE id=?", (*patch.values(), pid))
+        if cur.rowcount == 0:
+            return None
+    return get_project(pid)
+
+
 def delete_project(pid: str) -> bool:
     with _conn() as c:
+        cur = c.execute("DELETE FROM projects WHERE id=?", (pid,))
+        if cur.rowcount == 0:
+            return False
         c.execute("DELETE FROM findings WHERE project_id=?", (pid,))
+        c.execute("DELETE FROM facts WHERE project_id=?", (pid,))
+        c.execute("DELETE FROM intel WHERE project_id=?", (pid,))
         c.execute("DELETE FROM steps WHERE session_id IN (SELECT id FROM sessions WHERE project_id=?)", (pid,))
         c.execute("DELETE FROM sessions WHERE project_id=?", (pid,))
         c.execute("DELETE FROM projects WHERE id=?", (pid,))
@@ -190,6 +225,36 @@ def list_findings(project_id: str) -> list[dict]:
 def delete_finding(fid: str) -> bool:
     with _conn() as c:
         c.execute("DELETE FROM findings WHERE id=?", (fid,))
+    return True
+
+
+# ---------- 已证客观事实（facts） ----------
+def add_fact(project_id: str, content: str, source: str = "manual") -> dict:
+    """记录一条「已证实的客观事实」（凭据/漏洞/敏感路径等）。source: manual | agent。"""
+    content = content.strip()
+    if not content:
+        return {}
+    fid = uuid.uuid4().hex[:12]
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO facts (id,project_id,content,source,created_at) VALUES (?,?,?,?,?)",
+            (fid, project_id, content, source, time.time()),
+        )
+    return {"id": fid, "project_id": project_id, "content": content, "source": source,
+            "created_at": time.time()}
+
+
+def list_facts(project_id: str) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM facts WHERE project_id=? ORDER BY created_at DESC", (project_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_fact(fid: str) -> bool:
+    with _conn() as c:
+        c.execute("DELETE FROM facts WHERE id=?", (fid,))
     return True
 
 

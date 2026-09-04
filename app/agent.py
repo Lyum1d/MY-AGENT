@@ -17,10 +17,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import config, store
+from . import pyexec
 from . import replayer
 from .executor import executor
 from .intel import format_intel, update_intel_from_steps
-from .llm import get_backend, parse_tool_arguments
+from .llm import auto_route_candidate, get_backend, parse_tool_arguments
 from .registry import registry
 
 logger = logging.getLogger(__name__)
@@ -32,11 +33,22 @@ SYSTEM_PROMPT = """你是一个渗透测试编排助手，服务于 SRC（安全
 1. 一步一动：每次只选择「一个」最合适的工具执行，不要一次列出全部计划。
 2. 先看结果再决定：收到工具输出后，基于真实结果判断下一步，不要臆测。
 3. 只使用下面工具清单中真实存在的工具，绝对不要编造工具名。
-4. 目标是企业名称时，优先用 enscan 扩展资产；拿到域名后再做子域名、指纹、漏洞检测。
-5. 如果工具执行失败或输出为空，换一个工具或调整参数，不要重复同样的失败操作。
+4. 目标是企业名称时，先用「可用清单里的」资产收集工具扩展资产（如 app_info 按名称收集 APP/资产；
+   ensan 已禁用、不要调用），拿到域名后再做子域名(oneforall)、指纹(ehole)、漏洞检测。
+   目标类型与起步工具：企业名→app_info；域名/IP/URL→先 httpx 存活探测，再 ehole 指纹。
+5. 工具失败/超时 = 「调整并重试」信号：放大超时、换参数或拆小步骤再试，不要放弃任务，
+   也不要原样重复刚失败过的同一条命令。
 6. 每一步都要简要说明你的判断依据。
 7. 每次回复必须二选一：要么调用一个工具，要么给出最终结论。
    绝不允许只描述"下一步打算做什么"而不实际调用工具。
+8. 事实纪律：只能基于真实工具输出下结论。禁止编造漏洞、凭据、flag、版本号或"疑似成功"。
+   区分「已证实的事实」与「待验证的猜测」，报告中结论只先给证据确凿的，再扩展可疑点。
+
+Web 站点渗透 SOP（不可跳步，先手工后工具）：
+① 打开页面看结构 → ② 查源码/JS/注释/接口，收集泄露信息（凭据、API、内网路径）→
+③ 逐个测正常功能（登录/搜索/上传）并留意每步请求 → ④ 确认无隐藏逻辑后才跑自动化
+工具（目录/漏洞扫描）→ ⑤ 工具无果时从「功能与逻辑」视角推断漏洞：IDOR/越权/认证绕过/
+SSTI/文件上传/命令注入/SSRF/XXE/竞态/路径穿越等。发现任何凭据或漏洞先记录存证，再继续。
 
 可用工具（别名 = 工具名 | 分类 | 风险等级 | 说明）：
 {tool_list}
@@ -80,6 +92,18 @@ def extract_target(text: str) -> str:
             continue
         return cand
     return ""
+
+
+def _is_host_like(target: str) -> bool:
+    """判断目标是否像 URL / IP / 域名（而非企业名等自由文本）。
+
+    复用 extract_target 的域名/假 TLD 规则，保证与「从消息提取目标」口径一致：
+    「test.json」这类文件扩展名会被判为 False，不会被误当域名。
+    """
+    t = (target or "").strip()
+    if not t:
+        return False
+    return extract_target(t) == t
 
 
 def validate_target(target: str) -> str | None:
@@ -231,36 +255,79 @@ class Agent:
         session.state = "running"
         session.messages.append({"role": "user", "content": user_message})
         session.target = extract_target(user_message)
+        # 项目里显式填写的「目标」优先：用户建项目时填的常是纯企业名/域名，
+        # 而任务描述往往只说「做信息收集」之类，模型从消息里识别不出目标。
+        proj = store.get_project(session.project) if session.project else None
+        proj_target = (proj.get("target") or "").strip() if proj else ""
+        if proj_target and not session.target:
+            # 项目 target 由用户在界面手填，可能混入「待定」「请提供」这类说明文字。
+            # 原先直接赋值，问题要拖到工具执行前才以「目标参数无效」的形式暴露，
+            # 打断模型决策。这里先过一遍格式校验，让它在任务开始时就失败得明明白白。
+            # 注意：这是「提前失败」，不替代下方工具执行前的 validate_target 兜底，
+            # 两处调用的是同一个函数、同一套参数，不存在任何放宽。
+            bad_proj_target = validate_target(proj_target)
+            if bad_proj_target:
+                logger.warning("项目目标未采用（%s）：%r", bad_proj_target, proj_target)
+            else:
+                session.target = proj_target
         # 立即落库，避免中途关闭页面导致整轮记录丢失
         store.save_session(session.id, session.project, user_message, session.target, "running")
         await session.emit({"type": "session_start", "session_id": session.id})
         backend = get_backend(self.backend_name)
         # 漏洞验证类任务自动路由云端：本地小模型在多步推理上明显吃力，
         # 云端模型（已验证 function calling）决策质量高一个量级。未配 Key 时自动回退。
-        if (self.backend_name is None and config.AUTO_ROUTE_VULN
-                and backend.name != "deepseek"):
-            ds = get_backend("deepseek")
-            if ds.available() and any(k in user_message.lower() for k in config.VULN_KEYWORDS):
-                backend = ds
+        # 路由目标可在「设置 → 模型供应商」里改（默认 deepseek），也可关闭自动路由。
+        if self.backend_name is None and config.AUTO_ROUTE_VULN:
+            cloud = auto_route_candidate(backend.name)
+            if cloud and any(k in user_message.lower() for k in config.VULN_KEYWORDS):
+                backend = cloud
                 await session.emit({
                     "type": "reasoning",
-                    "data": "检测到漏洞验证类任务，本次决策自动路由到云端模型（未配 Key 或"
-                            "在设置中关闭 AUTO_ROUTE_VULN 可回退本地）",
+                    "data": f"检测到漏洞验证类任务，本次决策自动路由到「{cloud.label}」"
+                            "（可在设置 → 模型供应商里关闭自动路由）",
                 })
         await session.emit({
             "type": "model",
             "data": {
                 "backend": backend.name,
                 "model": getattr(backend, "model", ""),
-                "label": "本地模型" if backend.name == "ollama" else "云端模型",
+                "label": getattr(backend, "label", backend.name),
+                "local": bool(getattr(backend, "local", backend.name == "ollama")),
             },
         })
         if session.target:
             await session.emit({"type": "target", "data": session.target})
         system = SYSTEM_PROMPT.format(tool_list=registry.alias_reference())
+        # 注入项目上下文（名称/目标/备注），让模型在首轮就明确目标，无需再向用户索要
+        if proj:
+            ctx_lines: list[str] = []
+            if proj.get("name"):
+                ctx_lines.append(f"项目名称：{proj['name']}")
+            if proj.get("target"):
+                ctx_lines.append(f"项目目标：{proj['target']}")
+            if proj.get("note"):
+                ctx_lines.append(f"项目备注：{proj['note']}")
+            if ctx_lines:
+                system += (
+                    "\n\n【当前项目上下文】\n" + "\n".join(ctx_lines) + "\n"
+                    "以上「项目目标」即本次任务的默认目标，直接使用，不要再向用户索要目标；"
+                    "若用户任务里另有更具体的域名/IP/URL，则以任务里的为准。"
+                    "目标是企业名时用可用工具（如 app_info）扩展资产，不要调用已禁用的 enscan。"
+                )
         # 注入项目情报库：历史会话沉淀的子域/API/技术栈，避免重复收集
         if session.project:
             system += format_intel(store.get_intel(session.project))
+            # 注入已证事实库（note_fact / 人工登记），已证实内容无需重复验证
+            try:
+                _facts = store.list_facts(session.project)
+                if _facts:
+                    _fl = "\n".join(f"- {f['content']}" for f in _facts[:20])
+                    system += (
+                        "\n\n【已证事实库（工具输出已证实，可直接引用、不得推翻或重复验证；"
+                        "报告中基于这些事实组织结论）】\n" + _fl
+                    )
+            except Exception:
+                logger.exception("已证事实注入失败")
         consecutive_failures = 0
 
         for step_no in range(1, config.MAX_STEPS + 1):
@@ -400,6 +467,11 @@ class Agent:
                         "data": f"工具名 `{alias}` 不存在，已自动纠正为 `{tool.alias}`（{tool.name}）",
                     })
 
+                # ---- 内置 note_fact：记录已证事实（不进执行计划/不走风险闸门）----
+                if tool.alias == "note_fact":
+                    await self._note_fact(session, tc, target, args)
+                    continue
+
                 # ---- 校验目标（模型会把中文句子当目标传入） ----
                 bad_target = validate_target(target)
                 if bad_target:
@@ -472,16 +544,41 @@ class Agent:
         except Exception:
             logger.exception("项目情报沉淀失败")
 
+    # ---------- 已证事实记录 ----------
+    async def _note_fact(self, session: Session, tc: dict, target: str, args: str) -> None:
+        """note_fact 内置工具执行：写入项目事实库并回馈模型。"""
+        content = (args or "").strip() or (target or "").strip()
+        if not session.project:
+            note = "当前会话未关联项目，无法保存事实。请先创建/选择项目后再执行。"
+        elif not content:
+            note = "事实内容为空：args 应填要记录的事实正文（一句一事）。"
+        else:
+            try:
+                rec = store.add_fact(session.project, content[:500], source="agent")
+                note = f"已记录已证事实 #{rec.get('id','')}：{content[:120]}"
+            except Exception as e:
+                note = f"记录事实失败：{e}"
+        session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
+        await session.emit({"type": "reasoning", "data": f"（{note}）"})
+
     # ---------- 防呆提醒 ----------
     @staticmethod
     def _build_reminder(session: Session) -> str:
         """每轮注入目标 + 已尝试工具，抑制「遗忘目标」与「重复调同一失败工具」。"""
         parts: list[str] = []
         if session.target:
+            if _is_host_like(session.target):
+                note = (f"所有工具的 target 参数都必须填 `{session.target}`，"
+                        f"除非用户明确要求更换目标。")
+            else:
+                # 企业名（如「腾讯」）不能直接当扫描工具的目标
+                note = (f"`{session.target}` 看起来是企业名称而非域名/IP。"
+                        f"请先用可用工具（如 app_info 按名称收集 APP/资产）扩展出域名，"
+                        f"拿到域名后再把域名作为 target 使用其余工具；"
+                        f"不要把企业名直接塞进扫描/探测类工具的 target，也不要调用已禁用的 enscan。")
             parts.append(
-                f"\n\n【本次任务目标：{session.target}】\n"
-                f"所有工具的 target 参数都必须填 `{session.target}`，"
-                f"除非用户明确要求更换目标。不要向用户索要目标，也不要把说明文字填进 target。"
+                f"\n\n【本次任务目标：{session.target}】\n{note}"
+                f"不要向用户索要目标，也不要把说明文字填进 target。"
             )
         if session.steps:
             tried: dict[str, list[str]] = {}
@@ -531,6 +628,8 @@ class Agent:
             gen = replayer.run_replay(step.target, step.args)
         elif tool.alias == "nuclei_cli":
             gen = replayer.run_nuclei(tool, step.target, step.args)
+        elif tool.alias == "py_exec":
+            gen = pyexec.run_py_exec(step.args, step.target)
         else:
             gen = executor.run(tool, step.target, step.args)
         async for ev in gen:

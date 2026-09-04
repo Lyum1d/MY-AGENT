@@ -25,3 +25,8 @@ api_auth_test_results.json
 config.yaml
 data/runtime.json
 *.bak
+
+# Python 代码执行通道留档（py_exec）
+# 每段执行过的代码按 data/scripts/exec/<目标域名>/exec_<时间戳>.py 留档，
+# 目录名本身即目标、代码内可能含 payload/凭据。仓库为 public，必须排除。
+data/scripts/

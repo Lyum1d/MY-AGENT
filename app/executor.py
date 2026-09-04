@@ -20,9 +20,87 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import AsyncIterator
+from urllib.parse import urlparse
 
 from . import config
 from .registry import Tool
+
+
+# ---------- 授权范围（白名单）校验 ----------
+# 背景：data/scope.json 的白名单此前只在 HTTP 重放器（app/replayer.py）强制生效，
+# 命令行工具（本模块的 LocalExecutor）执行前只校验 target 格式是否像域名/IP，
+# 并不校验该目标是否在授权范围内——即「格式合法但未授权」的目标会被直接扫描。
+# 这里补上执行前的白名单比对，与重放器共用同一份 data/scope.json。
+#
+# 设计取舍：
+#   · 白名单为空（含 scope.json 不存在）一律拒绝执行，而不是放行。
+#     放行会让这道校验形同虚设；拒绝则强制使用者先明确授权范围。
+#   · 不擅自创建默认 scope.json：重放器在未配置时会写入 example.com 兜底，
+#     那是「HTTP 请求」场景的既有行为；命令行场景若静默写入默认域名，
+#     反而可能让人误以为自己已配置授权。故此处只读取、不写文件。
+#   · 提供 config.ENFORCE_SCOPE（环境变量 ENFORCE_SCOPE=0）用于临时排查，
+#     默认强制开启。
+def _load_scope() -> list[str]:
+    """读取授权白名单。文件缺失或解析失败返回空列表（由调用方决定放行/拒绝）。"""
+    p = config.SCOPE_FILE
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    domains = data.get("domains", [])
+    if not isinstance(domains, list):
+        return []
+    return [d.strip().lower() for d in domains if isinstance(d, str) and d.strip()]
+
+
+def _target_host(target: str) -> str:
+    """从 target 提取主机名：去协议、端口、路径、查询串与凭据。
+
+    支持 URL / 纯域名 / IPv4 三种形态。无法解析时回退为去掉端口的原文，
+    保证「解析不出来」不会变成「绕过校验」——回退值照样要过白名单。
+    """
+    t = (target or "").strip().lower()
+    if not t:
+        return ""
+    if "://" not in t:
+        t = "http://" + t
+    try:
+        host = urlparse(t).hostname or ""
+    except Exception:
+        host = ""
+    if host:
+        return host
+    # 解析失败：至少去掉端口，避免 "example.com:8080" 这类绕过精确匹配
+    return t.split("/", 1)[0].split("@")[-1].split(":")[0]
+
+
+def _host_in_scope(host: str, scope: list[str]) -> bool:
+    """精确匹配或子域匹配。白名单条目可直接写 IP（IP 走精确匹配）。"""
+    if not host:
+        return False
+    for d in scope:
+        if not d:
+            continue
+        if host == d or host.endswith("." + d):
+            return True
+    return False
+
+
+def check_scope(target: str) -> str | None:
+    """校验 target 是否在授权白名单内。返回 None 表示放行，否则返回拒绝原因。"""
+    host = _target_host(target)
+    scope = _load_scope()
+    if not scope:
+        return ("授权白名单为空（data/scope.json 未配置或解析失败），已拒绝执行。"
+                "请先在 data/scope.json 的 domains 中填写已获书面授权的目标，"
+                "或设置环境变量 ENFORCE_SCOPE=0 临时关闭本校验（不建议）。")
+    if not _host_in_scope(host, scope):
+        return (f"目标「{host or target}」不在授权白名单内，已拒绝执行。"
+                f"当前白名单：{', '.join(scope)}。"
+                f"新增授权目标请编辑 data/scope.json。")
+    return None
 
 
 def load_templates() -> dict[str, dict]:
@@ -275,6 +353,17 @@ class LocalExecutor(Executor):
 
     # ---------- 执行 ----------
     async def run(self, tool: Tool, target: str, args: str = "") -> AsyncIterator[dict]:
+        # ---- 授权范围校验（执行前最后一道闸门）----
+        # 命令行工具此前只校验 target 格式、不校验是否授权，
+        # 配合「项目 target 自动注入」后目标来源变多，越权路径更短，故在此兜底。
+        # 开关见 config.ENFORCE_SCOPE；白名单与 HTTP 重放器共用 data/scope.json。
+        if config.ENFORCE_SCOPE:
+            denied = check_scope(target)
+            if denied:
+                yield {"type": "error", "data": denied}
+                yield {"type": "exit", "code": 126}  # 126 = 命令不可执行（约定沿用 shell 语义）
+                return
+
         if not tool.executable:
             yield {"type": "error", "data": f"工具文件不存在：{tool.name}（{tool.rel_path}）"}
             return

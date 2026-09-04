@@ -5,35 +5,44 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SRC 渗透 Agent · 控制台</title>
 <link rel="stylesheet" href="/static/style.css">
+<script>try{document.documentElement.setAttribute('data-theme', localStorage.getItem('src_theme')||'dark');}catch(e){document.documentElement.setAttribute('data-theme','dark');}</script>
 </head>
 <body>
+<div class="app">
 
-<header>
-  <h1>SRC 渗透 Agent</h1>
-  <div class="status" id="status">正在加载…</div>
-</header>
+  <!-- ============ 左侧边栏 ============ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">🛡</div>
+      <div class="brand-text">
+        <div class="brand-name">SRC Agent</div>
+        <div class="brand-sub">渗透测试编排</div>
+      </div>
+    </div>
 
-<main>
-  <!-- 左：项目 / 工具箱 -->
-  <section class="panel">
+    <div class="side-section">
+      <label class="side-label">决策模型</label>
+      <select id="modelSelect" onchange="switchModel(this.value)" title="选择决策模型"></select>
+    </div>
+
     <div class="tabs">
       <div class="tab active" data-tab="proj">项目</div>
       <div class="tab" data-tab="tools">工具箱</div>
     </div>
 
-    <div id="tab-proj" style="display:flex;flex-direction:column;min-height:0;flex:1;">
-      <div class="panel-body" style="flex:1;" id="projectList"></div>
-      <div style="padding:10px;border-top:1px solid var(--border);flex-shrink:0;">
-        <div class="row"><input id="pName" placeholder="项目名称，如：补天-XX厂商"></div>
-        <div class="row"><input id="pTarget" placeholder="目标：企业名 / 域名"></div>
-        <button class="primary" style="width:100%" onclick="createProject()">新建项目</button>
+    <div id="tab-proj" class="tab-pane">
+      <div class="panel-body" id="projectList"></div>
+      <div class="new-proj">
+        <input id="pName" placeholder="项目名称，如：补天-XX厂商">
+        <input id="pTarget" placeholder="目标：企业名 / 域名">
+        <button class="primary" onclick="createProject()">+ 新建项目</button>
       </div>
     </div>
 
-    <div id="tab-tools" style="display:none;flex-direction:column;min-height:0;flex:1;">
+    <div id="tab-tools" class="tab-pane" style="display:none;">
       <div class="tool-search">
         <input id="toolSearch" placeholder="搜索工具…" oninput="renderTools()">
-        <select id="toolKind" onchange="renderTools()" style="width:100%;margin-top:6px;">
+        <select id="toolKind" onchange="renderTools()">
           <option value="launchable">本地工具（点击启动）</option>
           <option value="scriptable">可编排工具（Agent 自动调用）</option>
           <option value="web">网页工具</option>
@@ -42,56 +51,141 @@
       </div>
       <div class="panel-body" id="toolList"></div>
     </div>
-  </section>
 
-  <!-- 中：任务与输出 -->
-  <section class="center">
-    <div class="panel steps">
-      <div class="panel-head">执行计划 <span class="badge" id="stepCount">0 步</span></div>
-      <div class="panel-body" id="stepList"><div class="empty">尚未执行任务</div></div>
+    <div class="side-foot">
+      <button class="ghost" onclick="openSettings()">⚙ 模型供应商设置</button>
+    </div>
+  </aside>
+
+  <!-- ============ 主聊天区 ============ -->
+  <main class="chat">
+    <header class="chat-head">
+      <div class="project-info">
+        <span class="p-name" id="currentProjectName">未选择项目</span>
+        <span class="p-target" id="currentProjectTarget"></span>
+      </div>
+      <div class="status" id="status"></div>
+      <button class="ghost icon-btn" id="themeToggle" onclick="toggleTheme()" title="切换亮/暗主题">🌙</button>
+      <button class="ghost" id="toggleRightBtn" onclick="toggleRight()">报告 ▸</button>
+    </header>
+
+    <div class="messages" id="messages">
+      <div class="welcome" id="welcome">
+        <div class="welcome-logo">🛡</div>
+        <div class="welcome-title">SRC 渗透测试编排助手</div>
+        <div class="welcome-sub">先建一个「项目」并填写目标，然后描述你的任务，我会自动调度工具箱执行。</div>
+        <div class="welcome-hints">
+          <span>目标：企业名 / 域名 / IP</span>
+          <span>风险 L0-L3 分级确认</span>
+          <span>支持任意 OpenAI 兼容 / Anthropic 模型</span>
+        </div>
+      </div>
     </div>
 
     <div id="confirmBox"></div>
 
-    <div class="panel" style="flex:1;">
-      <div class="panel-head">实时输出</div>
-      <div class="panel-body" style="padding:0;">
-        <div class="log" id="log" style="border-radius:0;border:none;height:100%;">等待任务…</div>
-      </div>
+    <div class="input-bar">
+      <textarea id="taskInput" rows="1" placeholder="描述任务，例如：对目标做信息收集与指纹识别（Enter 发送，Shift+Enter 换行）"
+        onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault();sendTask();}"></textarea>
+      <button class="primary send" id="sendBtn" onclick="sendTask()">发送</button>
     </div>
+  </main>
 
-    <div class="input-row">
-      <select id="modelSelect" onchange="switchModel(this.value)"
-              title="选择决策模型：本地 / 云端" style="flex:0 0 auto;max-width:220px;"></select>
-      <input id="taskInput" placeholder="例如：对 example.com 做信息收集与指纹识别"
-             onkeydown="if(event.key==='Enter')sendTask()">
-      <button class="primary" id="sendBtn" onclick="sendTask()">执行</button>
-    </div>
-  </section>
-
-  <!-- 右：漏洞与报告 -->
-  <section class="panel">
+  <!-- ============ 右侧面板（可折叠） ============ -->
+  <aside class="right" id="rightPanel">
     <div class="panel-head">
       漏洞发现
-      <button class="sm" onclick="toggleFindingForm()">+ 添加</button>
+      <button class="mini" onclick="toggleFindingForm()">+ 添加</button>
     </div>
-    <div id="findingForm" style="display:none;padding:10px;border-bottom:1px solid var(--border);flex-shrink:0;">
-      <div class="row"><input id="fTitle" placeholder="漏洞名称"></div>
+    <div id="findingForm" class="form-card" style="display:none;">
+      <input id="fTitle" placeholder="漏洞名称">
       <div class="row">
         <select id="fSev"><option>高危</option><option>中危</option><option>低危</option><option>严重</option><option>信息</option></select>
         <input id="fTarget" placeholder="影响目标">
       </div>
       <textarea id="fDetail" placeholder="漏洞描述"></textarea>
-      <textarea id="fEvidence" placeholder="复现步骤 / 回显证据" style="margin-top:6px;"></textarea>
-      <button class="primary" style="width:100%;margin-top:6px;" onclick="addFinding()">保存</button>
+      <textarea id="fEvidence" placeholder="复现步骤 / 回显证据"></textarea>
+      <button class="primary" onclick="addFinding()">保存</button>
     </div>
     <div class="panel-body" id="findingList"><div class="empty">暂无记录</div></div>
-    <div style="padding:10px;border-top:1px solid var(--border);flex-shrink:0;display:flex;gap:6px;">
-      <button style="flex:1" onclick="viewReport()">查看报告</button>
-      <button class="primary" style="flex:1" onclick="exportReport()">导出</button>
+
+    <div class="panel-head">
+      已证事实 <span class="badge" id="factCount">0</span>
+      <button class="mini" onclick="toggleFactForm()">+ 记录</button>
     </div>
-  </section>
-</main>
+    <div id="factForm" class="form-card" style="display:none;">
+      <textarea id="factContent" placeholder="客观事实，一句一事（凭据/漏洞点/敏感路径等），仅记录已证实内容"></textarea>
+      <button class="primary" onclick="addFact()">保存事实</button>
+    </div>
+    <div class="panel-body" id="factList"><div class="empty">暂无已证事实</div></div>
+
+    <div class="report-bar">
+      <button class="ghost" onclick="viewReport()">查看报告</button>
+      <button class="primary" onclick="exportReport()">导出报告</button>
+    </div>
+  </aside>
+
+</div>
+
+<!-- ============ 设置 · 通用 LLM 供应商管理 ============ -->
+<div id="settingsModal" class="modal-mask">
+  <div class="modal">
+    <div class="modal-head">
+      <b>模型设置 · 通用 LLM 接入</b>
+      <button class="sm" onclick="closeSettings()">关闭</button>
+    </div>
+
+    <div class="modal-tip">
+      任何 <b>OpenAI 兼容端点</b>（/chat/completions）与 <b>Anthropic 原生端点</b>（/v1/messages）都能接入：
+      填 Base URL + API Key + 模型名即可。配置保存在个人目录 <code id="storeFileTip">%USERPROFILE%\.src_agent_llm.json</code>，
+      不进项目仓库；保存后无需重启服务。
+    </div>
+
+    <div class="prov-bar">
+      <select id="presetSelect" style="flex:1;"></select>
+      <button onclick="addFromPreset()">+ 从模板添加</button>
+      <button class="primary" onclick="openProviderForm('')">+ 自定义</button>
+    </div>
+
+    <div id="providerList" class="prov-list"><div class="empty">加载中…</div></div>
+
+    <div class="prov-route">
+      <label><input type="checkbox" id="autoRouteChk" onchange="saveAutoRoute()">
+        漏洞验证类任务自动路由到云端</label>
+      <select id="autoRouteSel" onchange="saveAutoRoute()" style="max-width:220px;"></select>
+    </div>
+
+    <!-- 编辑表单 -->
+    <div id="providerForm" style="display:none;border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px;">
+      <div class="row">
+        <input id="pfName" placeholder="供应商名称，如：通义千问">
+        <select id="pfType" onchange="onProviderTypeChange()" style="max-width:150px;">
+          <option value="openai">OpenAI 兼容</option>
+          <option value="anthropic">Anthropic 原生</option>
+        </select>
+      </div>
+      <div class="row"><input id="pfBase" placeholder="Base URL，如 https://api.deepseek.com/v1"></div>
+      <div class="row"><input id="pfKey" type="password" placeholder="API Key（留空 = 不修改已有密钥）"></div>
+      <div class="row">
+        <input id="pfModel" placeholder="模型名，如 deepseek-chat">
+        <button style="max-width:120px;" onclick="fetchProviderModels()">拉取模型</button>
+      </div>
+      <select id="pfModelPick" style="display:none;width:100%;margin-bottom:8px;"
+              onchange="if(this.value)$('pfModel').value=this.value"></select>
+      <div class="row" style="flex-wrap:wrap;gap:12px;">
+        <label class="chk"><input type="checkbox" id="pfThinking"> 本地思考模式（Ollama 必开）</label>
+        <label class="chk"><input type="checkbox" id="pfLocal"> 本地部署（免 Key）</label>
+        <label class="chk"><input type="checkbox" id="pfDisabled"> 停用</label>
+        <input id="pfTimeout" type="number" min="30" max="1200" placeholder="超时(秒)" style="max-width:120px;">
+      </div>
+      <div style="display:flex;gap:8px;margin-top:4px;">
+        <button class="primary" style="flex:1;" onclick="saveProviderForm()">保存</button>
+        <button style="flex:1;" onclick="closeProviderForm()">取消</button>
+      </div>
+      <div id="pfState" class="muted" style="margin-top:6px;"></div>
+    </div>
+  </div>
+</div>
 
 <script src="/static/app.js"></script>
 </body>

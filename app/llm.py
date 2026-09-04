@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-"""模型层：本地 Ollama 为主，云端 DeepSeek 为备用通道。
+"""模型层：统一接入任意 LLM 供应商（OpenAI 兼容 / Anthropic 原生 / 本地 Ollama）。
 
-重要结论（实测）：
+供应商配置由 app/providers.py 管理（%USERPROFILE%\\.src_agent_llm.json），
+本模块只负责「拿到一份供应商配置 → 发请求 → 归一化成 {tool_calls, content}」。
+
+实测结论：
   qwen3.5:9b 在关闭思考模式时会退化成纯文本输出、不再产生 tool_calls。
-  因此 OLLAMA_THINKING 必须保持 True，不要为了省时间关掉它。
+  因此本地 Ollama 供应商的 thinking 必须保持 True，不要为了省时间关掉它。
 """
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ from typing import Any
 
 import httpx
 
-from . import config
+from . import config, providers
 
 
 class LLMBackend(ABC):
@@ -28,17 +31,64 @@ class LLMBackend(ABC):
         return True
 
 
-class OllamaBackend(LLMBackend):
-    """本地 Ollama，OpenAI 兼容接口。"""
+# ---------- URL 归一化 ----------
+def _ensure_v1(url: str) -> str:
+    """OpenAI 兼容端点统一补 /v1。
 
-    name = "ollama"
+    用户常粘贴 https://api.deepseek.com 或 http://localhost:11434，
+    而各厂商的聊天路径都要求以 /v1 结尾（LM Studio / OpenRouter 等自带 /v1 的不动）。
+    """
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return u
+    return u if u.endswith("/v1") else u + "/v1"
 
-    def __init__(self) -> None:
-        self.base_url = config.OLLAMA_BASE_URL
-        self.model = config.OLLAMA_MODEL
-        self.timeout = 300.0
 
+def _strip_v1(url: str) -> str:
+    """Anthropic 端点去掉结尾 /v1（AnthropicBackend 自己会拼 /v1/messages）。"""
+    u = (url or "").strip().rstrip("/")
+    return u[:-3] if u.endswith("/v1") else u
+
+
+class OpenAICompatBackend(LLMBackend):
+    """通用 OpenAI 兼容后端。
+
+    覆盖：OpenAI / DeepSeek / 通义千问 / GLM / Kimi / 火山方舟 / 硅基流动 /
+    混元 / 文心 / Groq / OpenRouter / Grok / Gemini(兼容层) / Mistral /
+    本地 Ollama / LM Studio / vLLM / Xinference 等一切 /chat/completions 端点。
+    """
+
+    def __init__(self, cfg: dict) -> None:
+        self.id: str = cfg.get("id", "custom")
+        self.name: str = self.id
+        self.label: str = cfg.get("name", self.id)
+        self.base_url: str = _ensure_v1(cfg.get("base_url", ""))
+        self.api_key: str = cfg.get("api_key", "")
+        self.model: str = cfg.get("model", "")
+        self.thinking: bool = bool(cfg.get("thinking"))
+        self.local: bool = bool(cfg.get("local"))
+        self.timeout: float = float(cfg.get("timeout") or 300)
+
+    # ---------- 基础能力 ----------
+    def available(self) -> bool:
+        return bool(self.base_url and self.model) and (self.local or bool(self.api_key))
+
+    def _headers(self) -> dict[str, str]:
+        h = {"Content-Type": "application/json"}
+        if self.api_key:
+            h["Authorization"] = f"Bearer {self.api_key}"
+        return h
+
+    def _endpoint(self) -> str:
+        return self.base_url + "/chat/completions"
+
+    # ---------- 聊天 ----------
     async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+        if not self.base_url or not self.model:
+            raise RuntimeError(f"供应商「{self.label}」未配置 Base URL 或模型名")
+        if not self.local and not self.api_key:
+            raise RuntimeError(f"供应商「{self.label}」未配置 API Key，请在「设置 → 模型供应商」中填写")
+
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -47,141 +97,446 @@ class OllamaBackend(LLMBackend):
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        # 思考模式必须开启：关掉后模型不再调用工具（实测结论）
-        if config.OLLAMA_THINKING:
+        # 本地小模型：关掉 thinking 会退化成纯文本、不再调工具（实测结论）
+        if self.thinking:
             payload["thinking"] = True
 
         async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-            )
+            resp = await client.post(self._endpoint(), json=payload, headers=self._headers())
             resp.raise_for_status()
             data = resp.json()
 
-        msg = data.get("choices", [{}])[0].get("message", {})
+        msg = _first_message(data)
+        content = msg.get("content") or ""
+        # 部分推理模型（DeepSeek-R1、QwQ 等）把思考过程放在 reasoning_content
+        reasoning = msg.get("reasoning_content") or ""
+        if not content and reasoning:
+            content = reasoning
         return {
-            "tool_calls": msg.get("tool_calls") or [],
-            "content": msg.get("content") or "",
+            "tool_calls": _normalize_tool_calls(msg.get("tool_calls")),
+            "content": content,
             "backend": self.name,
         }
 
+    # ---------- 健康检查 / 模型列表 ----------
     async def health(self) -> dict:
+        base = {"model": self.model, "backend": self.name}
+        if not self.available():
+            return {**base, "ok": False, "ready": False,
+                    "reason": "未配置 API Key" if not self.local else "未配置模型"}
         try:
-            async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-                r = await client.get(self.base_url.replace("/v1", "/api/tags"))
-                models = [m.get("name") for m in r.json().get("models", [])]
-            return {"ok": True, "models": models, "model": self.model,
-                    "ready": self.model in models}
+            models = await self.list_models()
+            return {**base, "ok": True, "models": models, "ready": self.model in models}
         except Exception as e:
-            return {"ok": False, "error": str(e), "model": self.model, "ready": False}
+            # 模型列表接口不通不代表聊天不通（部分网关禁用 /models），退化为仅看配置
+            return {**base, "ok": True, "models": [], "ready": True,
+                    "reason": f"模型列表不可用（{e}）"}
+
+    async def list_models(self) -> list[str]:
+        """GET /models，返回模型 id 列表。"""
+        if not self.base_url:
+            return []
+        url = self.base_url + "/models"
+        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+            r = await client.get(url, headers=self._headers())
+            r.raise_for_status()
+            data = r.json()
+        out = []
+        for m in data.get("data") or []:
+            mid = m.get("id") if isinstance(m, dict) else str(m)
+            if mid:
+                out.append(mid)
+        return sorted(out)
+
+    async def probe(self) -> dict:
+        """连通性 + 工具调用能力探测（供控制台「测试连接」用）。
+
+        两步：先发一条极短对话验证链路，再带一个工具验证 function calling。
+        """
+        result: dict[str, Any] = {"chat": False, "tools": False, "models": [],
+                                  "error": "", "hint": ""}
+        try:
+            r = await self.chat([{"role": "user", "content": "ping，回复 ok"}])
+            result["chat"] = True
+            result["reply"] = (r.get("content") or "")[:200]
+        except Exception as e:
+            result["error"] = _friendly_error(e)
+            return result
+
+        probe_tool = [{
+            "type": "function",
+            "function": {
+                "name": "echo_ping",
+                "description": "回显传入的文本",
+                "parameters": {"type": "object", "properties": {"text": {"type": "string"}},
+                               "required": ["text"]},
+            },
+        }]
+        try:
+            r2 = await self.chat([{"role": "user", "content": "请调用 echo_ping，参数 text=ok"}],
+                                 tools=probe_tool)
+            result["tools"] = bool(r2.get("tool_calls"))
+        except Exception as e:
+            result["hint"] = f"工具调用探测失败：{_friendly_error(e)}"
+        if not result["tools"] and not result["hint"]:
+            result["hint"] = "该模型未返回工具调用。若任务无法调度工具，请换用支持 function calling 的模型（如 deepseek-chat、gpt-4o、qwen-plus、glm-4.6）。"
+        try:
+            result["models"] = (await self.list_models())[:200]
+        except Exception:
+            pass
+        return result
 
 
-class DeepSeekBackend(LLMBackend):
-    """云端备用通道。未配置 API Key 时自动禁用，不影响本地运行。"""
+class OllamaBackend(OpenAICompatBackend):
+    """本地 Ollama：本质是 OpenAI 兼容端点，额外走 /api/tags 探测模型。"""
 
-    name = "deepseek"
+    def __init__(self, cfg: dict | None = None) -> None:
+        cfg = dict(cfg or {})
+        cfg.setdefault("id", "ollama")
+        cfg.setdefault("name", "本地 Ollama")
+        cfg.setdefault("base_url", config.OLLAMA_BASE_URL)
+        cfg.setdefault("model", config.OLLAMA_MODEL)
+        cfg.setdefault("thinking", config.OLLAMA_THINKING)
+        cfg.setdefault("local", True)
+        super().__init__(cfg)
 
-    def __init__(self) -> None:
-        self.api_key = config.DEEPSEEK_API_KEY
-        self.base_url = config.DEEPSEEK_BASE_URL
-        self.model = config.DEEPSEEK_MODEL
+    async def list_models(self) -> list[str]:
+        # Ollama 的 /v1 兼容层没有 /models 的完整能力，走原生 /api/tags 更准
+        root = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
+            r = await client.get(root + "/api/tags")
+            r.raise_for_status()
+            data = r.json()
+        return sorted(m.get("name", "") for m in data.get("models", []) if m.get("name"))
+
+
+class AnthropicBackend(LLMBackend):
+    """Anthropic 原生 /v1/messages 协议（Claude 官方及各类 Anthropic 兼容网关）。
+
+    把本项目 OpenAI 形态的 messages / tool_calls 与 Anthropic 的 blocks 结构互转。
+    """
+
+    _ANTHROPIC_VERSION = "2023-06-01"
+
+    def __init__(self, cfg: dict) -> None:
+        self.id: str = cfg.get("id", "anthropic")
+        self.name: str = self.id
+        self.label: str = cfg.get("name", "Anthropic 兼容端点")
+        self.base_url: str = _strip_v1(cfg.get("base_url", ""))
+        self.api_key: str = cfg.get("api_key", "")
+        self.model: str = cfg.get("model", "")
+        self.local: bool = bool(cfg.get("local"))
+        self.timeout: float = float(cfg.get("timeout") or 300)
 
     def available(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.base_url and self.api_key and self.model)
 
-    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
-        if not self.available():
-            raise RuntimeError("DeepSeek 未配置 API Key，请设置环境变量 DEEPSEEK_API_KEY")
-
-        payload: dict[str, Any] = {"model": self.model, "messages": messages}
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
+    def _headers(self) -> dict[str, str]:
+        return {
+            "x-api-key": self.api_key,
+            "anthropic-version": self._ANTHROPIC_VERSION,
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=180.0, trust_env=False) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions", json=payload, headers=headers
+
+    # ---------- 消息结构互转 ----------
+    @staticmethod
+    def _to_anthropic_messages(messages: list[dict]) -> tuple[str | None, list[dict]]:
+        """OpenAI 形态 → Anthropic 形态。返回 (system, msgs)。
+
+        - role=system 汇总为 system 参数
+        - assistant 的 tool_calls → content blocks 中的 tool_use
+        - role=tool（含 tool_call_id）→ 收拢到紧随的 user 消息 tool_result 块
+        """
+        system_parts: list[str] = []
+        out: list[dict] = []
+        tool_results: list[dict] = []
+
+        def flush_results() -> None:
+            if tool_results:
+                out.append({"role": "user", "content": tool_results.copy()})
+                tool_results.clear()
+
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content") or ""
+            if role == "system":
+                if content:
+                    system_parts.append(content)
+                continue
+            if role == "tool":
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": m.get("tool_call_id", ""),
+                    "content": str(content)[:12000],
+                })
+                continue
+            if role == "assistant":
+                flush_results()
+                blocks: list[dict] = []
+                if content:
+                    blocks.append({"type": "text", "text": content})
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function", {})
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                    except Exception:
+                        args = {"raw": fn.get("arguments", "")}
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "input": args if isinstance(args, dict) else {"value": str(args)},
+                    })
+                if blocks:
+                    out.append({"role": "assistant", "content": blocks})
+                else:
+                    out.append({"role": "assistant", "content": content or ""})
+                continue
+            flush_results()
+            if content:
+                out.append({"role": "user", "content": content})
+        flush_results()
+        system = "\n\n".join(system_parts) if system_parts else None
+        return system, out
+
+    @staticmethod
+    def _to_anthropic_tools(tools: list[dict]) -> list[dict]:
+        """OpenAI function schema → Anthropic tools（去掉 function/type 包裹）。"""
+        result = []
+        for t in tools:
+            fn = t.get("function", t)
+            result.append({
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+            })
+        return result
+
+    # ---------- chat / health ----------
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+        if not self.available():
+            raise RuntimeError(
+                f"供应商「{self.label}」未配置完整（Base URL / API Key / 模型名），"
+                "请在「设置 → 模型供应商」中补齐"
             )
+
+        system, msgs = self._to_anthropic_messages(messages)
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "messages": msgs,
+        }
+        if system:
+            payload["system"] = system
+        if tools:
+            payload["tools"] = self._to_anthropic_tools(tools)
+            payload["tool_choice"] = {"type": "auto"}
+
+        url = self.base_url.rstrip("/") + "/v1/messages"
+        async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
+            resp = await client.post(url, json=payload, headers=self._headers())
             resp.raise_for_status()
             data = resp.json()
 
-        msg = data.get("choices", [{}])[0].get("message", {})
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+        for blk in data.get("content", []):
+            if blk.get("type") == "text":
+                text_parts.append(blk.get("text", ""))
+            elif blk.get("type") == "tool_use":
+                tool_calls.append({
+                    "id": blk.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": blk.get("name", ""),
+                        "arguments": json.dumps(blk.get("input", {}), ensure_ascii=False),
+                    },
+                })
         return {
-            "tool_calls": msg.get("tool_calls") or [],
-            "content": msg.get("content") or "",
+            "tool_calls": tool_calls,
+            "content": "\n".join(text_parts),
             "backend": self.name,
         }
 
     async def health(self) -> dict:
-        # 云端不做真实探测（避免白耗 API 配额），只看 Key 是否已配置
-        return {
-            "ok": self.available(),
-            "model": self.model,
-            "ready": self.available(),
-            "reason": None if self.available() else "未配置 DEEPSEEK_API_KEY",
+        base = {"model": self.model, "backend": self.name}
+        if not self.available():
+            return {**base, "ok": False, "ready": False,
+                    "reason": "未配置 Base URL / API Key / 模型（Anthropic 兼容端点）"}
+        try:
+            url = self.base_url.rstrip("/") + "/v1/models"
+            async with httpx.AsyncClient(timeout=8.0, trust_env=False) as client:
+                r = await client.get(url, headers=self._headers())
+                r.raise_for_status()
+                data = r.json()
+            models = [m.get("id") or m.get("name") for m in (data.get("data") or []) if isinstance(m, dict)]
+            return {**base, "ok": True, "models": models, "ready": True,
+                    "reason": None if self.model in models else "模型名不在端点列表中（可能是别名，可忽略）"}
+        except Exception as e:
+            return {**base, "ok": True, "ready": True,
+                    "reason": f"端点探测失败（{_friendly_error(e)}）"}
+
+    async def list_models(self) -> list[str]:
+        url = self.base_url.rstrip("/") + "/v1/models"
+        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+            r = await client.get(url, headers=self._headers())
+            r.raise_for_status()
+            data = r.json()
+        return sorted((m.get("id") or m.get("name") or "")
+                      for m in (data.get("data") or []) if isinstance(m, dict) and (m.get("id") or m.get("name")))
+
+    async def probe(self) -> dict:
+        result: dict[str, Any] = {"chat": False, "tools": False, "models": [],
+                                  "error": "", "hint": ""}
+        try:
+            r = await self.chat([{"role": "user", "content": "ping，回复 ok"}])
+            result["chat"] = True
+            result["reply"] = (r.get("content") or "")[:200]
+        except Exception as e:
+            result["error"] = _friendly_error(e)
+            return result
+
+        probe_tool = [{
+            "type": "function",
+            "function": {
+                "name": "echo_ping",
+                "description": "回显传入的文本",
+                "parameters": {"type": "object", "properties": {"text": {"type": "string"}},
+                               "required": ["text"]},
+            },
+        }]
+        try:
+            r2 = await self.chat([{"role": "user", "content": "请调用 echo_ping，参数 text=ok"}],
+                                 tools=probe_tool)
+            result["tools"] = bool(r2.get("tool_calls"))
+        except Exception as e:
+            result["hint"] = f"工具调用探测失败：{_friendly_error(e)}"
+        try:
+            result["models"] = (await self.list_models())[:200]
+        except Exception:
+            pass
+        return result
+
+
+# ---------- 归一化辅助 ----------
+def _first_message(data: dict) -> dict:
+    """兼容各家返回结构：标准 choices[0].message，或个别网关的扁平结构。"""
+    choices = data.get("choices") or []
+    if choices:
+        return choices[0].get("message") or {}
+    if isinstance(data.get("message"), dict):
+        return data["message"]
+    return {}
+
+
+def _normalize_tool_calls(raw: Any) -> list[dict]:
+    """统一 tool_calls 结构：补全 id / type / function.arguments 为 JSON 字符串。"""
+    out: list[dict] = []
+    if not raw:
+        return out
+    if isinstance(raw, dict):
+        raw = [raw]
+    for i, tc in enumerate(raw):
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        if not fn and tc.get("name"):
+            fn = {"name": tc.get("name"), "arguments": tc.get("arguments") or tc.get("input")}
+        args = fn.get("arguments")
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args, ensure_ascii=False)
+        out.append({
+            "id": tc.get("id") or f"call_{i}_{abs(hash(str(fn.get('name')))) % 100000}",
+            "type": "function",
+            "function": {
+                "name": fn.get("name", ""),
+                "arguments": args if isinstance(args, str) else "",
+            },
+        })
+    return out
+
+
+def _friendly_error(e: Exception) -> str:
+    """把 httpx 异常转成能看懂的中文提示。"""
+    if isinstance(e, httpx.HTTPStatusError):
+        code = e.response.status_code
+        body = ""
+        try:
+            body = (e.response.text or "")[:300]
+        except Exception:
+            pass
+        tips = {
+            401: "API Key 无效或缺失（401）",
+            403: "Key 无权限访问该模型（403）",
+            404: "端点或模型不存在（404）——检查 Base URL 是否带 /v1、模型名是否正确",
+            429: "触发限流或余额不足（429）",
+            500: "服务端异常（500）",
         }
+        return f"{tips.get(code, f'HTTP {code}')} {body}".strip()
+    if isinstance(e, httpx.ConnectError):
+        return f"无法连接端点（{e}）——检查网络、代理或 Base URL"
+    if isinstance(e, httpx.TimeoutException):
+        return "请求超时——本地模型首次加载较慢，可适当调大超时"
+    return str(e)
 
 
+# ---------- 后端工厂 ----------
 _backends: dict[str, LLMBackend] = {}
-
-# ---------- 运行时后端选择 ----------
-# 默认取 config.DEFAULT_BACKEND；可通过 /api/models 在前端切换，并持久化到 data/runtime.json，
-# 服务重启后仍保持用户上次的选择。
-_RUNTIME_FILE = config.DATA_DIR / "runtime.json"
-_current_backend: str | None = None
+_backend_sig: dict[str, str] = {}
 
 
-def _load_saved_backend() -> str | None:
-    try:
-        return json.loads(_RUNTIME_FILE.read_text(encoding="utf-8")).get("backend")
-    except Exception:
-        return None
+def _signature(p: dict) -> str:
+    return "|".join(str(p.get(k, "")) for k in
+                    ("id", "type", "base_url", "api_key", "model", "thinking", "timeout"))
 
 
-def _save_backend(name: str) -> None:
-    try:
-        _RUNTIME_FILE.write_text(
-            json.dumps({"backend": name}, ensure_ascii=False), encoding="utf-8"
-        )
-    except Exception:
-        pass
+def build_backend(p: dict) -> LLMBackend:
+    ptype = (p.get("type") or "openai").lower()
+    if ptype == "anthropic":
+        return AnthropicBackend(p)
+    # 只有内置 ollama 走 /api/tags；LM Studio / vLLM 等本地服务仍走标准 /v1/models
+    if ptype == "openai" and (p.get("id") == "ollama" or "11434" in (p.get("base_url") or "")):
+        return OllamaBackend(p)
+    return OpenAICompatBackend(p)
 
 
 def get_backend(name: str | None = None) -> LLMBackend:
-    """取后端实例。不传 name 时返回当前运行时选中的后端。"""
-    global _current_backend
-    if name is None:
-        if _current_backend is None:
-            saved = _load_saved_backend()
-            _current_backend = saved if saved in ("ollama", "deepseek") else config.DEFAULT_BACKEND
-            # 持久化的选择指向未配置 Key 的云端时，回退到本地，避免启动即不可用
-            if _current_backend == "deepseek" and not config.DEEPSEEK_API_KEY:
-                _current_backend = "ollama"
-        name = _current_backend
-    if name not in _backends:
-        _backends[name] = OllamaBackend() if name == "ollama" else DeepSeekBackend()
-    return _backends[name]
+    """取后端实例。name 为供应商 id；不传则用当前选中的供应商。
+
+    实例按「供应商配置签名」缓存，配置一改（设置里保存）下一次调用即生效，
+    无需重启服务。
+    """
+    if not name:
+        name = providers.current_id()
+    p = providers.get(name)
+    if p is None:
+        # 供应商被删了/改名了：回退到本地，避免整站不可用
+        p = providers.current()
+
+    sig = _signature(p)
+    if _backend_sig.get(p["id"]) != sig:
+        _backends[p["id"]] = build_backend(p)
+        _backend_sig[p["id"]] = sig
+    return _backends[p["id"]]
 
 
 def current_backend_name() -> str:
-    return get_backend().name
+    return providers.current_id()
 
 
 def set_backend(name: str) -> LLMBackend:
-    """切换运行时后端并持久化。校验失败抛 ValueError / RuntimeError。"""
-    global _current_backend
-    if name not in ("ollama", "deepseek"):
-        raise ValueError(f"未知后端：{name}（可选 ollama / deepseek）")
-    if name == "deepseek" and not config.DEEPSEEK_API_KEY:
-        raise RuntimeError("DeepSeek 未配置 API Key，请先设置环境变量 DEEPSEEK_API_KEY 再切换")
-    _current_backend = name
-    _save_backend(name)
+    """切换当前供应商并持久化，返回后端实例。校验失败抛 ValueError。"""
+    providers.set_current(name)
     return get_backend(name)
+
+
+def auto_route_candidate(current: str) -> LLMBackend | None:
+    """漏洞验证类任务的云端自动路由目标（未配置/就是当前后端时返回 None）。"""
+    pid = providers.auto_route_id()
+    if not pid or pid == current:
+        return None
+    b = get_backend(pid)
+    return b if b.available() else None
 
 
 def parse_tool_arguments(raw: str) -> dict:
@@ -192,3 +547,14 @@ def parse_tool_arguments(raw: str) -> dict:
         return json.loads(raw)
     except Exception:
         return {"target": raw.strip(), "args": ""}
+
+
+# ---------- 旧接口兼容（DeepSeekBackend / load_anthropic_cfg 等历史引用） ----------
+def load_anthropic_cfg() -> dict:
+    """旧版 Anthropic 配置读取，保留给兼容路径；新代码请直接用 providers。"""
+    p = providers.get("anthropic") or {}
+    return {"base_url": p.get("base_url", ""), "api_key": p.get("api_key", ""),
+            "model": p.get("model", config.DEFAULT_ANTHROPIC_MODEL)}
+
+
+DeepSeekBackend = OpenAICompatBackend  # 旧引用别名：DeepSeek 已是普通 OpenAI 兼容供应商

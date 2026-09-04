@@ -12,20 +12,20 @@ echo   仅限已获得书面授权的目标测试。
 echo ============================================================
 echo.
 
-set PY=C:\Users\Lianaxber\.workbuddy\binaries\python\envs\src-agent\Scripts\python.exe
+rem Python 解释器探测顺序（可移植写法，不写死本机路径）：
+rem   1. 环境变量 SRC_AGENT_PY 指定的解释器
+rem   2. 项目内 .venv\Scripts\python.exe（.venv 已被 .gitignore 排除）
+rem   3. PATH 中的 python
+set "PY=%SRC_AGENT_PY%"
+if "%PY%"=="" set "PY=%~dp0.venv\Scripts\python.exe"
+if not exist "%PY%" set "PY=python"
 
-rem DeepSeek 云端模型 API Key（前端模型切换用）。在下方填入你的 Key，或通过系统环境变量注入。
-rem 注意：不要将真实 Key 提交到公开仓库。
-set DEEPSEEK_API_KEY=
+rem DeepSeek 云端模型 API Key（前端模型切换用）。
+rem 建议通过系统环境变量 DEEPSEEK_API_KEY 注入，不要将真实 Key 提交到公开仓库。
+if not defined DEEPSEEK_API_KEY set "DEEPSEEK_API_KEY="
 
-if not exist "%PY%" (
-    echo [错误] 未找到 Python 环境：%PY%
-    echo 请先创建虚拟环境并安装依赖：
-    echo   python -m venv C:\Users\Lianaxber\.workbuddy\binaries\python\envs\src-agent
-    echo   pip install -r requirements.txt
-    pause
-    exit /b 1
-)
+echo   使用解释器：%PY%
+echo.
 
 "%PY%" run.py
 pause

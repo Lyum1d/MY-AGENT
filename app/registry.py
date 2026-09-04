@@ -259,6 +259,35 @@ class ToolRegistry:
                 "executable": str(nuclei_exe) if nuclei_exe.exists() else "",
                 "exists": nuclei_exe.exists(),
             },
+            {
+                "name": "记录已证事实",
+                "alias": "note_fact",
+                "description": "把「已由工具输出证实的客观事实」记入项目事实库（供后续步骤与最终报告引用）。"
+                               "适合记录：确认的凭据、漏洞点、敏感路径、关键版本、资产关系。"
+                               "只准记录已证实的事实，禁止记录计划、猜测或未验证的推测。",
+                "risk_level": "L0",
+                "risk_reason": "纯本地记录，无网络行为",
+                "caveat": "target 填当前任务目标域名/IP（可省略时填会话目标）；"
+                          "args 填事实正文，一句一事，具体到能直接引用。",
+                "executable": "builtin://note_fact",
+                "exists": True,
+            },
+            {
+                "name": "Python代码执行",
+                "alias": "py_exec",
+                "description": "在受控 Python 通道执行一段代码并回传输出（Intent Engineering：单点任务直接写代码，"
+                               "替代碎片化工具串）。适合：HTTP 请求分析（httpx/requests 可用）、数据处理、"
+                               "脚本化验证、生成字典/批量请求。代码用 print 输出结果。",
+                "risk_level": "L3",
+                "risk_reason": "在宿主解释器执行任意 Python 代码，能力等同本机命令行，风险高；"
+                               "须用户确认并勾选书面授权",
+                "caveat": "target 填当前授权目标（仅用于留档归类）；args 填完整 Python 代码（多行）。"
+                          "代码内 HTTP 请求只允许发往当前授权目标及其资产，禁止扫描/访问未授权主机或内网。"
+                          "每段代码保持小且聚焦（<30 行），超时就拆小重试，禁止在代码里 sleep 空转。"
+                          "依赖仅限标准库与已装包（httpx/pydantic 等），需要其他包用 urllib 或说明原因。",
+                "executable": "builtin://py_exec",
+                "exists": True,
+            },
         ]
         used = {t.alias for t in self.tools}
         for s in specs:
