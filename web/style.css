@@ -375,6 +375,73 @@ button.icon-btn { font-size: 16px; padding: 6px 10px; line-height: 1; }
 }
 .prov-route label { display: flex; align-items: center; gap: 6px; }
 
+/* ---------- 线索树（对话树小地图） ---------- */
+.tree-bar {
+  display: none; align-items: flex-start; gap: 10px; padding: 8px 16px;
+  border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0;
+}
+.tree-bar[style*="display: flex"] { display: flex; }
+.tree-label {
+  font-size: 11px; color: var(--muted); padding: 4px 8px; flex-shrink: 0;
+  border: 1px solid var(--border); border-radius: 6px; margin-top: 2px;
+}
+.tree-strip {
+  flex: 1; display: flex; gap: 14px; overflow-x: auto; padding: 2px 0; min-height: 46px;
+  align-items: flex-start;
+}
+.tree-empty { font-size: 12px; color: var(--placeholder); padding: 10px 2px; }
+.tree-col {
+  display: flex; flex-direction: column; gap: 6px; flex-shrink: 0;
+  border-left: 1px dashed var(--border); padding-left: 10px; min-width: 150px;
+}
+.tree-col:first-child { border-left: none; padding-left: 0; }
+.tnode {
+  position: relative; border: 1px solid var(--border); border-radius: 9px;
+  background: var(--panel-2); padding: 6px 9px; cursor: pointer;
+  transition: border-color .15s, background .15s; min-width: 140px; max-width: 190px;
+}
+.tnode:hover { border-color: var(--accent); }
+.tnode.cur { border-color: var(--accent); background: var(--accent-soft); }
+.tnode.st-done { opacity: .75; }
+.tnode.st-abandoned { opacity: .45; }
+.tnode.st-done .tn-name::after { content: ' ✓'; color: var(--ok); }
+.tnode.st-abandoned .tn-name::after { content: ' ✕'; color: var(--muted); }
+.tn-name { font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tn-meta { font-size: 11px; color: var(--muted); margin-top: 1px; }
+.tn-acts { display: none; gap: 4px; margin-top: 5px; }
+.tnode:hover .tn-acts { display: flex; }
+.tn-acts button {
+  padding: 1px 7px; font-size: 11px; border-radius: 5px; line-height: 1.4;
+}
+.tree-acts { display: flex; flex-direction: column; gap: 5px; flex-shrink: 0; }
+.tree-acts button { white-space: nowrap; }
+
+/* 历史回放里的打包记录提示 */
+.sys-note.thread-record {
+  text-align: left; background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 9px; padding: 7px 11px; font-size: 12px; color: var(--muted);
+  word-break: break-all;
+}
+
+/* ---------- 开新线索卡片 / 候选记录 ---------- */
+.branch-card {
+  align-self: stretch; border: 1px solid var(--accent); background: var(--accent-soft);
+  border-radius: 12px; padding: 13px 15px;
+}
+.branch-card .bc-title { font-weight: 600; margin-bottom: 6px; color: var(--accent-text); }
+.branch-card .bc-reason { font-size: 13px; color: var(--reasoning-text); margin-bottom: 8px; line-height: 1.6; }
+.branch-card .bc-tip, .modal-tip { font-size: 12px; color: var(--muted); margin-bottom: 8px; line-height: 1.6; }
+.branch-card .bc-actions, .bc-actions { display: flex; gap: 8px; margin-top: 10px; }
+.branch-cands { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 5px; }
+.bc-cand {
+  display: flex; align-items: center; gap: 8px; font-size: 12px;
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px;
+  background: var(--panel-2); cursor: pointer;
+}
+.bc-cand input { flex-shrink: 0; width: auto; }
+.bc-cand-t { font-weight: 500; white-space: nowrap; }
+.bc-cand-o { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+
 /* ---------- 滚动条 ---------- */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }

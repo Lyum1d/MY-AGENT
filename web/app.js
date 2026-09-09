@@ -4,11 +4,14 @@ let state = {
   projects: [],
   currentProject: null,
   sessionId: null,
+  threadFresh: true,   // 当前聊天区是否还是「没发过消息」的空线程（true=发送时复用 sessionId）
+  tree: [],            // 当前项目的线索树
   eventSource: null,
   tools: [],
   steps: [],
   models: null,
   assistant: null,   // 当前 AI 气泡的 DOM 引用（streaming 时填充）
+  branchParent: null, // 开分支弹窗的父会话 id
 };
 
 /* ---------- 工具函数 ---------- */
@@ -216,7 +219,7 @@ async function init() {
   } catch (e) {
     $('status').innerHTML = `<span class="dot bad"></span>后端未连接：${esc(e.message)}`;
   }
-  loadProjects().then(() => { autoSelectProject(); renderProjects(); updateProjectHeader(); loadFindings(); loadFacts(); });
+  loadProjects().then(() => { autoSelectProject(); renderProjects(); updateProjectHeader(); loadFindings(); loadFacts(); loadTree(); });
   loadTools();
 }
 
@@ -337,6 +340,7 @@ async function createProject() {
   updateProjectHeader();
   loadFindings();
   loadFacts();
+  loadTree();
 }
 
 async function selectProject(pid) {
@@ -346,6 +350,20 @@ async function selectProject(pid) {
   updateProjectHeader();
   loadFindings();
   loadFacts();
+  // 切项目 = 切对话树：清空当前线程，聊天区回到空态
+  if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
+  state.sessionId = null;
+  state.threadFresh = true;
+  state.steps = [];
+  state.assistant = null;
+  $('confirmBox').innerHTML = '';
+  $('messages').innerHTML = `
+    <div class="welcome" id="welcome">
+      <div class="welcome-logo">🛡</div>
+      <div class="welcome-title">SRC 渗透测试编排助手</div>
+      <div class="welcome-sub">已切换项目。描述你的任务开始测试；发现可疑点可随时「＋ 分支」拆出新线索。</div>
+    </div>`;
+  loadTree();
 }
 
 function startEditProject(pid) {
@@ -394,6 +412,7 @@ async function removeProject(pid) {
   renderProjects();
   updateProjectHeader();
   log('项目已删除', 'c-ok');
+  loadTree();
 }
 
 /* ---------- 工具箱 ---------- */
@@ -480,15 +499,27 @@ async function sendTask() {
   addUserMessage(msg);
   createAssistant();
 
-  const s = await api('/api/sessions', { method: 'POST' });
-  state.sessionId = s.session_id;
+  // 同一线索内连续发消息 = 续聊（上下文累积，便于对一个方向深挖）；
+  // 新建对话或刚切换进来的已有线索，threadFresh 标记是否需要复用。
+  let sid;
+  if (state.sessionId && state.threadFresh) {
+    sid = state.sessionId;
+  } else {
+    const s = await api('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ project_id: state.currentProject || '' }),
+    });
+    sid = s.session_id;
+    state.threadFresh = false;
+  }
+  state.sessionId = sid;
 
-  await api(`/api/sessions/${s.session_id}/run`, {
+  await api(`/api/sessions/${sid}/run`, {
     method: 'POST',
     body: JSON.stringify({ message: msg, project_id: state.currentProject || '' }),
   });
 
-  connectStream(s.session_id);
+  connectStream(sid);
 }
 
 function connectStream(sid) {
@@ -543,6 +574,13 @@ function handleEvent(ev) {
     case 'need_confirm':
       showConfirm(ev);
       break;
+    case 'branch_proposal':
+      showBranchCard(ev.data);
+      break;
+    case 'branch_update':
+      log(`子线索「${ev.data.title}」有新结论：${ev.data.summary.slice(0, 80)}…（已可在报告/小地图查看）`, 'c-ok');
+      loadTree();
+      break;
     case 'answer':
       appendAnswer(md(ev.data));
       break;
@@ -550,7 +588,8 @@ function handleEvent(ev) {
       finalizeAssistant(ev.state, state.steps.length);
       $('sendBtn').disabled = false;
       state.eventSource.close();
-      if (state.currentProject) { loadFindings(); loadFacts(); }
+      state.threadFresh = false;
+      if (state.currentProject) { loadFindings(); loadFacts(); loadTree(); }
       break;
   }
 }
@@ -607,6 +646,219 @@ async function doConfirm(approved) {
     method: 'POST',
     body: JSON.stringify({ approved }),
   });
+}
+
+/* ---------- 线索树（对话树小地图） ---------- */
+const THREAD_STATUS_LABEL = { active: '进行中', done: '已完成', abandoned: '已放弃' };
+
+async function loadTree() {
+  if (!state.currentProject) { $('treeBar').style.display = 'none'; return; }
+  try {
+    const d = await api(`/api/projects/${state.currentProject}/tree`);
+    state.tree = d.items;
+    $('treeBar').style.display = 'flex';
+    renderTree();
+  } catch (e) { /* 树加载失败不打断聊天 */ }
+}
+
+function threadName(n) {
+  return n.title || (n.task || '').slice(0, 18) || '未命名对话';
+}
+
+function renderTree() {
+  const strip = $('treeStrip');
+  if (!state.tree.length) {
+    strip.innerHTML = '<div class="tree-empty">同一方向聊久了会遗忘细节——发现可疑点就「＋ 分支」拆出独立线索深挖</div>';
+    return;
+  }
+  const byParent = {};
+  state.tree.forEach(n => (byParent[n.parent_id || ''] = byParent[n.parent_id || ''] || []).push(n));
+  const depthOf = {};
+  const walk = (pid, d) => (byParent[pid] || []).forEach(n => {
+    depthOf[n.id] = d;
+    walk(n.id, d + 1);
+  });
+  walk('', 0);
+  const maxDepth = Math.max(0, ...Object.values(depthOf));
+
+  strip.innerHTML = Array.from({ length: maxDepth + 1 }, (_, d) => {
+    const nodes = state.tree.filter(n => depthOf[n.id] === d);
+    return `<div class="tree-col">
+      ${nodes.map(n => {
+        const isCur = n.id === state.sessionId;
+        const st = THREAD_STATUS_LABEL[n.status] || n.status;
+        return `<div class="tnode st-${esc(n.status)} ${isCur ? 'cur' : ''}" onclick="openThread('${n.id}')" title="${esc(n.task || '')}">
+          <div class="tn-name">${esc(threadName(n))}</div>
+          <div class="tn-meta">${st} · ${n.step_count} 步</div>
+          <div class="tn-acts">
+            <button onclick="event.stopPropagation();openBranchModal('${n.id}')" title="在此线索下开新分支">＋</button>
+            ${n.status !== 'done' ? `<button onclick="event.stopPropagation();setThreadStatus('${n.id}','done')" title="标记已完成">✓</button>` : ''}
+            ${n.status !== 'abandoned' ? `<button onclick="event.stopPropagation();setThreadStatus('${n.id}','abandoned')" title="标记已放弃">✕</button>` : ''}
+            ${n.status !== 'active' ? `<button onclick="event.stopPropagation();setThreadStatus('${n.id}','active')" title="重新打开">↺</button>` : ''}
+          </div>
+        </div>`;
+      }).join('')}
+    </div>`;
+  }).join('');
+}
+
+/* 切换到某条线索：恢复持久化会话并回放历史 */
+async function openThread(sid) {
+  if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
+  $('sendBtn').disabled = false;
+  $('confirmBox').innerHTML = '';
+  try {
+    await api('/api/sessions', { method: 'POST', body: JSON.stringify({ sid }) });
+  } catch (e) { return alert('切换失败：' + e.message); }
+  state.sessionId = sid;
+  state.threadFresh = false;
+  const d = await api(`/api/sessions/${sid}`);
+  const m = $('messages');
+  m.innerHTML = '';
+  state.steps = d.steps || [];
+  state.assistant = null;
+
+  const head = document.createElement('div');
+  head.className = 'sys-note';
+  head.textContent = `线索「${d.title || '未命名对话'}」 · ${state.steps.length} 条历史记录`;
+  m.appendChild(head);
+
+  (d.records || []).forEach(rec => {
+    const el = document.createElement('div');
+    el.className = 'sys-note thread-record';
+    el.textContent = '📦 ' + rec;
+    m.appendChild(el);
+  });
+
+  state.steps.forEach(s => {
+    appendLine(`• ${s.tool_name || s.tool_alias} → ${s.target || '-'} [${s.status}]`, 'muted');
+  });
+  if (d.summary) appendAnswer(md(d.summary));
+  if (d.state === 'running' || d.state === 'awaiting_confirm') {
+    connectStream(sid);
+    log('该线索正在执行中，已接入实时输出…', 'c-warn');
+  }
+  renderTree();
+  scrollToBottom();
+}
+
+/* 另起一条独立主对话 */
+function newThread() {
+  if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
+  state.sessionId = null;
+  state.threadFresh = true;
+  state.steps = [];
+  state.assistant = null;
+  $('sendBtn').disabled = false;
+  $('confirmBox').innerHTML = '';
+  $('messages').innerHTML = `
+    <div class="welcome" id="welcome">
+      <div class="welcome-logo">🛡</div>
+      <div class="welcome-title">新的对话</div>
+      <div class="welcome-sub">描述你的任务开始。发送后它会作为一条主对话出现在上方线索树里。</div>
+    </div>`;
+  renderTree();
+}
+
+async function setThreadStatus(sid, status) {
+  try {
+    await api(`/api/sessions/${sid}/meta`, {
+      method: 'PUT',
+      body: JSON.stringify({ status }),
+    });
+    loadTree();
+  } catch (e) { alert('状态更新失败：' + e.message); }
+}
+
+/* 开分支弹窗：候选记录 = 该线索最近的执行步骤 */
+async function openBranchModal(sid) {
+  state.branchParent = sid || state.sessionId;
+  if (!state.branchParent) {
+    return log('还没有可分叉的对话：先发送一个任务，或在线索树里选中一条线索', 'c-warn');
+  }
+  $('bTitle').value = '';
+  $('bNote').value = '';
+  $('branchState').textContent = '';
+  let steps = [];
+  try {
+    const d = await api(`/api/sessions/${state.branchParent}`);
+    steps = d.steps || [];
+  } catch (e) { /* 忽略，保留空候选 */ }
+  const cands = steps.slice(-8).reverse();
+  $('branchCandidates').innerHTML = cands.length
+    ? cands.map((c, i) => `
+      <label class="bc-cand">
+        <input type="checkbox" value="${esc(c.id)}" ${i < 3 ? 'checked' : ''}>
+        <span class="bc-cand-t">${esc(c.tool_name || c.tool_alias)} → ${esc(c.target || '-')}</span>
+        <span class="bc-cand-o">${esc((c.output || '').replace(/\s+/g, ' ').slice(0, 70))}</span>
+      </label>`).join('')
+    : '<div class="empty">该线索还没有执行记录，将只带走补充说明</div>';
+  $('branchModal').style.display = 'flex';
+}
+
+function closeBranchModal() {
+  $('branchModal').style.display = 'none';
+  state.branchParent = null;
+}
+
+async function confirmCreateBranch() {
+  const title = $('bTitle').value.trim();
+  if (!title) return alert('请填写线索名称');
+  const ids = [...$('branchCandidates').querySelectorAll('input:checked')].map(x => x.value);
+  try {
+    const r = await api(`/api/sessions/${state.branchParent}/branch`, {
+      method: 'POST',
+      body: JSON.stringify({ title, record_ids: ids, extra_note: $('bNote').value.trim() }),
+    });
+    closeBranchModal();
+    log(`已创建线索「${r.title}」，携带 ${r.records.length} 条记录`, 'c-ok');
+    await loadTree();
+    openThread(r.session_id);
+  } catch (e) {
+    $('branchState').textContent = '创建失败：' + e.message;
+  }
+}
+
+/* AI 建议开线索的卡片（propose_branch 事件触发） */
+function showBranchCard(data) {
+  clearWelcome();
+  const m = $('messages');
+  const card = document.createElement('div');
+  card.className = 'branch-card';
+  card.innerHTML = `
+    <div class="bc-title">🌱 建议开辟新线索：《${esc(data.title)}》</div>
+    ${data.reason ? `<div class="bc-reason">${md(data.reason)}</div>` : ''}
+    <div class="bc-tip">新线索会带上你勾选的记录独立深挖这个方向，当前对话不受影响：</div>
+    <div class="bc-cands">
+      ${(data.candidates || []).map(c => `
+        <label class="bc-cand">
+          <input type="checkbox" value="${esc(c.id)}" checked>
+          <span class="bc-cand-t">${esc(c.tool_name || c.tool_alias)} → ${esc(c.target || '-')}</span>
+          <span class="bc-cand-o">${esc((c.output || '').replace(/\s+/g, ' ').slice(0, 70))}</span>
+        </label>`).join('') || '<div class="muted">（暂无可打包的执行记录，仅携带建议说明）</div>'}
+    </div>
+    <div class="bc-actions">
+      <button class="primary sm bc-go">确认开辟并切换</button>
+      <button class="sm bc-no">暂不需要</button>
+    </div>`;
+  m.appendChild(card);
+  scrollToBottom();
+  card.querySelector('.bc-go').onclick = async () => {
+    const ids = [...card.querySelectorAll('input:checked')].map(x => x.value);
+    try {
+      const r = await api(`/api/sessions/${state.sessionId}/branch`, {
+        method: 'POST',
+        body: JSON.stringify({ title: data.title, record_ids: ids, extra_note: data.reason || '' }),
+      });
+      card.remove();
+      log(`已创建线索「${r.title}」`, 'c-ok');
+      await loadTree();
+      openThread(r.session_id);
+    } catch (e) {
+      log('创建线索失败：' + e.message, 'c-err');
+    }
+  };
+  card.querySelector('.bc-no').onclick = () => card.remove();
 }
 
 /* ---------- 右侧面板折叠 ---------- */

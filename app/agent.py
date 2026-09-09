@@ -44,6 +44,12 @@ SYSTEM_PROMPT = """你是一个渗透测试编排助手，服务于 SRC（安全
 8. 事实纪律：只能基于真实工具输出下结论。禁止编造漏洞、凭据、flag、版本号或"疑似成功"。
    区分「已证实的事实」与「待验证的猜测」，报告中结论只先给证据确凿的，再扩展可疑点。
 
+对话树工作流（多条线索并行推进）：
+9. 发现值得单独深挖的可疑点（注入点/弱口令/未授权接口/可疑目录等）时，调用 propose_branch
+   向用户建议开辟新线索，由用户确认；新线索会带上相关记录独立推进，避免当前对话信息过载。
+10. 需要其他线索里已查到的信息时，调用 search_history 按关键词检索（子域名、路径、端口、
+    工具结果等），检索到的内容是已证实的工具输出，可直接引用；检索不到就继续用工具查证。
+
 Web 站点渗透 SOP（不可跳步，先手工后工具）：
 ① 打开页面看结构 → ② 查源码/JS/注释/接口，收集泄露信息（凭据、API、内网路径）→
 ③ 逐个测正常功能（登录/搜索/上传）并留意每步请求 → ④ 确认无隐藏逻辑后才跑自动化
@@ -222,6 +228,11 @@ class Session:
     target: str = ""     # 从任务描述中提取的目标，每轮重申防止模型遗忘
     nudges: int = 0      # 已催促次数，防止无限追问
     created_at: float = field(default_factory=time.time)
+    # ---- 对话树（线索分支）----
+    parent_id: str = ""              # 父会话 id，根线索为 ''
+    title: str = ""                  # 线索名
+    records: list[str] = field(default_factory=list)  # 开分支时打包带来的记录
+    summary: str = ""                # 最近一轮结论摘要（写回父对话/供其他线索引用）
 
     async def emit(self, event: dict) -> None:
         await self.events.put(event)
@@ -231,9 +242,54 @@ class SessionManager:
     def __init__(self) -> None:
         self.sessions: dict[str, Session] = {}
 
-    def create(self, project: str = "") -> Session:
+    def create(self, project: str = "", parent_id: str = "", title: str = "",
+               records: list[str] | None = None) -> Session:
         sid = uuid.uuid4().hex[:12]
-        s = Session(id=sid, project=project)
+        s = Session(id=sid, project=project, parent_id=parent_id,
+                    title=title, records=list(records or []))
+        self.sessions[sid] = s
+        return s
+
+    def adopt(self, sid: str) -> Session | None:
+        """从持久化层恢复已有会话（对话树切换线索/服务重启后续聊）。
+
+        内存里已有则直接返回；store 里也没有返回 None。
+        历史步骤一并装回：续聊时「已尝试过的工具」提醒、开分支的记录挑选都依赖它。
+        """
+        s = self.sessions.get(sid)
+        if s:
+            return s
+        rec = store.get_session(sid)
+        if not rec:
+            return None
+        row = rec["session"]
+        try:
+            records = json.loads(row.get("context") or "[]")
+        except Exception:
+            records = []
+        s = Session(
+            id=sid,
+            project=row.get("project_id") or "",
+            parent_id=row.get("parent_id") or "",
+            title=row.get("title") or "",
+            records=records if isinstance(records, list) else [],
+        )
+        s.target = row.get("target") or ""
+        s.state = "idle"
+        s.summary = row.get("summary") or ""
+        for st in rec["steps"]:
+            s.steps.append(Step(
+                id=st.get("id") or uuid.uuid4().hex[:12],
+                tool_alias=st.get("tool_alias") or "",
+                tool_name=st.get("tool_name") or "",
+                target=st.get("target") or "",
+                args=st.get("args") or "",
+                risk={"level": st.get("risk_level") or ""},
+                status=st.get("status") or "done",
+                output=st.get("output") or "",
+                started_at=st.get("created_at"),
+                finished_at=st.get("created_at"),
+            ))
         self.sessions[sid] = s
         return s
 
@@ -270,8 +326,10 @@ class Agent:
                 logger.warning("项目目标未采用（%s）：%r", bad_proj_target, proj_target)
             else:
                 session.target = proj_target
-        # 立即落库，避免中途关闭页面导致整轮记录丢失
-        store.save_session(session.id, session.project, user_message, session.target, "running")
+        # 立即落库，避免中途关闭页面导致整轮记录丢失（树字段一并带上，
+        # 分支线索在首次运行后就出现在小地图上）
+        store.save_session(session.id, session.project, user_message, session.target,
+                           "running", parent_id=session.parent_id, title=session.title)
         await session.emit({"type": "session_start", "session_id": session.id})
         backend = get_backend(self.backend_name)
         # 漏洞验证类任务自动路由云端：本地小模型在多步推理上明显吃力，
@@ -328,6 +386,30 @@ class Agent:
                     )
             except Exception:
                 logger.exception("已证事实注入失败")
+        # 注入对话树上下文：①本线索开局打包记录 ②同项目其他线索的进展摘要。
+        # 目的：单对话过长会遗忘细节，把方向拆到独立线索里深挖，跨线索信息按需取用。
+        if session.records:
+            rec_lines = "\n".join(f"- {r}" for r in session.records[:20])
+            system += (
+                "\n\n【本线索开局背景（从上级对话打包带来的已查记录，可直接引用，"
+                "不要重复验证，也不要质疑其真实性）】\n" + rec_lines
+            )
+        if session.project:
+            try:
+                _others = [t for t in store.list_tree(session.project)
+                           if t["id"] != session.id and (t.get("summary") or t.get("task"))]
+                if _others:
+                    _ol = []
+                    for t in _others[:8]:
+                        name = t.get("title") or (t.get("task") or "")[:24] or "未命名线索"
+                        brief = t.get("summary") or (t.get("task") or "")[:80]
+                        _ol.append(f"- 线索《{name}》（{t.get('status', 'active')}）：{brief}")
+                    system += (
+                        "\n\n【同项目其他线索的进展（并行推进的其他对话，详情可用 "
+                        "search_history 工具按关键词检索，不要臆测其内容）】\n" + "\n".join(_ol)
+                    )
+            except Exception:
+                logger.exception("线索树上下文注入失败")
         consecutive_failures = 0
 
         for step_no in range(1, config.MAX_STEPS + 1):
@@ -388,6 +470,7 @@ class Agent:
 
                 answer = result.get("content") or "（模型未给出结论）"
                 session.messages.append({"role": "assistant", "content": answer})
+                await self._write_back(session, answer)
                 await session.emit({"type": "answer", "data": answer})
                 session.state = "done"
                 await session.emit({"type": "done", "state": "done"})
@@ -472,6 +555,14 @@ class Agent:
                     await self._note_fact(session, tc, target, args)
                     continue
 
+                # ---- 内置 search_history / propose_branch（对话树能力，L0，不走风险闸门）----
+                if tool.alias == "search_history":
+                    await self._search_history(session, tc, args or target)
+                    continue
+                if tool.alias == "propose_branch":
+                    await self._propose_branch(session, tc, args)
+                    continue
+
                 # ---- 校验目标（模型会把中文句子当目标传入） ----
                 bad_target = validate_target(target)
                 if bad_target:
@@ -520,16 +611,20 @@ class Agent:
 
             # 连续多次失败说明思路不对，及时止损避免空转
             if consecutive_failures >= 3:
+                stop_msg = f"连续 {consecutive_failures} 次执行失败，已停止。请检查目标可达性、工具参数或授权范围。"
+                await self._write_back(session, stop_msg)
                 await session.emit({
                     "type": "answer",
-                    "data": f"连续 {consecutive_failures} 次执行失败，已停止。请检查目标可达性、工具参数或授权范围。",
+                    "data": stop_msg,
                 })
                 self._persist_intel(session)
                 session.state = "done"
                 await session.emit({"type": "done", "state": "done"})
                 return
 
-        await session.emit({"type": "answer", "data": f"已达到最大步数 {config.MAX_STEPS}，停止执行。"})
+        max_steps_msg = f"已达到最大步数 {config.MAX_STEPS}，停止执行。"
+        await self._write_back(session, max_steps_msg)
+        await session.emit({"type": "answer", "data": max_steps_msg})
         self._persist_intel(session)
         session.state = "done"
         await session.emit({"type": "done", "state": "done"})
@@ -560,6 +655,83 @@ class Agent:
                 note = f"记录事实失败：{e}"
         session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
         await session.emit({"type": "reasoning", "data": f"（{note}）"})
+
+    # ---------- 对话树：跨线索检索 ----------
+    async def _search_history(self, session: Session, tc: dict, keyword: str) -> None:
+        """search_history 内置工具：在项目内所有会话的历史工具输出里检索关键词。"""
+        kw = (keyword or "").strip()[:80]
+        if not session.project:
+            note = "当前会话未关联项目，无法检索历史线索。"
+        elif not kw:
+            note = "搜索关键词为空：args 应填要检索的关键词（域名、路径、工具名、端口等）。"
+        else:
+            try:
+                hits = store.search_history(session.project, kw)
+            except Exception as e:
+                hits = []
+                note = f"检索失败：{e}"
+            if not hits:
+                note = f"未检索到包含「{kw}」的历史记录。可换更具体的关键词（如具体路径、子域名、端口）。"
+            else:
+                lines = []
+                for h in hits:
+                    src = h.get("title") or (h.get("task") or "")[:24] or "未命名线索"
+                    lines.append(
+                        f"【线索《{src}》· {h.get('tool_name') or h.get('tool_alias')} → {h.get('target') or '-'}】\n"
+                        f"{h.get('snippet', '')}"
+                    )
+                note = f"检索到 {len(hits)} 条包含「{kw}」的历史记录（已证实的工具输出，可直接引用）：\n\n" + "\n\n".join(lines)
+        session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
+        await session.emit({"type": "reasoning", "data": f"（检索历史线索：{kw} → {len(hits) if session.project and kw else 0} 条）"})
+
+    # ---------- 对话树：建议开辟新线索 ----------
+    async def _propose_branch(self, session: Session, tc: dict, args: str) -> None:
+        """propose_branch 内置工具：向用户展示「开新线索」卡片，用户确认后才真正创建。
+
+        卡片候选记录 = 本会话最近的工具步骤摘要（前端可勾选打包带走）。
+        """
+        text = (args or "").strip()
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        title = (lines[0] if lines else "新线索")[:60]
+        reason = "\n".join(lines[1:]) if len(lines) > 1 else ""
+        candidates = [self._step_dict(st) for st in session.steps[-6:]]
+        await session.emit({
+            "type": "branch_proposal",
+            "data": {
+                "title": title,
+                "reason": reason,
+                "candidates": candidates,
+            },
+        })
+        note = (f"已把「开新线索」卡片展示给用户，建议标题《{title}》。"
+                f"用户确认后新对话会自动携带相关记录独立推进；"
+                f"请继续当前任务，或在当前方向确实告一段落时给出结论结束。")
+        session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
+        await session.emit({"type": "reasoning", "data": f"（已发出开新线索建议：《{title}》，等待用户确认）"})
+
+    # ---------- 对话树：结论回流 ----------
+    async def _write_back(self, session: Session, answer: str) -> None:
+        """会话给出最终结论后：①摘要落库（供其他线索的上下文注入与小地图展示）
+        ②父会话在线时实时推送 branch_update 通知。"""
+        text = (answer or "").strip()
+        if not text:
+            return
+        session.summary = text[:1000]
+        try:
+            store.save_summary(session.id, session.summary)
+        except Exception:
+            logger.exception("结论摘要落库失败")
+        if session.parent_id:
+            parent = sessions.get(session.parent_id)
+            if parent:
+                await parent.emit({
+                    "type": "branch_update",
+                    "data": {
+                        "child": session.id,
+                        "title": session.title or "子线索",
+                        "summary": text[:300],
+                    },
+                })
 
     # ---------- 防呆提醒 ----------
     @staticmethod

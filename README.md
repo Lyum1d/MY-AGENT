@@ -87,6 +87,27 @@ python run.py          → 命令行启动（--no-browser 不自动开浏览器�
 `py_exec` 借鉴了 Intent Engineering 思路（意图直出代码而非碎片化工具串），能力等同本机命令行，
 故定级 L3：需用户确认 + 勾选书面授权才会执行。
 
+### 对话树（线索分支，非线性对话）
+
+单条对话聊太久后模型会"遗忘"细节，无法对单个方向深挖。对话树把一次测试拆成
+多条独立线索并行推进：
+
+- **横向小地图**：聊天区上方是当前项目的「线索树」，节点按分支层级从左到右排列，
+  颜色区分状态（进行中 / 已完成 ✓ / 已放弃 ✕），点击节点即切换到那条对话（历史步骤与结论自动回放）。
+- **开新线索（两种方式）**：
+  - AI 发现值得单独深挖的可疑点时，调用内置工具 `propose_branch` 在聊天里发一张
+    「开新线索」卡片（含建议标题与可打包的执行记录勾选清单），确认后自动创建并切换；
+  - 手动：线索树节点 / 顶栏「＋ 分支」按钮，从该线索最近的步骤里勾选记录打包带走。
+- **开局背景**：新线索携带打包记录（工具输出摘要），系统提示明确「可直接引用、不要重复验证」。
+- **翻旧账**：内置工具 `search_history`（L0）跨线索检索项目内所有会话的历史工具输出，
+  其他线索的进展摘要也会注入系统提示；同线索内连续发消息即续聊（上下文累积）。
+- **成果回流**：线索给出结论后，摘要自动落库并实时推送给父会话（`branch_update` 事件），
+  主对话随时掌握全局。
+- 风险分级（L2 确认 / L3 二次确认）与授权白名单校验在线索间**完全一致**，切换对话形式不放松任何闸门。
+
+相关接口：`GET /api/projects/{pid}/tree`、`POST /api/sessions/{sid}/branch`、
+`PUT /api/sessions/{sid}/meta`、`POST /api/sessions`（body 带 `sid` 时为恢复已有会话续聊）。
+
 ## 工具能力边界
 
 工具箱 199 个工具 + 4 个内置能力；其中 **54 个可编排**（有 stdout，能进自动化流水线，
@@ -123,8 +144,8 @@ src-agent/
 │   ├── intel.py              项目情报库注入
 │   ├── providers.py        通用 LLM 供应商注册中心（预设厂商 / 增删改 / 持久化）
 │   ├── llm.py              模型层：OpenAI 兼容 + Anthropic 原生双协议通用后端
-│   ├── agent.py            ReAct 单步决策循环（SOP 与事实纪律在 SYSTEM_PROMPT）
-│   ├── store.py            SQLite 项目仓储（projects/sessions/steps/findings/intel/facts）
+│   ├── agent.py            ReAct 单步决策循环（SOP 与事实纪律在 SYSTEM_PROMPT；对话树上下文注入/结论回流）
+│   ├── store.py            SQLite 项目仓储（projects/sessions(含线索树字段)/steps/findings/intel/facts）
 │   ├── report.py           补天格式报告生成
 │   └── main.py             FastAPI 后端（供应商管理 / 项目 / 会话 / 工具接口）
 ├── web/                      原生前端（index.html / app.js / style.css）

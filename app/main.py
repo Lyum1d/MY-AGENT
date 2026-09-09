@@ -61,6 +61,25 @@ class ModelRequest(BaseModel):
     backend: str
 
 
+class SessionCreateRequest(BaseModel):
+    """创建会话。sid 传入时表示「续聊已有会话」（从持久化层恢复，对话树切线索用）。"""
+    sid: str = ""
+    project_id: str = ""
+
+
+class BranchRequest(BaseModel):
+    """从父会话开新线索：title 线索名；record_ids 要打包带走的步骤 id；extra_note 额外说明。"""
+    title: str
+    record_ids: list[str] = []
+    extra_note: str = ""
+
+
+class SessionMetaRequest(BaseModel):
+    """线索标题/状态更新。status: active | done | abandoned"""
+    title: str | None = None
+    status: str | None = None
+
+
 class SettingsLLMRequest(BaseModel):
     backend: str  # deepseek | anthropic
     base_url: str = ""
@@ -399,9 +418,90 @@ async def export_report(pid: str):
 
 # ---------- 会话与 Agent ----------
 @app.post("/api/sessions")
-async def create_session(project_id: str = ""):
-    s = sessions.create(project=project_id)
+async def create_session(req: SessionCreateRequest | None = None):
+    """新建会话；body 带 sid 时改为「恢复已有会话」继续聊（对话树切换线索）。"""
+    if req and req.sid:
+        s = sessions.adopt(req.sid)
+        if not s:
+            raise HTTPException(404, "会话不存在")
+        if req.project_id:
+            s.project = req.project_id
+        return {"session_id": s.id, "adopted": True}
+    s = sessions.create(project=(req.project_id if req else "") or "")
     return {"session_id": s.id}
+
+
+def _branch_records(sid: str, req: BranchRequest) -> tuple[str, str, list[str]]:
+    """汇集开分支要打包的记录：选中的步骤摘要 + 额外说明。返回 (project_id, 父任务, 记录列表)。"""
+    s = sessions.get(sid)
+    row = store.get_session_row(sid)
+    project_id = (s.project if s else "") or (row.get("project_id") or "" if row else "")
+    task = (row.get("task") or "") if row else ""
+    # 步骤合并持久化层与内存会话（同 id 以内存为准）：
+    # 内存会话可能在 adopt 后没跑过新步骤，store 里反而更全
+    steps: list[dict] = []
+    if row:
+        rec = store.get_session(sid)
+        steps = rec["steps"] if rec else []
+    if s:
+        mem = {agent._step_dict(st)["id"]: agent._step_dict(st) for st in s.steps}
+        by_id = {st["id"]: st for st in steps}
+        by_id.update(mem)
+        steps = list(by_id.values())
+    by_id = {st["id"]: st for st in steps}
+    records: list[str] = []
+    for rid in req.record_ids:
+        st = by_id.get(rid)
+        if not st:
+            continue
+        output = (st.get("output") or "").strip()[:400]
+        records.append(
+            f"[{st.get('tool_name') or st.get('tool_alias')} → {st.get('target') or '-'}]"
+            f"{' 参数: ' + st['args'] if st.get('args') else ''}"
+            f"{(' 输出摘要: ' + output) if output else ''}"
+        )
+    if req.extra_note.strip():
+        records.insert(0, req.extra_note.strip()[:500])
+    if not records and task:
+        records.append(f"上级任务：{task[:200]}")
+    if not records:
+        records.append("（上级对话未提供具体记录）")
+    return project_id, task, records
+
+
+@app.post("/api/sessions/{sid}/branch")
+async def create_branch_api(sid: str, req: BranchRequest):
+    """开新线索：把选中记录打包写入新会话的 context，新线索独立推进。"""
+    title = (req.title or "").strip()
+    if not title:
+        raise HTTPException(400, "请填写线索名称")
+    if not sessions.get(sid) and not store.get_session_row(sid):
+        raise HTTPException(404, "父会话不存在")
+    project_id, _task, records = _branch_records(sid, req)
+    branch = store.create_branch(sid, project_id, title, records)
+    return {"ok": True, "session_id": branch["id"], "title": branch["title"],
+            "records": records}
+
+
+@app.get("/api/projects/{pid}/tree")
+async def project_tree(pid: str):
+    """项目的会话树（前端小地图数据源）。"""
+    return {"items": store.list_tree(pid)}
+
+
+@app.put("/api/sessions/{sid}/meta")
+async def update_session_meta(sid: str, req: SessionMetaRequest):
+    """线索改名/改状态（active | done | abandoned）。"""
+    try:
+        row = store.update_session_meta(sid, title=req.title, status=req.status)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not row:
+        raise HTTPException(404, "会话不存在")
+    s = sessions.get(sid)
+    if s and req.title:
+        s.title = row["title"]  # 运行态(state)与线索状态(status)是两回事，互不影响
+    return {"ok": True, "session": row}
 
 
 @app.post("/api/sessions/{sid}/run")
@@ -476,15 +576,27 @@ async def session_state(sid: str):
             "state": s.state,
             "target": s.target,
             "steps": [agent._step_dict(x) for x in s.steps],
+            "parent_id": s.parent_id,
+            "title": s.title,
+            "records": s.records,
+            "summary": s.summary,
         }
     # 回退到持久化层：服务重启后内存会话已清空，但 store 里仍有记录
     rec = store.get_session(sid)
     if not rec:
         raise HTTPException(404, "会话不存在")
     sess = rec["session"]
+    try:
+        records = json.loads(sess.get("context") or "[]")
+    except Exception:
+        records = []
     return {
         "id": sess["id"],
         "state": sess.get("state"),
         "target": sess.get("target"),
         "steps": rec["steps"],
+        "parent_id": sess.get("parent_id") or "",
+        "title": sess.get("title") or "",
+        "records": records if isinstance(records, list) else [],
+        "summary": sess.get("summary") or "",
     }

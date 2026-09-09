@@ -288,6 +288,32 @@ class ToolRegistry:
                 "executable": "builtin://py_exec",
                 "exists": True,
             },
+            {
+                "name": "检索历史线索",
+                "alias": "search_history",
+                "description": "跨线索检索：在当前项目所有对话（含主对话与其他线索分支）的历史工具输出里"
+                               "按关键词搜索，回传命中的记录片段。当需要别的线索里已查到的信息"
+                               "（子域名列表、端口、指纹、历史命令结果等）时用它，不要凭记忆编造。",
+                "risk_level": "L0",
+                "risk_reason": "纯本地数据库查询，无网络行为",
+                "caveat": "args 填搜索关键词（域名、路径、工具名、端口等，越具体越好）；"
+                          "target 可省略。结果按时间倒序，含来源线索名，可直接引用。",
+                "executable": "builtin://search_history",
+                "exists": True,
+            },
+            {
+                "name": "建议开辟新线索",
+                "alias": "propose_branch",
+                "description": "发现值得单独深入挖掘的可疑点（注入点/弱口令/未授权接口/可疑目录等）时，"
+                               "用它向用户展示「开新线索」卡片：新线索会带上本对话的相关记录独立推进，"
+                               "避免当前对话被塞满后遗忘细节。仅建议、不改变当前任务。",
+                "risk_level": "L0",
+                "risk_reason": "纯本地操作：仅把建议卡片展示给用户，由用户确认后才创建新对话",
+                "caveat": "args 第一行填线索标题（简短具体，如「admin.php 疑似 SQL 注入」），"
+                          "其后各行填建议原因与已知线索；target 可省略。",
+                "executable": "builtin://propose_branch",
+                "exists": True,
+            },
         ]
         used = {t.alias for t in self.tools}
         for s in specs:

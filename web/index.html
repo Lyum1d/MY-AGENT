@@ -69,6 +69,16 @@
       <button class="ghost" id="toggleRightBtn" onclick="toggleRight()">报告 ▸</button>
     </header>
 
+    <!-- ============ 线索树（横向小地图） ============ -->
+    <div class="tree-bar" id="treeBar">
+      <span class="tree-label">线索树</span>
+      <div class="tree-strip" id="treeStrip"></div>
+      <div class="tree-acts">
+        <button class="mini" onclick="openBranchModal(state.sessionId || '')" title="从当前线索开辟一条新分支">＋ 分支</button>
+        <button class="mini" onclick="newThread()" title="另起一条独立的主对话">＋ 新对话</button>
+      </div>
+    </div>
+
     <div class="messages" id="messages">
       <div class="welcome" id="welcome">
         <div class="welcome-logo">🛡</div>
@@ -184,6 +194,29 @@
       </div>
       <div id="pfState" class="muted" style="margin-top:6px;"></div>
     </div>
+  </div>
+</div>
+
+<!-- ============ 开辟新线索 ============ -->
+<div id="branchModal" class="modal-mask">
+  <div class="modal" style="width:600px;">
+    <div class="modal-head">
+      <b>开辟新线索</b>
+      <button class="sm" onclick="closeBranchModal()">关闭</button>
+    </div>
+    <div class="modal-tip">
+      新线索是一条<b>独立对话</b>，会带上你勾选的记录开局，专心挖这一个方向；
+      主对话和其他线索不受影响，随时可在聊天区上方的「线索树」里切换。
+    </div>
+    <div class="row"><input id="bTitle" placeholder="线索名称，如：admin.php 疑似 SQL 注入"></div>
+    <div class="row"><textarea id="bNote" rows="2" placeholder="补充说明（可选）：这个方向为什么要深挖、目前已经知道什么"></textarea></div>
+    <div class="modal-tip" style="margin-bottom:6px;">勾选要打包带走的记录（来自当前线索的历史步骤）：</div>
+    <div id="branchCandidates" class="branch-cands"><div class="empty">加载中…</div></div>
+    <div style="display:flex;gap:8px;margin-top:12px;">
+      <button class="primary" style="flex:1;" onclick="confirmCreateBranch()">创建线索并切换过去</button>
+      <button onclick="closeBranchModal()">取消</button>
+    </div>
+    <div id="branchState" class="muted" style="margin-top:6px;"></div>
   </div>
 </div>
 
