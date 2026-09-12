@@ -11,6 +11,9 @@ env/
 *.sqlite3
 *.sqlite
 
+# 运行产物（导出的报告等，含漏洞细节，严禁入库）
+data/artifacts/
+
 # 日志与运行输出
 *.log
 *.out
