@@ -310,6 +310,11 @@ class Agent:
     async def run(self, session: Session, user_message: str) -> None:
         session.state = "running"
         session.messages.append({"role": "user", "content": user_message})
+        # 对话历史落库：切线索回放时可见用户原始消息
+        try:
+            store.save_chat_message(session.id, "user", user_message)
+        except Exception:
+            logger.exception("用户消息落库失败")
         session.target = extract_target(user_message)
         # 项目里显式填写的「目标」优先：用户建项目时填的常是纯企业名/域名，
         # 而任务描述往往只说「做信息收集」之类，模型从消息里识别不出目标。
@@ -431,6 +436,11 @@ class Agent:
             # ---- 模型给出思考/说明 ----
             if result.get("content"):
                 await session.emit({"type": "reasoning", "data": result["content"]})
+                # 对话历史落库：模型说明（reasoning）
+                try:
+                    store.save_chat_message(session.id, "assistant", result["content"], kind="reasoning")
+                except Exception:
+                    logger.exception("模型说明落库失败")
 
             tool_calls = result.get("tool_calls") or []
 
@@ -716,6 +726,11 @@ class Agent:
         text = (answer or "").strip()
         if not text:
             return
+        # 对话历史落库：最终结论（answer）
+        try:
+            store.save_chat_message(session.id, "assistant", text, kind="answer")
+        except Exception:
+            logger.exception("结论消息落库失败")
         session.summary = text[:1000]
         try:
             store.save_summary(session.id, session.summary)

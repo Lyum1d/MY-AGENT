@@ -175,6 +175,7 @@ def test_adopt_and_api(pid):
     r = client.get(f"/api/sessions/{branch_sid}")
     check("GET session 含 parent_id/records",
           r.json().get("parent_id") == "root1" and isinstance(r.json().get("records"), list))
+    check("GET session 含 chat 历史字段", "chat" in r.json() and isinstance(r.json()["chat"], list))
     return branch_sid
 
 
@@ -212,6 +213,11 @@ def test_agent_branch_tools(pid, branch_sid):
     sys3 = fb3.last_system or ""
     check("系统提示注入开局打包记录", "开局记录A" in sys3)
     check("系统提示注入其他线索进展", "admin.php 疑似注入" in sys3)
+
+    # 3.5) 对话历史落库：用户消息 + AI 结论可回放
+    chats = store.list_chat_messages(s3.id)
+    check("对话历史落库（含用户消息）", any(m["role"] == "user" for m in chats))
+    check("对话历史落库（含 AI 结论）", any(m["role"] == "assistant" and m["kind"] == "answer" for m in chats))
 
     # 4) 结论回流：子线索结论落库 + 父会话收到 branch_update
     parent = sessions.create(project=pid, parent_id="", title="回流主对话")

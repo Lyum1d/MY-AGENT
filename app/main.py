@@ -569,6 +569,7 @@ async def confirm_step(sid: str, req: ConfirmRequest):
 
 @app.get("/api/sessions/{sid}")
 async def session_state(sid: str):
+    chat = store.list_chat_messages(sid)  # 对话历史（新旧会话通用，旧会话为空列表）
     s = sessions.get(sid)
     if s:
         return {
@@ -580,6 +581,7 @@ async def session_state(sid: str):
             "title": s.title,
             "records": s.records,
             "summary": s.summary,
+            "chat": chat,
         }
     # 回退到持久化层：服务重启后内存会话已清空，但 store 里仍有记录
     rec = store.get_session(sid)
@@ -599,4 +601,5 @@ async def session_state(sid: str):
         "title": sess.get("title") or "",
         "records": records if isinstance(records, list) else [],
         "summary": sess.get("summary") or "",
+        "chat": chat,
     }

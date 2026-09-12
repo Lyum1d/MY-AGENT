@@ -730,10 +730,30 @@ async function openThread(sid) {
     m.appendChild(el);
   });
 
-  state.steps.forEach(s => {
-    appendLine(`• ${s.tool_name || s.tool_alias} → ${s.target || '-'} [${s.status}]`, 'muted');
-  });
-  if (d.summary) appendAnswer(md(d.summary));
+  // 历史对话回放：有聊天记录时按原气泡样式还原（用户消息 / AI 说明 / 结论）
+  const chat = d.chat || [];
+  if (chat.length) {
+    const chatHead = document.createElement('div');
+    chatHead.className = 'sys-note';
+    chatHead.textContent = '—— 历史对话 ——';
+    m.appendChild(chatHead);
+    chat.forEach(msg => {
+      if (msg.role === 'user') {
+        addUserMessage(msg.content);
+      } else {
+        if (!state.assistant) createAssistant();
+        if (msg.kind === 'answer') appendAnswer(md(msg.content));
+        else appendReasoning(md(msg.content));
+      }
+    });
+    state.assistant = null;
+  } else {
+    // 旧会话无聊天记录：回退为步骤清单 + 结论摘要
+    state.steps.forEach(s => {
+      appendLine(`• ${s.tool_name || s.tool_alias} → ${s.target || '-'} [${s.status}]`, 'muted');
+    });
+    if (d.summary) appendAnswer(md(d.summary));
+  }
   if (d.state === 'running' || d.state === 'awaiting_confirm') {
     connectStream(sid);
     log('该线索正在执行中，已接入实时输出…', 'c-warn');

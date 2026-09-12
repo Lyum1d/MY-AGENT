@@ -68,9 +68,18 @@ CREATE TABLE IF NOT EXISTS facts (
     source      TEXT,
     created_at  REAL
 );
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id          TEXT PRIMARY KEY,
+    session_id  TEXT,
+    role        TEXT,
+    kind        TEXT DEFAULT '',
+    content     TEXT,
+    created_at  REAL
+);
 CREATE INDEX IF NOT EXISTS idx_steps_session ON steps(session_id);
 CREATE INDEX IF NOT EXISTS idx_findings_project ON findings(project_id);
 CREATE INDEX IF NOT EXISTS idx_facts_project ON facts(project_id);
+CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_messages(session_id);
 """
 
 
@@ -343,6 +352,33 @@ def get_session(sid: str) -> dict | None:
             "SELECT * FROM steps WHERE session_id=? ORDER BY created_at ASC", (sid,)
         ).fetchall()]
     return {"session": dict(s), "steps": steps}
+
+
+# ---------- 对话历史（线索回放用） ----------
+def save_chat_message(sid: str, role: str, content: str, kind: str = "") -> None:
+    """持久化一条对话消息：role=user/assistant；kind=reasoning/answer（assistant 侧细分）。
+
+    供「切换线索时回放历史对话」使用；单条截断 8000 字符防膨胀。
+    """
+    text = (content or "").strip()
+    if not text:
+        return
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO chat_messages (id,session_id,role,kind,content,created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (uuid.uuid4().hex[:12], sid, role, kind, text[:8000], time.time()),
+        )
+
+
+def list_chat_messages(sid: str) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT role,kind,content,created_at FROM chat_messages"
+            " WHERE session_id=? ORDER BY created_at ASC, rowid ASC",
+            (sid,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------- 漏洞发现 ----------
