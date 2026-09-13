@@ -447,6 +447,7 @@ class Agent:
 
             await session.emit({"type": "thinking", "step": step_no,
                                 "data": f"第 {step_no} 步：正在决策…"})
+            _t0 = time.time()
             try:
                 result = await backend.chat(messages, tools=registry.build_schemas())
             except Exception as e:
@@ -454,6 +455,20 @@ class Agent:
                 session.state = "error"
                 await session.emit({"type": "done", "state": "error"})
                 return
+            # token 用量落库（仅成功且端点返回 usage 的调用；额度耗尽等失败不计）
+            try:
+                _u = result.get("usage") or {}
+                if _u.get("prompt") or _u.get("completion"):
+                    store.save_usage(
+                        provider_id=backend.name,
+                        model=getattr(backend, "model", ""),
+                        prompt_tokens=_u.get("prompt", 0),
+                        completion_tokens=_u.get("completion", 0),
+                        session_id=session.id, project_id=session.project,
+                        duration_ms=int((time.time() - _t0) * 1000),
+                    )
+            except Exception:
+                logger.exception("token 用量落库失败")
 
             # ---- 模型给出思考/说明 ----
             if result.get("content"):

@@ -442,6 +442,48 @@ button.icon-btn { font-size: 16px; padding: 6px 10px; line-height: 1; }
 .bc-cand-t { font-weight: 500; white-space: nowrap; }
 .bc-cand-o { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 
+/* ---------- Token 用量统计 ---------- */
+.usage-btn { display: flex; align-items: center; gap: 4px; }
+.usage-badge {
+  font-size: 11px; color: var(--accent-text); background: var(--accent-soft);
+  padding: 1px 7px; border-radius: 10px;
+}
+.usage-modal { width: 940px; }
+.usage-cards { display: flex; gap: 10px; margin-bottom: 12px; }
+.ucard {
+  flex: 1; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel-2); padding: 10px 13px;
+}
+.uc-t { font-size: 12px; color: var(--muted); }
+.uc-n { font-size: 20px; font-weight: 650; color: var(--text-strong); margin: 3px 0 2px; }
+.uc-c { font-size: 13px; color: var(--accent-text); }
+.uc-m { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.usage-sec { margin-bottom: 14px; }
+.usage-sec-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.usage-sec.two-col { display: flex; gap: 18px; }
+.usage-sec.two-col > div { flex: 1; min-width: 0; }
+.usage-chart { border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); padding: 6px; }
+.uchart-bar { fill: var(--accent); }
+.uchart-grid { stroke: var(--border); stroke-width: 1; }
+.uchart-x, .uchart-y { fill: var(--muted); font-size: 10px; }
+.usage-bars { display: flex; flex-direction: column; gap: 7px; }
+.ubar-head { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 2px; }
+.ubar-track { height: 7px; border-radius: 4px; background: var(--panel-3); overflow: hidden; }
+.ubar-fill { height: 100%; border-radius: 4px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+.usage-filters { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+.usage-filters select { max-width: 200px; }
+.flex-sp { flex: 1; }
+.usage-table-wrap { max-height: 260px; overflow-y: auto; border: 1px solid var(--border); border-radius: 9px; }
+.usage-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.usage-table th, .usage-table td {
+  text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border-soft);
+}
+.usage-table th {
+  position: sticky; top: 0; background: var(--panel-2);
+  font-weight: 600; color: var(--muted); font-size: 11.5px;
+}
+.usage-table td input { padding: 3px 7px; font-size: 12px; }
+
 /* ---------- 滚动条 ---------- */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }

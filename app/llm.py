@@ -112,10 +112,16 @@ class OpenAICompatBackend(LLMBackend):
         reasoning = msg.get("reasoning_content") or ""
         if not content and reasoning:
             content = reasoning
+        # token 用量（用量统计用）：OpenAI 兼容 usage.prompt_tokens / completion_tokens
+        usage = data.get("usage") or {}
         return {
             "tool_calls": _normalize_tool_calls(msg.get("tool_calls")),
             "content": content,
             "backend": self.name,
+            "usage": {
+                "prompt": int(usage.get("prompt_tokens") or 0),
+                "completion": int(usage.get("completion_tokens") or 0),
+            },
         }
 
     # ---------- 健康检查 / 模型列表 ----------
@@ -352,10 +358,16 @@ class AnthropicBackend(LLMBackend):
                         "arguments": json.dumps(blk.get("input", {}), ensure_ascii=False),
                     },
                 })
+        # token 用量（用量统计用）：Anthropic usage.input_tokens / output_tokens
+        u = data.get("usage") or {}
         return {
             "tool_calls": tool_calls,
             "content": "\n".join(text_parts),
             "backend": self.name,
+            "usage": {
+                "prompt": int(u.get("input_tokens") or 0),
+                "completion": int(u.get("output_tokens") or 0),
+            },
         }
 
     async def health(self) -> dict:

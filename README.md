@@ -152,6 +152,7 @@ src-agent/
 │   ├── intel.py              项目情报库注入
 │   ├── kb.py                 SRC 知识库/工作流规则检索（data/kb + data/rules）
 │   ├── fofa.py               FOFA 资产测绘客户端（key 走本机 config.yaml，trust_env=False）
+│   ├── usage.py              Token 用量聚合与模型单价表（data/usage_prices.json）
 │   ├── providers.py        通用 LLM 供应商注册中心（预设厂商 / 增删改 / 持久化）
 │   ├── llm.py              模型层：OpenAI 兼容 + Anthropic 原生双协议通用后端
 │   ├── agent.py            ReAct 单步决策循环（SOP 与事实纪律在 SYSTEM_PROMPT；对话树上下文注入/结论回流）
@@ -245,6 +246,21 @@ src-agent/
 
 > 实测提醒：并非所有模型都支持 function calling。控制台「测试」里工具调用显示 ✗ 的型号，
 > 只能当聊天模型用，无法驱动工具编排。
+
+### Token 用量统计
+
+顶栏「📊 用量」按钮（带今日 token 徽标）或「设置 → 用量统计」打开独立弹窗：
+
+- **三档汇总卡**：今日 / 本月 / 累计（token 数 + 人民币费用估算 + 调用次数）
+- **按天趋势图**（最近 30 天，纯 SVG 无外部依赖）
+- **分模型占比 + 分项目排行**（本地 Ollama 统计 token、费用为 0）
+- **调用明细表**：逐条 LLM 调用（时间/项目/模型/输入/输出/耗时），可按项目、模型、时间筛选
+- **单价管理**：输入/输出分开计价（¥/百万 token），预填常见模型价，可改可增删、可恢复默认
+- **数据管理**：清空（全部或 N 天前）、导出 CSV
+
+实现：每次 LLM 调用成功后从响应 usage 提取 token 数落库（`usage_log` 表，自上线起统计，
+旧会话无 usage 数据不回填；失败调用不计费）；接口 `GET /api/usage/{summary,daily,list,prices,export.csv}`、
+`POST /api/usage/{prices,prices/reset,clear}`。费用为估算值，请在单价表里按自己账单校准。
 
 ### 其他
 

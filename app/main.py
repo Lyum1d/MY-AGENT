@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
@@ -11,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, providers, report, store
+from . import config, providers, report, store, usage
 from .agent import agent, sessions
 from .executor import executor
 from .llm import current_backend_name, get_backend, set_backend
@@ -414,6 +415,81 @@ async def get_report(pid: str):
 async def export_report(pid: str):
     path = report.export_report(pid)
     return {"path": path}
+
+
+# ---------- Token 用量统计 ----------
+@app.get("/api/usage/summary")
+async def usage_summary():
+    """三档汇总（今日/本月/累计）+ 分模型 + 分项目聚合。费用为按单价表的估算值。"""
+    return usage.summary()
+
+
+@app.get("/api/usage/daily")
+async def usage_daily(days: int = 30):
+    """按天聚合（最近 N 天，空天补 0），供趋势图。"""
+    return {"items": usage.daily(max(1, min(days, 90)))}
+
+
+@app.get("/api/usage/list")
+async def usage_list(project_id: str = "", model: str = "", days: int = 0, limit: int = 300):
+    """逐条调用明细（倒序）。"""
+    return {"items": store.list_usage(project_id=project_id, model=model,
+                                      days=days, limit=min(limit, 2000))}
+
+
+class UsagePriceItem(BaseModel):
+    input: float = 0.0
+    output: float = 0.0
+
+
+class UsagePricesRequest(BaseModel):
+    prices: dict[str, UsagePriceItem]  # key: 模型名或 provider/model；单位 元/百万 token
+
+
+@app.get("/api/usage/prices")
+async def usage_prices_get():
+    return {"items": usage._load_prices(), "defaults": usage.DEFAULT_PRICES}
+
+
+@app.post("/api/usage/prices")
+async def usage_prices_set(req: UsagePricesRequest):
+    """覆盖保存单价表（人民币 元/百万 token；输入/输出分开）。"""
+    usage.save_prices({k: v.model_dump() for k, v in req.prices.items()})
+    return {"ok": True, "items": usage._load_prices()}
+
+
+@app.post("/api/usage/prices/reset")
+async def usage_prices_reset():
+    usage.reset_prices()
+    return {"ok": True, "items": usage._load_prices()}
+
+
+@app.post("/api/usage/clear")
+async def usage_clear(days: int = 0):
+    """清空用量记录；days>0 表示只删除 N 天前的旧记录（保留最近 N 天）。"""
+    deleted = store.clear_usage(days=max(0, days))
+    return {"ok": True, "deleted": deleted}
+
+
+@app.get("/api/usage/export.csv")
+async def usage_export():
+    """导出全部明细为 CSV（Excel 友好，UTF-8 BOM）。"""
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["时间", "项目", "会话", "供应商", "模型", "输入tokens", "输出tokens", "耗时ms"])
+    name_map = {p["id"]: p["name"] for p in store.list_projects()}
+    for r in store.list_usage(limit=5000):
+        w.writerow([
+            datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M:%S"),
+            name_map.get(r["project_id"], r["project_id"] or "未关联项目"),
+            r["session_id"], r["provider_id"], r["model"],
+            r["prompt_tokens"], r["completion_tokens"], r["duration_ms"],
+        ])
+    from fastapi.responses import Response
+    return Response(content="\ufeff" + buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": "attachment; filename=usage_export.csv"})
 
 
 # ---------- 会话与 Agent ----------

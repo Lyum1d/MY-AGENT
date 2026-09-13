@@ -65,6 +65,7 @@
         <span class="p-target" id="currentProjectTarget"></span>
       </div>
       <div class="status" id="status"></div>
+      <button class="ghost usage-btn" id="usageBtn" onclick="openUsage()" title="Token 用量统计">📊 用量 <span class="usage-badge" id="usageBadge"></span></button>
       <button class="ghost icon-btn" id="themeToggle" onclick="toggleTheme()" title="切换亮/暗主题">🌙</button>
       <button class="ghost" id="toggleRightBtn" onclick="toggleRight()">报告 ▸</button>
     </header>
@@ -142,7 +143,10 @@
   <div class="modal">
     <div class="modal-head">
       <b>模型设置 · 通用 LLM 接入</b>
-      <button class="sm" onclick="closeSettings()">关闭</button>
+      <div style="display:flex;gap:8px;">
+        <button class="sm" onclick="closeSettings();openUsage()">📊 用量统计</button>
+        <button class="sm" onclick="closeSettings()">关闭</button>
+      </div>
     </div>
 
     <div class="modal-tip">
@@ -217,6 +221,79 @@
       <button onclick="closeBranchModal()">取消</button>
     </div>
     <div id="branchState" class="muted" style="margin-top:6px;"></div>
+  </div>
+</div>
+
+<!-- ============ Token 用量统计 ============ -->
+<div id="usageModal" class="modal-mask">
+  <div class="modal usage-modal">
+    <div class="modal-head">
+      <b>📊 Token 用量统计</b>
+      <button class="sm" onclick="closeUsage()">关闭</button>
+    </div>
+    <div class="modal-tip">自功能上线起统计；费用为按单价表的估算值（人民币），单价可在下方自行调整。本地 Ollama 统计 token、费用为 0。</div>
+
+    <div class="usage-cards">
+      <div class="ucard"><div class="uc-t">今日</div><div class="uc-n" id="uTodayTok">-</div><div class="uc-c" id="uTodayCost">-</div><div class="uc-m" id="uTodayCalls"></div></div>
+      <div class="ucard"><div class="uc-t">本月</div><div class="uc-n" id="uMonthTok">-</div><div class="uc-c" id="uMonthCost">-</div><div class="uc-m" id="uMonthCalls"></div></div>
+      <div class="ucard"><div class="uc-t">累计</div><div class="uc-n" id="uTotalTok">-</div><div class="uc-c" id="uTotalCost">-</div><div class="uc-m" id="uTotalCalls"></div></div>
+    </div>
+
+    <div class="usage-sec">
+      <div class="usage-sec-title">按天趋势（tokens）</div>
+      <div id="uDailyChart" class="usage-chart"><div class="empty">加载中…</div></div>
+    </div>
+
+    <div class="usage-sec two-col">
+      <div>
+        <div class="usage-sec-title">按模型</div>
+        <div id="uByModel" class="usage-bars"></div>
+      </div>
+      <div>
+        <div class="usage-sec-title">按项目</div>
+        <div id="uByProject" class="usage-bars"></div>
+      </div>
+    </div>
+
+    <div class="usage-sec">
+      <div class="usage-sec-title">调用明细</div>
+      <div class="usage-filters">
+        <select id="uFilterProject" onchange="loadUsageList()"><option value="">全部项目</option></select>
+        <select id="uFilterModel" onchange="loadUsageList()"><option value="">全部模型</option></select>
+        <select id="uFilterDays" onchange="loadUsageList()">
+          <option value="0">全部时间</option>
+          <option value="1">今天</option>
+          <option value="7">最近 7 天</option>
+          <option value="30">最近 30 天</option>
+        </select>
+        <span class="flex-sp"></span>
+        <button class="sm" onclick="exportUsage()">导出 CSV</button>
+        <button class="sm danger" onclick="clearUsageAsk()">清理记录…</button>
+      </div>
+      <div class="usage-table-wrap">
+        <table class="usage-table" id="uTable">
+          <thead><tr><th>时间</th><th>项目</th><th>模型</th><th>输入</th><th>输出</th><th>耗时</th></tr></thead>
+          <tbody><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="usage-sec">
+      <div class="usage-sec-title">模型单价（人民币 元/百万 token；输入/输出分开）</div>
+      <div class="usage-table-wrap">
+        <table class="usage-table" id="uPriceTable">
+          <thead><tr><th>模型（provider:model 或模型名）</th><th>输入价</th><th>输出价</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:8px;">
+        <button class="sm" onclick="addPriceRow()">+ 新增单价</button>
+        <span class="flex-sp"></span>
+        <button class="sm" onclick="resetPrices()">恢复默认价</button>
+        <button class="primary sm" onclick="savePrices()">保存单价</button>
+      </div>
+      <div id="uPriceState" class="muted" style="margin-top:4px;"></div>
+    </div>
   </div>
 </div>
 

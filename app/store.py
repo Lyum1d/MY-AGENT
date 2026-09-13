@@ -76,10 +76,23 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     content     TEXT,
     created_at  REAL
 );
+CREATE TABLE IF NOT EXISTS usage_log (
+    id              TEXT PRIMARY KEY,
+    ts              REAL,
+    session_id      TEXT DEFAULT '',
+    project_id      TEXT DEFAULT '',
+    provider_id     TEXT DEFAULT '',
+    model           TEXT DEFAULT '',
+    prompt_tokens   INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    duration_ms     INTEGER DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS idx_steps_session ON steps(session_id);
 CREATE INDEX IF NOT EXISTS idx_findings_project ON findings(project_id);
 CREATE INDEX IF NOT EXISTS idx_facts_project ON facts(project_id);
 CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_log(ts);
+CREATE INDEX IF NOT EXISTS idx_usage_project ON usage_log(project_id);
 """
 
 
@@ -379,6 +392,51 @@ def list_chat_messages(sid: str) -> list[dict]:
             (sid,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------- Token 用量统计 ----------
+def save_usage(provider_id: str, model: str, prompt_tokens: int, completion_tokens: int,
+               session_id: str = "", project_id: str = "", duration_ms: int = 0) -> None:
+    """记录一次 LLM 调用的 token 用量（仅成功且有 usage 数据的调用）。"""
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO usage_log (id,ts,session_id,project_id,provider_id,model,"
+            "prompt_tokens,completion_tokens,duration_ms) VALUES (?,?,?,?,?,?,?,?,?)",
+            (uuid.uuid4().hex[:12], time.time(), session_id or "", project_id or "",
+             provider_id or "", model or "", int(prompt_tokens or 0),
+             int(completion_tokens or 0), int(duration_ms or 0)),
+        )
+
+
+def list_usage(project_id: str = "", model: str = "", days: int = 0,
+               limit: int = 500) -> list[dict]:
+    """明细记录（倒序）。days>0 限定最近 N 天；project_id/model 空串为不过滤。"""
+    q = "SELECT * FROM usage_log WHERE 1=1"
+    vals: list = []
+    if project_id:
+        q += " AND project_id=?"
+        vals.append(project_id)
+    if model:
+        q += " AND model=?"
+        vals.append(model)
+    if days > 0:
+        q += " AND ts>=?"
+        vals.append(time.time() - days * 86400)
+    q += " ORDER BY ts DESC LIMIT ?"
+    vals.append(max(1, min(limit, 5000)))
+    with _conn() as c:
+        rows = c.execute(q, vals).fetchall()
+    return [dict(r) for r in rows]
+
+
+def clear_usage(days: int = 0) -> int:
+    """清空用量记录；days>0 只删最近 N 天之外的……即保留最近 N 天，删除更早的。"""
+    with _conn() as c:
+        if days > 0:
+            cur = c.execute("DELETE FROM usage_log WHERE ts<?", (time.time() - days * 86400,))
+        else:
+            cur = c.execute("DELETE FROM usage_log")
+    return cur.rowcount
 
 
 # ---------- 漏洞发现 ----------

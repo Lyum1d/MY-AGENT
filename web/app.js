@@ -221,6 +221,7 @@ async function init() {
   }
   loadProjects().then(() => { autoSelectProject(); renderProjects(); updateProjectHeader(); loadFindings(); loadFacts(); loadTree(); });
   loadTools();
+  refreshUsageBadge();
 }
 
 /* ---------- 模型切换 ---------- */
@@ -590,6 +591,7 @@ function handleEvent(ev) {
       state.eventSource.close();
       state.threadFresh = false;
       if (state.currentProject) { loadFindings(); loadFacts(); loadTree(); }
+      refreshUsageBadge();
       break;
   }
 }
@@ -879,6 +881,236 @@ function showBranchCard(data) {
     }
   };
   card.querySelector('.bc-no').onclick = () => card.remove();
+}
+
+/* ---------- Token 用量统计 ---------- */
+function fmtTok(n) {
+  n = n || 0;
+  if (n >= 10000) return (n / 10000).toFixed(1) + '万';
+  return String(n);
+}
+function fmtCost(c) {
+  return '≈ ¥' + (c || 0).toFixed(c > 0 && c < 1 ? 4 : 2);
+}
+
+/* 顶栏徽标：今日 token（任务完成后与打开弹窗时刷新） */
+async function refreshUsageBadge() {
+  try {
+    const d = await api('/api/usage/summary');
+    const b = $('usageBadge');
+    if (b) b.textContent = d.today.calls ? `今日 ${fmtTok(d.today.tokens)} tok` : '';
+  } catch (e) { /* 静默 */ }
+}
+
+function openUsage() {
+  $('usageModal').style.display = 'flex';
+  loadUsage();
+  loadUsageList();
+  loadPriceEditor();
+}
+function closeUsage() { $('usageModal').style.display = 'none'; }
+
+async function loadUsage() {
+  try {
+    const [sum, daily, projects] = await Promise.all([
+      api('/api/usage/summary'),
+      api('/api/usage/daily?days=30'),
+      api('/api/projects'),
+    ]);
+    // 汇总卡
+    $('uTodayTok').textContent = fmtTok(sum.today.tokens) + ' tok';
+    $('uTodayCost').textContent = fmtCost(sum.today.cost);
+    $('uTodayCalls').textContent = `${sum.today.calls} 次调用 · 输入 ${fmtTok(sum.today.prompt)} / 输出 ${fmtTok(sum.today.completion)}`;
+    $('uMonthTok').textContent = fmtTok(sum.month.tokens) + ' tok';
+    $('uMonthCost').textContent = fmtCost(sum.month.cost);
+    $('uMonthCalls').textContent = `${sum.month.calls} 次调用`;
+    $('uTotalTok').textContent = fmtTok(sum.total.tokens) + ' tok';
+    $('uTotalCost').textContent = fmtCost(sum.total.cost);
+    $('uTotalCalls').textContent = `${sum.total.calls} 次调用`;
+    // 占比
+    renderUsageBars('uByModel', sum.by_model, sum.total.tokens);
+    renderUsageBars('uByProject', sum.by_project, sum.total.tokens,
+      Object.fromEntries(projects.items.map(p => [p.id, p.name])));
+    // 筛选下拉
+    const pSel = $('uFilterProject');
+    const curP = pSel.value;
+    pSel.innerHTML = '<option value="">全部项目</option>' + projects.items.map(p =>
+      `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+    pSel.value = curP;
+    const mSel = $('uFilterModel');
+    const curM = mSel.value;
+    mSel.innerHTML = '<option value="">全部模型</option>' + Object.keys(sum.by_model).map(k =>
+      `<option value="${esc(k.split(':')[1] || k)}">${esc(k)}</option>`).join('');
+    mSel.value = curM;
+    // 趋势图
+    renderDailyChart(daily.items);
+    refreshUsageBadge();
+  } catch (e) {
+    log('用量加载失败：' + e.message, 'c-err');
+  }
+}
+
+/* 横向占比条 */
+function renderUsageBars(elId, map, total, nameMap) {
+  const el = $(elId);
+  const entries = Object.entries(map || {}).sort((a, b) => b[1].tokens - a[1].tokens);
+  if (!entries.length) { el.innerHTML = '<div class="empty">暂无数据</div>'; return; }
+  const maxTok = entries[0][1].tokens || 1;
+  el.innerHTML = entries.map(([k, v]) => {
+    const label = nameMap ? (nameMap[k] || (k ? k.slice(0, 8) : '未关联项目')) : k;
+    const pct = total ? Math.round(v.tokens / total * 100) : 0;
+    return `<div class="ubar" title="${esc(label)}：${v.tokens} tok / ${v.calls} 次 / ${fmtCost(v.cost)}">
+      <div class="ubar-head"><span>${esc(label)}</span><span class="muted">${fmtTok(v.tokens)} · ${pct}% · ${fmtCost(v.cost)}</span></div>
+      <div class="ubar-track"><div class="ubar-fill" style="width:${Math.max(3, Math.round(v.tokens / maxTok * 100))}%"></div></div>
+    </div>`;
+  }).join('');
+}
+
+/* SVG 按天柱状图（无外部依赖） */
+function renderDailyChart(items) {
+  const el = $('uDailyChart');
+  if (!items || !items.some(d => d.tokens)) {
+    el.innerHTML = '<div class="empty">暂无数据：跑一个任务后这里会出现按天趋势</div>';
+    return;
+  }
+  const W = 860, H = 180, padL = 44, padB = 22, padT = 10;
+  const maxTok = Math.max(...items.map(d => d.tokens), 1);
+  const bw = (W - padL - 8) / items.length;
+  const bars = items.map((d, i) => {
+    const h = Math.round(d.tokens / maxTok * (H - padT - padB));
+    const x = padL + i * bw + 1;
+    const y = H - padB - h;
+    const tip = `${d.day}｜${fmtTok(d.tokens)} tok · ${d.calls} 次 · ${fmtCost(d.cost)}`;
+    return `<rect x="${x}" y="${y}" width="${Math.max(1, bw - 3)}" height="${h}" rx="2"
+      class="uchart-bar"><title>${esc(tip)}</title></rect>
+      ${i % Math.ceil(items.length / 10) === 0 ? `<text x="${x + bw / 2}" y="${H - 6}" text-anchor="middle" class="uchart-x">${d.day}</text>` : ''}`;
+  }).join('');
+  const gridLines = [0.25, 0.5, 0.75, 1].map(f => {
+    const y = H - padB - f * (H - padT - padB);
+    return `<line x1="${padL}" y1="${y}" x2="${W - 8}" y2="${y}" class="uchart-grid"/>
+      <text x="${padL - 5}" y="${y + 4}" text-anchor="end" class="uchart-y">${fmtTok(Math.round(maxTok * f))}</text>`;
+  }).join('');
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" style="width:100%;">${gridLines}${bars}</svg>`;
+}
+
+async function loadUsageList() {
+  const pid = $('uFilterProject').value;
+  const model = $('uFilterModel').value;
+  const days = $('uFilterDays').value;
+  const qs = new URLSearchParams({ project_id: pid, model, days, limit: '300' });
+  try {
+    const d = await api('/api/usage/list?' + qs.toString());
+    const projNames = {};
+    try {
+      const projects = await api('/api/projects');
+      projects.items.forEach(p => projNames[p.id] = p.name);
+    } catch (e) { /* 项目名映射失败就显示 id */ }
+    const tb = $('uTable').querySelector('tbody');
+    if (!d.items.length) {
+      tb.innerHTML = '<tr><td colspan="6" class="empty">暂无记录</td></tr>';
+      return;
+    }
+    tb.innerHTML = d.items.map(r => {
+      const t = new Date(r.ts * 1000);
+      const time = `${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')} ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
+      return `<tr>
+        <td>${time}</td>
+        <td>${esc(projNames[r.project_id] || (r.project_id ? r.project_id.slice(0, 8) : '未关联'))}</td>
+        <td>${esc(r.provider_id)} / ${esc(r.model)}</td>
+        <td>${r.prompt_tokens}</td>
+        <td>${r.completion_tokens}</td>
+        <td>${r.duration_ms ? (r.duration_ms / 1000).toFixed(1) + 's' : '-'}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    log('明细加载失败：' + e.message, 'c-err');
+  }
+}
+
+/* ---------- 单价编辑 ---------- */
+async function loadPriceEditor() {
+  try {
+    const d = await api('/api/usage/prices');
+    renderPriceRows(d.items);
+  } catch (e) { /* 静默 */ }
+}
+
+function renderPriceRows(prices) {
+  const tb = $('uPriceTable').querySelector('tbody');
+  const keys = Object.keys(prices || {}).sort();
+  tb.innerHTML = keys.map(k => `
+    <tr>
+      <td><input class="up-key" value="${esc(k)}" style="width:100%;"></td>
+      <td><input class="up-in" type="number" step="0.01" min="0" value="${prices[k].input}"></td>
+      <td><input class="up-out" type="number" step="0.01" min="0" value="${prices[k].output}"></td>
+      <td><button class="sm danger" onclick="this.closest('tr').remove()">删</button></td>
+    </tr>`).join('') || '<tr><td colspan="4" class="empty">无单价条目，点「+ 新增单价」</td></tr>';
+}
+
+function addPriceRow(model = '', input = 0, output = 0) {
+  const tb = $('uPriceTable').querySelector('tbody');
+  if (tb.querySelector('.empty')) tb.innerHTML = '';
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td><input class="up-key" value="${esc(model)}" placeholder="模型名，如 qwen3.7-plus" style="width:100%;"></td>
+    <td><input class="up-in" type="number" step="0.01" min="0" value="${input}"></td>
+    <td><input class="up-out" type="number" step="0.01" min="0" value="${output}"></td>
+    <td><button class="sm danger" onclick="this.closest('tr').remove()">删</button></td>`;
+  tb.appendChild(tr);
+}
+
+async function savePrices() {
+  const prices = {};
+  $('uPriceTable').querySelectorAll('tbody tr').forEach(tr => {
+    const k = tr.querySelector('.up-key').value.trim();
+    if (!k) return;
+    prices[k] = {
+      input: parseFloat(tr.querySelector('.up-in').value) || 0,
+      output: parseFloat(tr.querySelector('.up-out').value) || 0,
+    };
+  });
+  try {
+    await api('/api/usage/prices', { method: 'POST', body: JSON.stringify({ prices }) });
+    $('uPriceState').textContent = '单价已保存，费用估算立即按新价生效。';
+    loadUsage();
+  } catch (e) {
+    $('uPriceState').textContent = '保存失败：' + e.message;
+  }
+}
+
+async function resetPrices() {
+  if (!confirm('恢复默认单价表（当前修改会被覆盖）？')) return;
+  try {
+    const d = await api('/api/usage/prices/reset', { method: 'POST' });
+    renderPriceRows(d.items);
+    $('uPriceState').textContent = '已恢复默认单价。';
+    loadUsage();
+  } catch (e) {
+    $('uPriceState').textContent = '恢复失败：' + e.message;
+  }
+}
+
+/* ---------- 清空 / 导出 ---------- */
+function exportUsage() {
+  window.open('/api/usage/export.csv', '_blank');
+}
+
+async function clearUsageAsk() {
+  const choice = prompt(
+    '清理用量记录：\n输入 0 = 清空全部\n输入 N（如 30）= 只删除 N 天前的旧记录\n输入其他或取消 = 放弃', '0');
+  if (choice === null) return;
+  const days = parseInt(choice, 10);
+  if (isNaN(days) || days < 0) return;
+  if (!confirm(days === 0 ? '确定清空全部用量记录？不可恢复。' : `确定删除 ${days} 天前的用量记录？`)) return;
+  try {
+    const r = await api('/api/usage/clear', { method: 'POST', body: JSON.stringify({ days }) });
+    log(`已清理 ${r.deleted} 条用量记录`, 'c-ok');
+    loadUsage();
+    loadUsageList();
+    refreshUsageBadge();
+  } catch (e) {
+    alert('清理失败：' + e.message);
+  }
 }
 
 /* ---------- 右侧面板折叠 ---------- */
@@ -1268,6 +1500,10 @@ document.querySelectorAll('.tab').forEach(t => {
 
 $('settingsModal').addEventListener('click', e => {
   if (e.target.id === 'settingsModal') closeSettings();
+});
+
+$('usageModal').addEventListener('click', e => {
+  if (e.target.id === 'usageModal') closeUsage();
 });
 
 init();
