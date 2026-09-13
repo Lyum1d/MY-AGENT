@@ -33,3 +33,10 @@ data/runtime.json
 # 每段执行过的代码按 data/scripts/exec/<目标域名>/exec_<时间戳>.py 留档，
 # 目录名本身即目标、代码内可能含 payload/凭据。仓库为 public，必须排除。
 data/scripts/
+
+# 更新工具产物
+update.exe
+update_backup_*/
+update_state.json
+build/
+update.spec
