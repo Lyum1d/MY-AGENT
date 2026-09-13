@@ -75,7 +75,7 @@ python run.py          → 命令行启动（--no-browser 不自动开浏览器�
 
 ### 内置工具（始终对 LLM 可见，不占配额）
 
-除工具箱工具外，注册表内置 4 个能力（`app/registry.py::_add_builtin_tools`）：
+除工具箱工具外，注册表内置 8 个能力（`app/registry.py::_add_builtin_tools`）：
 
 | 别名 | 风险 | 作用 |
 |---|---|---|
@@ -83,6 +83,13 @@ python run.py          → 命令行启动（--no-browser 不自动开浏览器�
 | nuclei_cli | L2 | nuclei 模板漏洞验证 |
 | note_fact | L0 | 记录已证事实（见上） |
 | py_exec | L3 | **Python 代码执行通道**：让 Agent 对单点任务直接写代码（HTTP 用 httpx/requests），代码留档 `data/scripts/exec/`，超时自动中断 |
+| search_history | L0 | 跨线索检索项目内历史工具输出 |
+| kb_search / kb_read | L0 | **SRC 知识库检索/阅读**（`data/kb/` 49 篇漏洞类型打法 + `data/rules/` 11 篇工作流规则，来自外部方法论包经安全审查后移植） |
+| fofa_search | L1 | **FOFA 资产测绘**（key 在本机 config.yaml 的 fofaEmail/fofaKey，未配置则提示；查询只走 fofa.info） |
+
+知识库使用纪律已写入系统提示：进站先读「打穿短表」，按目标特征（用户体系→越权、上传→file-upload、
+支付→logic+race-condition 等）kb_search 找对应篇目再动手；CORS 永不挖；写正式报告前先读
+`vuln-report-format`（取舍闸门）；FOFA 按「一种子闭环」节奏使用。
 
 `py_exec` 借鉴了 Intent Engineering 思路（意图直出代码而非碎片化工具串），能力等同本机命令行，
 故定级 L3：需用户确认 + 勾选书面授权才会执行。
@@ -143,6 +150,8 @@ src-agent/
 │   ├── pyexec.py             Python 代码执行通道（py_exec 后端）
 │   ├── replayer.py           HTTP 重放器 / nuclei 托管运行器
 │   ├── intel.py              项目情报库注入
+│   ├── kb.py                 SRC 知识库/工作流规则检索（data/kb + data/rules）
+│   ├── fofa.py               FOFA 资产测绘客户端（key 走本机 config.yaml，trust_env=False）
 │   ├── providers.py        通用 LLM 供应商注册中心（预设厂商 / 增删改 / 持久化）
 │   ├── llm.py              模型层：OpenAI 兼容 + Anthropic 原生双协议通用后端
 │   ├── agent.py            ReAct 单步决策循环（SOP 与事实纪律在 SYSTEM_PROMPT；对话树上下文注入/结论回流）

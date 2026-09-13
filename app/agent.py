@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import config, store
+from . import kb, fofa
 from . import pyexec
 from . import replayer
 from .executor import executor
@@ -49,6 +50,27 @@ SYSTEM_PROMPT = """你是一个渗透测试编排助手，服务于 SRC（安全
    向用户建议开辟新线索，由用户确认；新线索会带上相关记录独立推进，避免当前对话信息过载。
 10. 需要其他线索里已查到的信息时，调用 search_history 按关键词检索（子域名、路径、端口、
     工具结果等），检索到的内容是已证实的工具输出，可直接引用；检索不到就继续用工具查证。
+
+知识库与测绘（kb / fofa）：
+11. 进站先调用 kb_read 读「打穿短表」（手法索引，当开场几枪），再按目标特征用 kb_search 找
+    对应打法篇目并用 kb_read 读全文后动手——禁止凭空编测试手法，禁止每站通读全部篇目。
+    特征对照速查：有用户体系→idor-test+authbypass-test；有搜索/筛选→injection-test；有上传→
+    file-upload-test；有内容请求/预览→ssrf-test；有评论/富文本→xss-test；有支付/优惠券→
+    logic-test+race-condition-test；接口字段多→info-leak-test；OAuth/JWT→oauth-jwt-test；
+    GraphQL→graphql-test；网关/微服务→api-gateway-test；前后端分离→http-smuggling-test；
+    WAF 拦截→waf-bypass（有差分面的参数被拦才读）；路径/下载→path-traversal-lfi-test；
+    XML 解析→xxe-test；Java 反序列化/中间件→deserialization-test+jndi-injection-test；
+    JS 加密参数→js-reverse-guide；公开 Redis/rsync/FPM/AJP/h2-console→info-leak-test。
+12. 安全红线（知识库打法之上，不可违反）：越权验证优先读/列表差分（GET）；写越权按
+    「先添加→删自己刚加的」顺序，禁止改/删他人已有对象，禁止扣钱/清库存/批量/真资损；
+    用户提供登录态后严禁登出/注销/吊销会话；CORS 永不挖（勿读 cors-test.md）；禁止开场对
+    每个 path 喂引号当注入检测，注入打在有差分面的参数上；nuclei/afrog 只当已知 CVE 辅助，
+    禁止全量模板当本站矩阵。
+13. FOFA 测绘（fofa_search）按「一种子闭环」：一个种子（业务名/根域/全资子公司）查完 →
+    去重去废存活确认 → 剩余活面挖完 → 才查下一个种子；禁止多种子一次搜完再挖、禁止拿
+    测绘充数代替实际挖掘。查到的每个活面都要真实探测。
+14. 写正式漏洞报告前先 kb_read 读 vuln-report-format（报告取舍闸门：认钥闸/匿名闸/不写清单，
+    低危信息类默认不单独成篇；最终落库仍按本项目补天格式）。
 
 Web 站点渗透 SOP（不可跳步，先手工后工具）：
 ① 打开页面看结构 → ② 查源码/JS/注释/接口，收集泄露信息（凭据、API、内网路径）→
@@ -573,6 +595,11 @@ class Agent:
                     await self._propose_branch(session, tc, args)
                     continue
 
+                # ---- 内置 kb_search / kb_read / fofa_search（知识库与测绘，L0/L1）----
+                if tool.alias in ("kb_search", "kb_read", "fofa_search"):
+                    await self._kb_fofa_tool(session, tool.alias, tc, args)
+                    continue
+
                 # ---- 校验目标（模型会把中文句子当目标传入） ----
                 bad_target = validate_target(target)
                 if bad_target:
@@ -718,6 +745,47 @@ class Agent:
                 f"请继续当前任务，或在当前方向确实告一段落时给出结论结束。")
         session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
         await session.emit({"type": "reasoning", "data": f"（已发出开新线索建议：《{title}》，等待用户确认）"})
+
+    # ---------- 知识库 / FOFA 测绘 ----------
+    async def _kb_fofa_tool(self, session: Session, alias: str, tc: dict, args: str) -> None:
+        """kb_search / kb_read / fofa_search 内置工具执行。"""
+        arg = (args or "").strip()
+        try:
+            if alias == "kb_search":
+                if arg.lower() == "list" or not arg:
+                    topics = kb.list_topics()
+                    body = "\n".join(f"- [{t['category']}] {t['file']}  {t['title']}" for t in topics)
+                    note = f"知识库共 {len(topics)} 篇（kb=漏洞类型打法，rules=工作流/报告规则）：\n{body}"
+                else:
+                    hits = kb.search(arg)
+                    if not hits:
+                        note = f"知识库中未检索到「{arg}」。可用 args='list' 查看全部篇目名。"
+                    else:
+                        body = "\n".join(
+                            f"- [{h['category']}] {h['file']}（命中 {h['score']}）\n  {h['snippet'][:200]}"
+                            for h in hits
+                        )
+                        note = f"「{arg}」命中 {len(hits)} 篇，用 kb_read 读全文：\n{body}"
+            elif alias == "kb_read":
+                r = kb.read(arg)
+                note = f"【{r.get('file', arg)}】\n{r.get('content') or r.get('error', '')}"
+            else:  # fofa_search
+                r = await fofa.search(arg)
+                if r.get("error"):
+                    note = f"FOFA 查询失败：{r['error']}"
+                else:
+                    body = "\n".join(
+                        f"- {x.get('host', '')} | {x.get('ip', '')}:{x.get('port', '')}"
+                        f" | {(x.get('title') or '')[:40]} | {(x.get('server') or '')[:30]}"
+                        for x in r.get("results", [])
+                    )
+                    note = (f"FOFA 查询「{r['query']}」返回 {r['count']} 条（消耗 F点：{r.get('consumed_fpoint', '?')}）：\n{body}"
+                            "\n按「一种子闭环」：把这些活面挖完再查下一个种子。")
+        except Exception as e:
+            note = f"{alias} 执行异常：{e}"
+            logger.exception("%s 执行异常", alias)
+        session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note[: config.MAX_OUTPUT_CHARS + 2000]})
+        await session.emit({"type": "reasoning", "data": f"（{alias} → {'OK' if '失败' not in note and '异常' not in note else '见结果'}）"})
 
     # ---------- 对话树：结论回流 ----------
     async def _write_back(self, session: Session, answer: str) -> None:

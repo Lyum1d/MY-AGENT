@@ -314,6 +314,45 @@ class ToolRegistry:
                 "executable": "builtin://propose_branch",
                 "exists": True,
             },
+            {
+                "name": "知识库检索",
+                "alias": "kb_search",
+                "description": "在 SRC 漏洞挖掘知识库（按漏洞类型的测试指南：越权/注入/SSRF/XSS/上传/"
+                               "逻辑/反序列化/JS 逆向/WAF 绕过等 49 篇）与挖掘工作流规则中按关键词检索。"
+                               "进站前用它找「当前目标特征对应哪篇打法」。",
+                "risk_level": "L0",
+                "risk_reason": "纯本地文件检索，无网络行为",
+                "caveat": "target 可省略；args 填关键词（如：越权、文件上传、swagger、子域接管），"
+                          "args 填 list 返回全部篇目目录。命中后用 kb_read 读全文再动手。",
+                "executable": "builtin://kb_search",
+                "exists": True,
+            },
+            {
+                "name": "知识库阅读",
+                "alias": "kb_read",
+                "description": "阅读知识库/工作流规则指定篇目全文。进站先读「打穿短表」；"
+                               "按目标特征读对应漏洞类型篇目；写正式报告前读 vuln-report-format"
+                               "（报告取舍闸门与写法规则）。",
+                "risk_level": "L0",
+                "risk_reason": "纯本地文件读取，无网络行为",
+                "caveat": "target 可省略；args 填篇目名（可省 .md 后缀，如 打穿短表 / idor-test / vuln-report-format）。",
+                "executable": "builtin://kb_read",
+                "exists": True,
+            },
+            {
+                "name": "FOFA资产测绘",
+                "alias": "fofa_search",
+                "description": "FOFA 网络空间测绘：按语法查公网资产（host/ip/port/title/server），"
+                               "用于目标企业的资产面扩展与子域发现。查询只走 fofa.info 数据库，不与被测目标交互。"
+                               "需在本机 config.yaml 配置 fofaEmail/fofaKey（未配置会返回提示）。",
+                "risk_level": "L1",
+                "risk_reason": "调用外部测绘服务 API，消耗账号配额（F点），不与被测目标产生交互",
+                "caveat": "args 填 FOFA 查询语法，如 domain=\"example.com\" && status_code=200、"
+                          "body=\"Coremail\"、icp=\"京ICP备xxxx号\"；多条件用 && 连接。"
+                          "按「一种子闭环」节奏用：一个种子查完挖完再查下一个，禁止多种子一次搜完再挖。",
+                "executable": "builtin://fofa_search",
+                "exists": True,
+            },
         ]
         used = {t.alias for t in self.tools}
         for s in specs:
