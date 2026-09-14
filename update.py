@@ -302,7 +302,7 @@ class App:
         self.local_v = tk.StringVar(value=local_version(ROOT))
         self.remote_v = tk.StringVar(value="（未检查）")
         self._build()
-        self.root.after(300, self.check_remote)
+        self.root.after(300, self.thread_check)
 
     # -- 状态持久化（代理地址） --
     def _load_proxy(self) -> str:
@@ -323,6 +323,7 @@ class App:
 
     # -- 界面 --
     def _build(self) -> None:
+        tk, ttk = self.tk, self.ttk  # 延迟导入的模块从实例取
         f = ttk.Frame(self.root, padding=14)
         f.pack(fill="both", expand=True)
 
