@@ -580,6 +580,19 @@ async def update_session_meta(sid: str, req: SessionMetaRequest):
     return {"ok": True, "session": row}
 
 
+@app.delete("/api/sessions/{sid}")
+async def delete_session(sid: str):
+    """彻底删除一条线索分支（含其下所有子分支）及关联数据。"""
+    if not store.get_session_row(sid):
+        raise HTTPException(404, "会话不存在")
+    result = store.delete_session_tree(sid)
+    # 同步清理内存中的运行态会话
+    for dsid in result.get("deleted_ids", []):
+        sessions.remove(dsid)
+    # 若当前活动线索被删，前端下次交互会重新选择；这里不做强制跳转
+    return {"ok": True, "deleted": result["count"], "ids": result["deleted_ids"]}
+
+
 @app.post("/api/sessions/{sid}/run")
 async def run_session(sid: str, req: RunRequest):
     s = sessions.get(sid)

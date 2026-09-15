@@ -286,6 +286,38 @@ def save_summary(sid: str, summary: str) -> None:
         c.execute("UPDATE sessions SET summary=? WHERE id=?", (summary[:1000], sid))
 
 
+def delete_session_tree(sid: str) -> dict:
+    """彻底删除一条线索及其所有后代（子分支），并级联清理步骤、对话历史、用量记录。
+
+    返回 {deleted_ids: [sid, ...], count: N}。
+    """
+    with _conn() as c:
+        # 1) 收集待删节点（含后代）
+        to_delete: list[str] = []
+        queue = [sid]
+        while queue:
+            cur = queue.pop(0)
+            if cur in to_delete:
+                continue
+            to_delete.append(cur)
+            rows = c.execute(
+                "SELECT id FROM sessions WHERE parent_id=?", (cur,)
+            ).fetchall()
+            queue.extend([r["id"] for r in rows])
+
+        if not to_delete:
+            return {"deleted_ids": [], "count": 0}
+
+        # 2) 级联删除
+        placeholders = ",".join("?" * len(to_delete))
+        c.execute(f"DELETE FROM steps WHERE session_id IN ({placeholders})", to_delete)
+        c.execute(f"DELETE FROM chat_messages WHERE session_id IN ({placeholders})", to_delete)
+        c.execute(f"DELETE FROM usage_log WHERE session_id IN ({placeholders})", to_delete)
+        c.execute(f"DELETE FROM sessions WHERE id IN ({placeholders})", to_delete)
+
+    return {"deleted_ids": to_delete, "count": len(to_delete)}
+
+
 def search_history(project_id: str, keyword: str, limit: int = 8) -> list[dict]:
     """跨线索检索：在项目内所有会话的工具输出/参数/目标中搜关键词。
 

@@ -318,6 +318,10 @@ class SessionManager:
     def get(self, sid: str) -> Session | None:
         return self.sessions.get(sid)
 
+    def remove(self, sid: str) -> Session | None:
+        """从内存中移除会话（彻底删除分支时同步清理）。"""
+        return self.sessions.pop(sid, None)
+
 
 sessions = SessionManager()
 

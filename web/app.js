@@ -708,12 +708,13 @@ function renderTree() {
         const isCur = n.id === state.sessionId;
         const st = THREAD_STATUS_LABEL[n.status] || n.status;
         return `<div class="tnode st-${esc(n.status)} ${isCur ? 'cur' : ''}" onclick="openThread('${n.id}')" title="${esc(n.task || '')}">
+          <button class="tn-del" onclick="event.stopPropagation();deleteThread('${n.id}', this)" title="彻底删除该分支">×</button>
           <div class="tn-name">${esc(threadName(n))}</div>
           <div class="tn-meta">${st} · ${n.step_count} 步</div>
           <div class="tn-acts">
             <button onclick="event.stopPropagation();openBranchModal('${n.id}')" title="在此线索下开新分支">＋</button>
             ${n.status !== 'done' ? `<button onclick="event.stopPropagation();setThreadStatus('${n.id}','done')" title="标记已完成">✓</button>` : ''}
-            ${n.status !== 'abandoned' ? `<button onclick="event.stopPropagation();setThreadStatus('${n.id}','abandoned')" title="标记已放弃">✕</button>` : ''}
+            ${n.status !== 'abandoned' ? `<button onclick="event.stopPropagation();setThreadStatus('${n.id}','abandoned')" title="标记已放弃">−</button>` : ''}
             ${n.status !== 'active' ? `<button onclick="event.stopPropagation();setThreadStatus('${n.id}','active')" title="重新打开">↺</button>` : ''}
           </div>
         </div>`;
@@ -808,6 +809,17 @@ async function setThreadStatus(sid, status) {
     });
     loadTree();
   } catch (e) { alert('状态更新失败：' + e.message); }
+}
+
+async function deleteThread(sid, btn) {
+  if (!confirm('确定彻底删除该线索分支？\n其下的子分支、执行记录、对话历史将一并删除，不可恢复。')) return;
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/api/sessions/${sid}`, { method: 'DELETE' });
+    if (state.sessionId === sid) { newThread(); }
+    await loadTree();
+  } catch (e) { alert('删除失败：' + e.message); }
+  finally { if (btn) btn.disabled = false; }
 }
 
 /* 开分支弹窗：候选记录 = 该线索最近的执行步骤 */

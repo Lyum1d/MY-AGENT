@@ -405,9 +405,17 @@ button.icon-btn { font-size: 16px; padding: 6px 10px; line-height: 1; }
 .tnode.st-done { opacity: .75; }
 .tnode.st-abandoned { opacity: .45; }
 .tnode.st-done .tn-name::after { content: ' ✓'; color: var(--ok); }
-.tnode.st-abandoned .tn-name::after { content: ' ✕'; color: var(--muted); }
-.tn-name { font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tnode.st-abandoned .tn-name::after { content: ' −'; color: var(--muted); }
+.tn-name { font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 16px; }
 .tn-meta { font-size: 11px; color: var(--muted); margin-top: 1px; }
+.tn-del {
+  position: absolute; top: 3px; right: 4px;
+  padding: 0 4px; font-size: 13px; line-height: 1;
+  background: transparent; color: var(--muted); border: none; border-radius: 4px;
+  cursor: pointer; opacity: 0; transition: opacity .15s, color .15s;
+}
+.tnode:hover .tn-del { opacity: 1; }
+.tn-del:hover { color: var(--danger); }
 .tn-acts { display: none; gap: 4px; margin-top: 5px; }
 .tnode:hover .tn-acts { display: flex; }
 .tn-acts button {

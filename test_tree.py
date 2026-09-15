@@ -129,6 +129,29 @@ def test_store_layer():
     check("search_history 命中步骤输出", len(hits) == 1 and "error-based" in hits[0]["snippet"])
     check("search_history 带来源线索名", hits[0]["title"] == "admin.php 疑似注入")
     check("search_history 无关键词时返回空", store.search_history(pid, "") == [])
+
+    # 级联删除：删除根分支应带走所有后代与关联数据
+    store.save_session("del_root", pid, "待删根", "demo.example.com", "idle",
+                       parent_id="", title="待删根", status="active")
+    store.save_session("del_child", pid, "待删子", "demo.example.com", "idle",
+                       parent_id="del_root", title="待删子", status="active")
+    store.save_session("del_grand", pid, "待删孙", "demo.example.com", "idle",
+                       parent_id="del_child", title="待删孙", status="active")
+    store.save_step("del_child", {"id": "del_st1", "tool_alias": "nmap",
+                                  "tool_name": "Nmap", "target": "demo.example.com",
+                                  "status": "done", "output": "80 open"})
+    store.save_chat_message("del_child", "assistant", "发现开放端口")
+    res = store.delete_session_tree("del_root")
+    check("delete_session_tree 级联删除根及后代",
+          set(res["deleted_ids"]) == {"del_root", "del_child", "del_grand"},
+          res["deleted_ids"])
+    check("删除后根会话不存在", store.get_session_row("del_root") is None)
+    check("删除后孙会话不存在", store.get_session_row("del_grand") is None)
+    with store._conn() as _c:
+        left_steps = _c.execute("SELECT COUNT(*) FROM steps WHERE session_id='del_child'").fetchone()[0]
+        left_chat = _c.execute("SELECT COUNT(*) FROM chat_messages WHERE session_id='del_child'").fetchone()[0]
+    check("级联清理步骤", left_steps == 0, left_steps)
+    check("级联清理对话历史", left_chat == 0, left_chat)
     return pid
 
 
@@ -170,6 +193,19 @@ def test_adopt_and_api(pid):
     check("PUT meta 非法状态 400", r.status_code == 400)
     r = client.put("/api/sessions/no-such/meta", json={"status": "done"})
     check("PUT meta 不存在 404", r.status_code == 404)
+
+    # 删除接口：彻底删除分支（含子分支）
+    store.save_session("api_root", pid, "API待删根", "demo.example.com", "idle",
+                       parent_id="", title="API待删根", status="active")
+    store.save_session("api_child", pid, "API待删子", "demo.example.com", "idle",
+                       parent_id="api_root", title="API待删子", status="active")
+    r = client.delete("/api/sessions/api_root")
+    check("DELETE sessions 返回 200", r.status_code == 200, r.status_code)
+    check("DELETE sessions 级联计数正确", r.json().get("deleted") == 2, r.json())
+    check("DELETE sessions 后根会话不存在", store.get_session_row("api_root") is None)
+    check("DELETE sessions 后子会话不存在", store.get_session_row("api_child") is None)
+    r = client.delete("/api/sessions/no-such")
+    check("DELETE sessions 不存在 404", r.status_code == 404)
 
     # session_state 回退路径带树字段
     r = client.get(f"/api/sessions/{branch_sid}")
