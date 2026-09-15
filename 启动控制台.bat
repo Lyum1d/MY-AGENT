@@ -1,31 +1,67 @@
 @echo off
-chcp 65001 >nul
+rem SRC ÉøÍ¸ Agent ±¾µØ¿ØÖÆÌ¨Æô¶¯½Å±¾£¨GBK ±àÂë + CRLF£¬ÖÐÎÄ Windows Ô­Éú¼æÈÝ£©
+setlocal
 cd /d "%~dp0"
+
 echo ============================================================
-echo   SRC æ¸—é€ Agent - æœ¬åœ°æŽ§åˆ¶å°
+echo   SRC ÉøÍ¸ Agent - ±¾µØ¿ØÖÆÌ¨
 echo ============================================================
-echo.
-echo   æ­£åœ¨å¯åŠ¨ï¼Œæµè§ˆå™¨ä¼šè‡ªåŠ¨æ‰“å¼€ http://127.0.0.1:8770
-echo   å…³é—­æ­¤çª—å£å³åœæ­¢æœåŠ¡ã€‚
-echo.
-echo   ä»…é™å·²èŽ·å¾—ä¹¦é¢æŽˆæƒçš„ç›®æ ‡æµ‹è¯•ã€‚
+echo   ºó¶Ë¾ÍÐ÷ºóä¯ÀÀÆ÷»á×Ô¶¯´ò¿ª http://127.0.0.1:8770
+echo   ¹Ø±Õ´Ë´°¿Ú¼´Í£Ö¹·þÎñ¡£½öÏÞÒÑ»ñµÃÊéÃæÊÚÈ¨µÄÄ¿±ê²âÊÔ¡£
 echo ============================================================
 echo.
 
-rem Python è§£é‡Šå™¨æŽ¢æµ‹é¡ºåºï¼ˆå¯ç§»æ¤å†™æ³•ï¼Œä¸å†™æ­»æœ¬æœºè·¯å¾„ï¼‰ï¼š
-rem   1. çŽ¯å¢ƒå˜é‡ SRC_AGENT_PY æŒ‡å®šçš„è§£é‡Šå™¨
-rem   2. é¡¹ç›®å†… .venv\Scripts\python.exeï¼ˆ.venv å·²è¢« .gitignore æŽ’é™¤ï¼‰
-rem   3. PATH ä¸­çš„ python
+rem ---- 1. Ì½²â Python ½âÊÍÆ÷£¨¿ÉÒÆÖ²Ð´·¨£¬²»Ð´ËÀ±¾»úÂ·¾¶£©----
+rem Ë³Ðò£º»·¾³±äÁ¿ SRC_AGENT_PY ¡ú ÏîÄ¿ .venv ¡ú py Æô¶¯Æ÷ ¡ú PATH python
+rem Ã¿¸öºòÑ¡¶¼Êµ¼ÊÖ´ÐÐ --version ÑéÖ¤£¬ÈÆ¿ª Windows ÉÌµêµÄ python Õ¼Î»³ÌÐò
 set "PY=%SRC_AGENT_PY%"
 if "%PY%"=="" set "PY=%~dp0.venv\Scripts\python.exe"
-if not exist "%PY%" set "PY=python"
+if exist "%PY%" "%PY%" --version >nul 2>&1 && goto pick_ok
+set "PY="
+where py >nul 2>&1 && for /f "delims=" %%i in ('py -3 -c "import sys;print(sys.executable)" 2^>nul') do set "PY=%%i"
+if defined PY if exist "%PY%" goto pick_ok
+set "PY="
+where python >nul 2>&1 && for /f "delims=" %%i in ('python -c "import sys;print(sys.executable)" 2^>nul') do set "PY=%%i"
+if defined PY if exist "%PY%" goto pick_ok
 
-rem DeepSeek äº‘ç«¯æ¨¡åž‹ API Keyï¼ˆå‰ç«¯æ¨¡åž‹åˆ‡æ¢ç”¨ï¼‰ã€‚
-rem å»ºè®®é€šè¿‡ç³»ç»ŸçŽ¯å¢ƒå˜é‡ DEEPSEEK_API_KEY æ³¨å…¥ï¼Œä¸è¦å°†çœŸå®ž Key æäº¤åˆ°å…¬å¼€ä»“åº“ã€‚
-if not defined DEEPSEEK_API_KEY set "DEEPSEEK_API_KEY="
+echo [´íÎó] Î´ÕÒµ½¿ÉÓÃµÄ Python£¨3.10+£©£¬ÎÞ·¨Æô¶¯¡£
+echo   ÇëÈÎÑ¡ÆäÒ»£º
+echo     1. °²×° Python ²¢¹´Ñ¡ Add to PATH£¬È»ºóÖØÐÂË«»÷±¾ÎÄ¼þ£»
+echo     2. ÉèÖÃÏµÍ³»·¾³±äÁ¿ SRC_AGENT_PY Ö¸Ïò python.exe ÍêÕûÂ·¾¶£»
+echo     3. °Ñ update.exe ·Åµ½±¾Ä¿Â¼Ë«»÷£¨¿ÉÒýµ¼Íê³É»·¾³×¼±¸£©¡£
+echo.
+pause
+exit /b 1
 
-echo   ä½¿ç”¨è§£é‡Šå™¨ï¼š%PY%
+:pick_ok
+echo   Ê¹ÓÃ½âÊÍÆ÷£º%PY%
 echo.
 
+rem ---- 2. ÒÀÀµ×Ô¼ì£ºÈ±ÒÀÀµÊ±×Ô¶¯°²×°£¨½öÊ×´Î£¬Çå»ª¾µÏñ£©----
+"%PY%" -c "import fastapi,uvicorn,httpx,yaml" >nul 2>&1
+if errorlevel 1 (
+  echo   Ê×´ÎÔËÐÐ£ºÕýÔÚ°²×°ÒÀÀµ£¬¿ÉÄÜÐèÒª¼¸·ÖÖÓ£¬ÇëÎð¹Ø±Õ´°¿Ú¡­
+  call :install_deps
+  if errorlevel 1 (
+    echo [´íÎó] ÒÀÀµ°²×°Ê§°Ü¡£Çë¼ì²éÍøÂçºóÖØÊÔ±¾ÎÄ¼þ£¬»òÊÖ¶¯Ö´ÐÐ£º
+    echo     "%PY%" -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+    echo.
+    pause
+    exit /b 1
+  )
+  echo   ÒÀÀµ°²×°Íê³É¡£
+  echo.
+)
+
+rem ---- 3. Æô¶¯·þÎñ ----
 "%PY%" run.py
-pause
+echo.
+echo ·þÎñÒÑÍË³ö¡£ÈôÉÏ·½ÓÐ±¨´íÇë½ØÍ¼·´À¡¸øÎ¬»¤Õß£»°´ÈÎÒâ¼ü¹Ø±Õ´°¿Ú¡£
+pause >nul
+exit /b 0
+
+:install_deps
+if not exist "requirements.txt" exit /b 1
+"%PY%" -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple 2>nul
+if errorlevel 1 "%PY%" -m pip install -r requirements.txt
+exit /b %errorlevel%

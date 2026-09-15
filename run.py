@@ -6,7 +6,10 @@
     python run.py --port 8770
 """
 import argparse
+import socket
 import sys
+import threading
+import time
 import webbrowser
 from pathlib import Path
 
@@ -15,6 +18,26 @@ sys.path.insert(0, str(Path(__file__).parent))
 import uvicorn  # noqa: E402
 
 from app import config  # noqa: E402
+
+
+def _open_browser_when_ready(host: str, port: int, timeout: float = 30.0) -> None:
+    """等后端端口真正可连接后再打开浏览器。
+
+    修复「启动后未连接后端」：此前 webbrowser.open 先于 uvicorn 监听执行，
+    浏览器加载时后端尚未就绪，前端健康检查失败显示未连接。
+    """
+    url = f"http://127.0.0.1:{port}"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                time.sleep(0.5)  # 端口通了再给应用半秒完成初始化
+                webbrowser.open(url)
+                print(f"  浏览器已打开：{url}")
+                return
+        except OSError:
+            time.sleep(0.4)
+    print(f"  后端 {timeout}s 内未就绪，请手动打开：{url}")
 
 
 def main():
@@ -36,7 +59,8 @@ def main():
     print("=" * 60)
 
     if not args.no_browser:
-        webbrowser.open(f"http://{args.host}:{args.port}")
+        threading.Thread(target=_open_browser_when_ready,
+                         args=(args.host, args.port), daemon=True).start()
 
     uvicorn.run("app.main:app", host=args.host, port=args.port, reload=False)
 

@@ -207,6 +207,8 @@ async function init() {
   $('themeToggle').textContent = t === 'light' ? '☀️' : '🌙';
 
   await loadModels();
+  // 等后端就绪再继续（页面可能在服务启动完成前被打开）
+  if (!(await waitForBackend())) return;
   try {
     const h = await api('/api/health');
     const dot = h.llm.ready ? '<span class="dot ok"></span>' : '<span class="dot bad"></span>';
@@ -218,10 +220,26 @@ async function init() {
       · <b>本地</b> ${h.registry.launchable}`;
   } catch (e) {
     $('status').innerHTML = `<span class="dot bad"></span>后端未连接：${esc(e.message)}`;
+    return;
   }
   loadProjects().then(() => { autoSelectProject(); renderProjects(); updateProjectHeader(); loadFindings(); loadFacts(); loadTree(); });
   loadTools();
   refreshUsageBadge();
+}
+
+/* 后端就绪探测：每 0.8s 重试一次，最多 40 次（约 30s），全部失败给出可操作提示 */
+async function waitForBackend(tries = 40) {
+  for (let i = 1; i <= tries; i++) {
+    try {
+      await api('/api/health');
+      return true;
+    } catch (e) {
+      $('status').innerHTML = `<span class="dot bad"></span>正在连接后端…（${i}/${tries}）`;
+      await new Promise(r => setTimeout(r, 800));
+    }
+  }
+  $('status').innerHTML = '<span class="dot bad"></span>后端未连接：请确认服务已启动（python run.py），或刷新页面重试';
+  return false;
 }
 
 /* ---------- 模型切换 ---------- */
