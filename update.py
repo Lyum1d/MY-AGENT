@@ -126,6 +126,20 @@ def is_first_install(root: Path) -> bool:
     return not (root / "app").exists()
 
 
+# ---------- 换行符归一（批处理必须 CRLF，否则启动器被打坏）----------
+# 为什么必须在这里兜：更新包在 Linux 侧打包，zip 里的 .bat 是 LF。
+# cmd.exe 解析 LF 批处理时，遇到多字节字符（中文提示）会算错行偏移，
+# 把脚本切碎执行，表现为双击后满屏「'xx' 不是内部或外部命令」——启动器彻底不可用。
+# 这个故障每更新一次就会复现一次（已实测：v004/v006 两个版本落盘的 .bat 都是 LF + 中文），
+# 所以不能只靠修包里的那一个文件，必须在落盘这一步强制归一。
+CRLF_REQUIRED_EXT = (".bat", ".cmd", ".ps1")
+
+
+def normalize_crlf(data: bytes) -> bytes:
+    """把任意换行（CRLF / 裸 LF / 裸 CR）统一成 CRLF。"""
+    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
+
+
 # ---------- 更新核心 ----------
 def do_update(root: Path, proxy: str, log, progress) -> None:
     """执行更新（在工作线程中调用）。抛异常即失败。"""
@@ -163,7 +177,10 @@ def do_update(root: Path, proxy: str, log, progress) -> None:
         rel = parts[1]
         target = tmp_root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(zf.read(name))
+        payload = zf.read(name)
+        if rel.lower().endswith(CRLF_REQUIRED_EXT):
+            payload = normalize_crlf(payload)
+        target.write_bytes(payload)
         extracted.append(rel)
     log(f"解压完成：{len(extracted)} 个文件")
     progress(0.68)

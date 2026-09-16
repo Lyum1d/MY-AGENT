@@ -1,0 +1,9 @@
+# 换行符规则（重要：不要删）
+#
+# Windows 批处理必须使用 CRLF。cmd.exe 解析 LF 换行的批处理时，遇到多字节字符
+# （中文注释/提示）会算错行偏移、把脚本切碎执行，表现为双击后满屏
+# 「'xx' 不是内部或外部命令」，启动脚本彻底不可用。
+# 同时 .bat/.cmd 内容请保持纯 ASCII，中文提示交给 Python 端输出。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

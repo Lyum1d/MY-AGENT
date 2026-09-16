@@ -21,14 +21,22 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from . import config
-from .scope import check_scope
+from .scope import check_scope, find_hosts
 
 logger = None  # 延迟引入 logging，避免无谓开销
 
 
 def _sanitize(name: str) -> str:
+    """把 target 变成安全的单层目录名。
+
+    注意：`.` 必须保留（域名本身有点），但**纯点名**必须中和——
+    `..` / `.` / `...` 拼进路径就是目录穿越，能把留档写到 PY_EXEC_DIR 之外。
+    此前实现只做字符替换，`_sanitize("..")` 原样返回 `..`，是实打实的穿越入口。
+    """
     name = re.sub(r"[^\w\-.]", "_", name)
-    return (name or "default")[:60]
+    if not name.strip("."):      # 全是点（含空串）→ 无有效字符，落回占位名
+        name = "_" + name
+    return name[:60]
 
 
 def _scope_check_target(target: str) -> str | None:
@@ -36,17 +44,27 @@ def _scope_check_target(target: str) -> str | None:
 
     py_exec 是 L3 通道，能力等同本机命令行，理应与命令行工具一样受白名单约束。
     但它的 target 仅用于留档归类，模型时常填企业名（如「腾讯」）以待后续资产扩展，
-    这类值白名单里本就不存在，强制校验会误伤正常流程，故：
-      · 含空格 / 含非 ASCII / 不含「.」 → 视为自由文本，跳过本校验；
-      · 其余（域名、URL、IP）→ 走与 executor / replayer 同一份 scope.check_scope。
+    这类值白名单里本就不存在，强制校验会误伤正常流程，故只校验「确实像主机」的片段。
+
+    实现要点（此前版本的缺口）：
+      · 旧实现用「含空格 / 含非 ASCII / 不含 . 就整串跳过」做粗判，
+        于是 `evil.com foo`、`evil.com 腾讯` 这类「主机 + 一点说明」直接绕过白名单；
+        现改为 **逐个抽出像主机的片段分别校验，任一未授权即拒绝**。
+      · 抽出规则收敛到 app/scope.py 的 find_hosts，与 Agent 的「从任务描述提取目标」
+        共用同一套口径，避免两处规则分叉出现静默缺口。
+      · `localhost` 这类不含点、却明确指向本机的名字被显式纳入校验（不再跳过）。
 
     局限：代码内部实际请求的主机无法静态解析，本校验只覆盖声明的 target；
     真正的边界仍是 L3 的用户确认 + 书面授权，二者缺一不可。
     """
-    t = (target or "").strip()
-    if not t or " " in t or not t.isascii() or "." not in t:
+    hosts = find_hosts(target or "")
+    if not hosts:               # 纯自由文本（企业名 / 版本号 / 状态词）→ 不误伤
         return None
-    return check_scope(t)
+    for h in hosts:
+        denied = check_scope(h)
+        if denied:
+            return denied
+    return None
 
 
 async def run_py_exec(code: str, target: str = "") -> AsyncIterator[dict]:
