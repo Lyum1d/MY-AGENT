@@ -145,6 +145,10 @@ def test_store_layer():
                                   "tool_name": "Nmap", "target": "demo.example.com",
                                   "status": "done", "output": "80 open"})
     store.save_chat_message("del_child", "assistant", "发现开放端口")
+    # 用量记录必须**活过**会话删除：它是 token 消耗的审计凭据，
+    # 若随会话一起删掉，等于「删掉线索即可抹掉自己烧过多少钱」。
+    store.save_usage(provider_id="deepseek", model="deepseek-chat", prompt_tokens=100,
+                     completion_tokens=50, session_id="del_child", project_id=pid)
     res = store.delete_session_tree("del_root")
     check("delete_session_tree 级联删除根及后代",
           set(res["deleted_ids"]) == {"del_root", "del_child", "del_grand"},
@@ -154,8 +158,11 @@ def test_store_layer():
     with store._db() as _c:
         left_steps = _c.execute("SELECT COUNT(*) FROM steps WHERE session_id='del_child'").fetchone()[0]
         left_chat = _c.execute("SELECT COUNT(*) FROM chat_messages WHERE session_id='del_child'").fetchone()[0]
+        kept_usage = _c.execute(
+            "SELECT COUNT(*) FROM usage_log WHERE model='deepseek-chat'").fetchone()[0]
     check("级联清理步骤", left_steps == 0, left_steps)
     check("级联清理对话历史", left_chat == 0, left_chat)
+    check("用量记录不被级联删除（保留成本审计，仅解绑会话）", kept_usage == 1, kept_usage)
     return pid
 
 
@@ -212,6 +219,21 @@ def test_adopt_and_api(pid):
     check("DELETE sessions 后子会话不存在", store.get_session_row("api_child") is None)
     r = client.delete("/api/sessions/no-such")
     check("DELETE sessions 不存在 404", r.status_code == 404)
+
+    # 运行中的会话不得删除：Agent 协程还持有该 Session，每步都会 save_step，
+    # 删掉之后它会继续往已删除的 session_id 上写，留下清理不掉的孤儿行。
+    store.save_session("api_run", pid, "运行中线索", "demo.example.com", "running",
+                       parent_id="", title="运行中线索", status="active")
+    s_run = sessions.adopt("api_run")
+    s_run.state = "running"
+    r = client.delete("/api/sessions/api_run")
+    check("DELETE 拒绝删除运行中的会话（409）", r.status_code == 409, r.status_code)
+    check("被拒后该会话仍存在", store.get_session_row("api_run") is not None)
+    s_run.state = "awaiting_confirm"
+    check("DELETE 同样拒绝等待确认中的会话",
+          client.delete("/api/sessions/api_run").status_code == 409)
+    s_run.state = "idle"
+    check("结束后可正常删除", client.delete("/api/sessions/api_run").status_code == 200)
 
     # session_state 回退路径带树字段
     r = client.get(f"/api/sessions/{branch_sid}")
@@ -295,6 +317,209 @@ async def _drain(session):
     return events
 
 
+def test_confirm_gate(pid):
+    """高危确认闸门：确认必须「绑步骤 + 在正确状态下」才被接受。
+
+    这一节守的是项目最硬的那条线——L2/L3 必须经用户确认。历史实现里
+    session.control 是一条与步骤无绑定的 FIFO 队列，任何时刻投递的确认都会被
+    **下一个**高危步骤消费掉，于是「用户没看确认框，L3 就被放行了」。
+    """
+    print("== D. 高危确认闸门（步骤绑定 + 状态校验）==")
+    from fastapi.testclient import TestClient
+    from app.main import app
+    client = TestClient(app, base_url="http://127.0.0.1")
+
+    store.save_session("cf1", pid, "确认测试", "demo.example.com", "idle",
+                       parent_id="", title="确认测试", status="active")
+    s = sessions.adopt("cf1")
+
+    # 1) 空闲态：不允许投递确认（不给「先囤一条，等下次高危步骤时自动放行」的机会）
+    s.state = "idle"
+    r = client.post("/api/sessions/cf1/confirm", json={"approved": True, "step_id": "st_x"})
+    check("空闲态提交确认被拒（409）", r.status_code == 409, r.status_code)
+    check("被拒后队列里没有残留确认", s.control.empty())
+
+    # 2) 等待确认中，但 step_id 不匹配 → 拒绝（挡陈旧/重放/伪造）
+    s.state = "awaiting_confirm"
+    s.pending_step_id = "st_real"
+    r = client.post("/api/sessions/cf1/confirm", json={"approved": True, "step_id": "st_other"})
+    check("step_id 不匹配的确认被拒（409）", r.status_code == 409, r.status_code)
+
+    # 3) 缺少 step_id → 拒绝（不给「不带身份也能放行」的后门）
+    r = client.post("/api/sessions/cf1/confirm", json={"approved": True})
+    check("缺少 step_id 的确认被拒（409）", r.status_code == 409, r.status_code)
+
+    # 4) 正确匹配 → 放行，且队列里只此一条
+    r = client.post("/api/sessions/cf1/confirm", json={"approved": True, "step_id": "st_real"})
+    check("匹配的确认被接受（200）", r.status_code == 200, r.status_code)
+    check("队列里恰好一条确认", s.control.qsize() == 1, s.control.qsize())
+
+    # 5) 重复提交 → 拒绝（挡连点预支）
+    r = client.post("/api/sessions/cf1/confirm", json={"approved": True, "step_id": "st_real"})
+    check("重复提交被拒（409，挡连点预支）", r.status_code == 409, r.status_code)
+
+    # 6) Agent 侧：不匹配的确认会被丢弃而不是被消费掉
+    step = agent_mod.Step(id="st_real", tool_alias="py_exec", tool_name="Python代码执行",
+                          target="demo.example.com", args="print(1)", risk={"level": "L3"})
+    while not s.control.empty():
+        s.control.get_nowait()
+    s.state = "awaiting_confirm"
+    s.pending_step_id = "st_real"
+    s.control.put_nowait({"approved": True, "step_id": "st_stale"})   # 陈旧指令
+    s.control.put_nowait({"approved": True, "step_id": "st_real"})    # 真正的放行
+
+    async def _confirm():
+        return await agent._await_confirm(s, step)
+
+    approved = asyncio.run(_confirm())
+    check("_await_confirm 丢弃不匹配的确认、采纳匹配的那条", approved is True, approved)
+
+    # 7) 超时后状态必须复位（历史实现只在成功路径复位，超时后永远卡在 awaiting_confirm）
+    while not s.control.empty():
+        s.control.get_nowait()
+    s.state = "awaiting_confirm"
+    old_timeout = config.CONFIRM_TIMEOUT
+    config.CONFIRM_TIMEOUT = 1
+    try:
+        denied = asyncio.run(_confirm())
+    finally:
+        config.CONFIRM_TIMEOUT = old_timeout
+    check("确认超时按「拒绝」处理", denied is False, denied)
+    check("超时后 state 已复位（不再卡在 awaiting_confirm）",
+          s.state == "running", s.state)
+    check("超时后 pending_step_id 已清空", s.pending_step_id == "", s.pending_step_id)
+    return "cf1"
+
+
+class _FakeExec:
+    """假执行器：按脚本吐出与真实 executor 同构的事件流。"""
+
+    def __init__(self, events):
+        self.events = list(events)
+
+    async def run(self, tool, target, args=""):
+        for e in self.events:
+            yield e
+
+
+def test_scope_denial_not_swallowed(pid):
+    """授权拒绝（126）不得被 ignore_exit_code 吞成「执行成功」。
+
+    背景：`meaningful = bool(output.strip())` 把执行器自己写的那行
+    `[错误] 目标不在授权白名单内…` 也算成「有实质输出」，于是开了
+    ignore_exit_code 的工具（EHole 就是）会把「越权被拦」判成 done，
+    _attribute_failure 里那档 SCOPE（要求停手、别换参数绕过）永远送不到模型，
+    模型就会一直换参数去撞授权墙。
+    """
+    print("== E. 授权拒绝（126）不被 ignore_exit_code 吞掉 ==")
+    from app.registry import Tool
+    from app.registry import registry as reg
+
+    fake = Tool(name="EHole", alias="_test_ehole", category="指纹", type="命令行",
+                rel_path="", description="x", risk_level="L1")
+    fake.executable = "fake-ehole.exe"
+    fake.ignore_exit_code = True      # 模拟 data/tool_overrides.json 里的 ehole 配置
+    reg._by_alias["_test_ehole"] = fake
+
+    session = sessions.create(project=pid)
+    step = agent_mod.Step(id="st126", tool_alias="_test_ehole", tool_name="EHole",
+                          target="evil.com", args="", risk={"level": "L1"})
+    real_exec = agent_mod.executor
+    agent_mod.executor = _FakeExec([
+        {"type": "error", "data": "目标「evil.com」不在授权白名单内，已拒绝执行。"},
+        {"type": "exit", "code": 126},
+    ])
+    try:
+        asyncio.run(agent._execute(session, step, "call126"))
+    finally:
+        agent_mod.executor = real_exec
+        reg._by_alias.pop("_test_ehole", None)
+
+    check("退出码 126 判为失败，不被 ignore_exit_code 翻成 done",
+          step.status == "error", step.status)
+    fed = session.messages[-1]["content"] if session.messages else ""
+    check("回喂内容带 SCOPE 归因（模型才知道这是授权边界）", "SCOPE" in fed, fed[:70])
+    check("回喂内容明确要求「不要换参数绕过」",
+          "不要换参数" in fed or "停手" in fed, fed[:90])
+
+    # 反向对照：同样的工具，正常有输出 + 退出码 1 时仍应按成功解读
+    # （EHole 没命中「重点资产」会返回 1，这是它 ignore_exit_code 的存在理由）
+    step2 = agent_mod.Step(id="st1ok", tool_alias="_test_ehole", tool_name="EHole",
+                           target="demo.example.com", args="", risk={"level": "L1"})
+    reg._by_alias["_test_ehole"] = fake
+    agent_mod.executor = _FakeExec([
+        {"type": "output", "data": "[+] https://demo.example.com 用友NC"},
+        {"type": "exit", "code": 1},
+    ])
+    try:
+        asyncio.run(agent._execute(sessions.create(project=pid), step2, "call1ok"))
+    finally:
+        agent_mod.executor = real_exec
+        reg._by_alias.pop("_test_ehole", None)
+    check("有实质输出 + 退出码 1 仍算成功（未误伤 ignore_exit_code 的本意）",
+          step2.status == "done", step2.status)
+
+
+def test_subtask_flag_persists(pid):
+    """子任务标记必须落库并能恢复。
+
+    为什么是安全相关：`subtask=True` 的会话在 run() 里会被拒绝执行 L2/L3
+    （并行子任务没人能应答确认框）。标记只存内存的话，服务重启或被 adopt 之后
+    就丢了，这道闸门会**静默失效**。
+    """
+    print("== F. 子任务标记落库与恢复（subtask 闸门不丢）==")
+    from fastapi.testclient import TestClient
+    from app.main import app
+    client = TestClient(app, base_url="http://127.0.0.1")
+
+    sessions.sessions.clear()
+    store.save_session("sub_a", pid, "子任务A", "demo.example.com", "idle",
+                       parent_id="", title="子任务A", status="active", subtask=True)
+    store.save_session("sub_b", pid, "普通线索B", "demo.example.com", "idle",
+                       parent_id="", title="普通线索B", status="active", subtask=False)
+    check("subtask 已落库（读回来是 True）",
+          bool(store.get_session_row("sub_a").get("subtask")))
+
+    sa = sessions.adopt("sub_a")
+    sb = sessions.adopt("sub_b")
+    check("adopt 恢复 subtask=True（子任务闸门不会因恢复而失效）", sa.subtask is True,
+          sa.subtask)
+    check("adopt 普通线索仍是 subtask=False（不误伤）", sb.subtask is False, sb.subtask)
+
+    # 内存会话被 drop 后再恢复，同样要保住标记（模拟服务重启后的续聊）
+    sessions.sessions.clear()
+    check("清空内存后重新 adopt 仍为 subtask=True",
+          sessions.adopt("sub_a").subtask is True)
+
+    print("== G. 运行时不覆盖已有项目归属 ==")
+    store.save_session("proj_keep", pid, "归属测试", "demo.example.com", "idle",
+                       parent_id="", title="归属测试", status="active")
+    sp = sessions.adopt("proj_keep")
+    sp.project = pid
+    # 用 no-op 顶掉真实 Agent：本节点只验「项目归属不被空值冲掉」，不需要跑模型
+    real_run = agent.run
+
+    async def _noop_run(session, message, **kw):
+        return
+
+    agent.run = _noop_run
+    try:
+        r = client.post("/api/sessions/proj_keep/run",
+                        json={"message": "跑一下", "project_id": ""})
+        check("POST /run 空 project_id 时正常受理", r.status_code == 200, r.status_code)
+        check("已有项目归属没被空值冲掉（否则情报/事实注入会静默失效）",
+              sp.project == pid, sp.project)
+        r2 = client.post("/api/sessions/proj_keep/run",
+                         json={"message": "换项目", "project_id": "another-pid"})
+        check("显式传入非空 project_id 时正常覆盖", sp.project == "another-pid",
+              sp.project)
+    finally:
+        agent.run = real_run
+        sp.state = "idle"
+        for sid in ("proj_keep", "sub_a", "sub_b"):
+            sessions.sessions.pop(sid, None)
+
+
 def test_cleanup(pid):
     store.delete_project(pid)
     sessions.sessions.clear()
@@ -306,6 +531,9 @@ if __name__ == "__main__":
     pid = test_store_layer()
     branch_sid = test_adopt_and_api(pid)
     test_agent_branch_tools(pid, branch_sid)
+    test_confirm_gate(pid)
+    test_scope_denial_not_swallowed(pid)
+    test_subtask_flag_persists(pid)
     test_cleanup(pid)
     print(f"\n结果：{len(ok)} 通过 / {len(fail)} 失败")
     if fail:

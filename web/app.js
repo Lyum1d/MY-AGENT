@@ -12,6 +12,7 @@ let state = {
   models: null,
   assistant: null,   // 当前 AI 气泡的 DOM 引用（streaming 时填充）
   branchParent: null, // 开分支弹窗的父会话 id
+  confirmBusy: false, // 高危确认是否正在提交（挡连点，防「预支」掉下一次确认）
 };
 
 /* ---------- 工具函数 ---------- */
@@ -217,7 +218,11 @@ async function init() {
     $('status').innerHTML = `
       ${dot}<b>${esc(label)}</b> ${esc(h.current_model || cur.model || '')}（${h.llm.ready ? '就绪' : '未就绪'}）
       · <b>可编排</b> ${h.registry.scriptable}
-      · <b>本地</b> ${h.registry.launchable}`;
+      · <b>本地</b> ${h.registry.launchable}
+      · <b>授权</b> ${h.enforce_scope ? ((h.scope_domains || []).length ? `${h.scope_domains.length} 个目标` : '未配置') : '已关闭'}`;
+    // 授权边界异常必须显式可见：白名单为空时所有工具都会被拒（现象像"工具坏了"），
+    // 而 ENFORCE_SCOPE=0 时工具会对任意目标执行。两种都不该靠使用者自己猜。
+    if (h.scope_warning) log(`⚠ ${h.scope_warning}`, 'c-err');
   } catch (e) {
     $('status').innerHTML = `<span class="dot bad"></span>后端未连接：${esc(e.message)}`;
     return;
@@ -479,7 +484,20 @@ async function launchTool(alias) {
     const r = await api(`/api/tools/launch/${alias}`, { method: 'POST' });
     log(r.ok ? `已启动：${r.message}` : `启动失败：${r.message}`, r.ok ? 'c-ok' : 'c-err');
   } catch (e) {
-    log(`启动失败：${e.message}`, 'c-err');
+    // L2/L3 工具需要显式确认：首次调用会被后端以 409 挡下，这里据此二次确认后重试。
+    // 与「流程内工具执行」的风险闸门口径保持一致（此前启动图形界面工具完全不校验分级）。
+    const msg = String(e.message || '');
+    if (msg.includes('需要显式确认')) {
+      if (!confirm(`${msg}\n\n确认启动该工具？`)) return;
+      try {
+        const r2 = await api(`/api/tools/launch/${alias}?confirm=true`, { method: 'POST' });
+        log(r2.ok ? `已启动：${r2.message}` : `启动失败：${r2.message}`, r2.ok ? 'c-ok' : 'c-err');
+      } catch (e2) {
+        log(`启动失败：${e2.message}`, 'c-err');
+      }
+      return;
+    }
+    log(`启动失败：${msg}`, 'c-err');
   }
 }
 
@@ -649,23 +667,35 @@ function showConfirm(ev) {
       </div>
       <div class="actions">
         ${needDouble ? '<label><input type="checkbox" id="authChk"> 我确认已获得该目标的书面授权</label>' : ''}
-        <button class="primary" onclick="doConfirm(true)">放行</button>
-        <button class="danger" onclick="doConfirm(false)">拒绝</button>
+        <button class="primary" onclick="doConfirm('${esc(s.id)}', true)">放行</button>
+        <button class="danger" onclick="doConfirm('${esc(s.id)}', false)">拒绝</button>
       </div>
     </div>`;
 }
 
-async function doConfirm(approved) {
+async function doConfirm(stepId, approved) {
   const chk = $('authChk');
   if (approved && chk && !chk.checked) {
     return alert('请先勾选授权确认');
   }
+  // 防重复点击：连点会投递多条确认，多出来的那条会被**下一个**高危步骤直接消费掉，
+  // 等于用户没看确认框就放行了。这里用一次性的在途标志把并发点击挡掉，
+  // 后端也会以 409 兜底（队列非空即拒收），两侧都不依赖对方。
+  if (state.confirmBusy) return;
+  state.confirmBusy = true;
   $('confirmBox').innerHTML = '';
   appendLine(approved ? '→ 已放行' : '→ 已拒绝', approved ? '' : 'err');
-  await api(`/api/sessions/${state.sessionId}/confirm`, {
-    method: 'POST',
-    body: JSON.stringify({ approved }),
-  });
+  try {
+    // 必须带上 step_id：后端据此拒绝陈旧/重放/伪造的确认（详见 /confirm 接口注释）
+    await api(`/api/sessions/${state.sessionId}/confirm`, {
+      method: 'POST',
+      body: JSON.stringify({ approved, step_id: stepId }),
+    });
+  } catch (e) {
+    appendLine(`确认提交失败：${e.message}`, 'err');
+  } finally {
+    state.confirmBusy = false;
+  }
 }
 
 /* ---------- 线索树（对话树小地图） ---------- */
@@ -875,6 +905,12 @@ async function openThread(sid) {
   if (d.state === 'running' || d.state === 'awaiting_confirm') {
     connectStream(sid);
     log('该线索正在执行中，已接入实时输出…', 'c-warn');
+  }
+  // 断线/刷新后重连：need_confirm 事件已经过去，必须按后端回传的「正在等待确认的步骤」
+  // 重绘确认框。否则用户会看到「执行中」却没有任何可点的按钮，只能干等到超时。
+  if (d.pending_confirm && d.pending_confirm.step) {
+    log('该线索有一步高危操作正在等待你的授权确认…', 'c-warn');
+    showConfirm({ step: d.pending_confirm.step, risk: d.pending_confirm.risk || {} });
   }
   renderTree();
   scrollToBottom();

@@ -24,6 +24,11 @@ from typing import AsyncIterator
 from . import config
 from .registry import Tool
 from .scope import check_scope
+# 向后兼容别名：白名单逻辑已收敛到 app/scope.py（唯一实现），
+# 但 test_scope.py / test_replayer.py 等既有套件是按历史名字导入的，
+# 这里保留同名入口，避免为了改名而改动（进而弱化）那些安全断言。
+from .scope import host_in_scope as _host_in_scope  # noqa: F401
+from .scope import target_host as _target_host      # noqa: F401
 
 
 # ---------- 授权范围（白名单）校验 ----------

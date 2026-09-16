@@ -13,7 +13,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, providers, report, store, usage
+from . import config, providers, report, scope, store, usage
+from . import graph
 from .agent import agent, sessions
 from .executor import executor
 from .llm import current_backend_name, get_backend, set_backend
@@ -80,7 +81,14 @@ class RunRequest(BaseModel):
 
 
 class ConfirmRequest(BaseModel):
+    """高危步骤的放行/拒绝。
+
+    step_id 必填：确认通道是「一次一步」的交互式队列，若不绑定步骤身份，
+    任何时刻投递的确认（陈旧点击、重放、脚本伪造）都会躺在队列里被**下一个**
+    高危步骤消费掉，等于绕过 L2/L3 授权闸门。
+    """
     approved: bool
+    step_id: str = ""
 
 
 class ProjectRequest(BaseModel):
@@ -102,10 +110,19 @@ class FindingRequest(BaseModel):
     target: str = ""
     detail: str = ""
     evidence: str = ""
+    session_id: str = ""     # 登记时的线索，用于因果图里和该线索的关键事实连边
 
 
 class FactRequest(BaseModel):
     content: str
+    session_id: str = ""
+    step_id: str = ""        # 产出该事实的工具执行步骤，因果图据此连 Evidence→KeyFact
+
+
+class CausalUpdateRequest(BaseModel):
+    """因果图增量写入：nodes 先落库，edges 再连接（端点不存在会被丢弃）。"""
+    nodes: list[dict] = []
+    edges: list[dict] = []
 
 
 class ModelRequest(BaseModel):
@@ -174,6 +191,18 @@ async def health():
     backend = get_backend()
     llm = await backend.health()
     cur = providers.current()
+    # 授权边界的可视性：fail-closed 的白名单如果配错（为空 / 与实际靶标不符），
+    # 现象是「所有工具都被拒」，而排查时最省事的"修复"是关掉 ENFORCE_SCOPE，
+    # 那等于把授权红线整体关停且无人察觉。这里把真实状态暴露出来，
+    # 让「没配授权」和「校验被关了」这两件事都看得见，而不是靠猜。
+    scope_domains = scope.load_scope()
+    scope_warn = ""
+    if not config.ENFORCE_SCOPE:
+        scope_warn = ("授权校验已被关闭（ENFORCE_SCOPE=0）：工具会对**任意目标**执行，"
+                      "不受 data/scope.json 约束。仅应在临时排查时使用。")
+    elif not scope_domains:
+        scope_warn = ("授权白名单为空（data/scope.json 缺失或解析失败）：所有命令行工具、"
+                      "HTTP 重放器与 py_exec 都会被拒绝执行。")
     return {
         "toolbox": str(config.TOOLBOX_ROOT),
         "toolbox_exists": config.TOOLBOX_ROOT.exists(),
@@ -186,6 +215,9 @@ async def health():
         "anthropic_enabled": bool((providers.get("anthropic") or {}).get("api_key")),
         "provider_count": len(providers.list_providers()),
         "models": {p["id"]: p["model"] for p in providers.list_providers()},
+        "enforce_scope": bool(config.ENFORCE_SCOPE),
+        "scope_domains": scope_domains,
+        "scope_warning": scope_warn,
     }
 
 
@@ -375,13 +407,26 @@ async def list_tools(kind: str = "all"):
 
 
 @app.post("/api/tools/launch/{alias}")
-async def launch_tool(alias: str):
-    """一键启动图形界面工具（不取回输出）。"""
+async def launch_tool(alias: str, confirm: bool = False):
+    """一键启动图形界面工具（不取回输出）。
+
+    历史实现只校验「文件存在」就直接 spawn，完全不看风险分级——
+    而这里能启动的工具包含本属 L2/L3 的可编排工具，等价于绕过整套风险闸门
+    执行本机程序（L3 的 py_exec 反倒要用户二次确认，此处却不要，属明显不一致）。
+    现对齐同一条规则：L2/L3 必须带 confirm=true 才放行（前端二次确认后传参）。
+    """
     tool = registry.get_by_alias(alias)
     if not tool:
         raise HTTPException(404, f"工具不存在：{alias}")
     if not tool.executable:
         raise HTTPException(400, f"该工具没有可执行文件（可能是网页工具）：{tool.name}")
+    risk = registry.risk_of(tool.alias) or {}
+    if not risk.get("auto", False) and not confirm:
+        raise HTTPException(
+            409,
+            f"「{tool.name}」风险等级 {risk.get('level', '?')}（{risk.get('name', '需确认')}），"
+            f"启动前需要显式确认：请带上 confirm=true 重试。",
+        )
     return await executor.launch(tool)
 
 
@@ -438,28 +483,78 @@ async def project_detail(pid: str):
 
 @app.post("/api/projects/{pid}/facts")
 async def add_fact(pid: str, req: FactRequest):
-    return store.add_fact(pid, req.content, source="manual")
+    rec = store.add_fact(pid, req.content, source="manual",
+                         session_id=req.session_id, step_id=req.step_id)
+    if rec:
+        graph.on_fact_added(pid, rec)      # 因果图同步长出「关键事实」节点
+    return rec
 
 
 @app.delete("/api/projects/{pid}/facts/{fid}")
 async def remove_fact(pid: str, fid: str):
-    return {"ok": store.delete_fact(fid)}
+    ok = store.delete_fact(fid)
+    graph.on_fact_deleted(pid, fid)
+    return {"ok": ok}
 
 
 @app.post("/api/projects/{pid}/findings")
 async def add_finding(pid: str, req: FindingRequest):
-    return store.add_finding(pid, req.title, req.severity, req.target, req.detail, req.evidence)
+    rec = store.add_finding(pid, req.title, req.severity, req.target,
+                            req.detail, req.evidence, session_id=req.session_id)
+    graph.on_finding_added(pid, rec)
+    return rec
 
 
 @app.delete("/api/projects/{pid}/findings/{fid}")
 async def remove_finding(pid: str, fid: str):
-    return {"ok": store.delete_finding(fid)}
+    ok = store.delete_finding(fid)
+    graph.on_finding_deleted(pid, fid)
+    return {"ok": ok}
+
+
+# ---------- 线索图（攻击图 / 因果图） ----------
+# 这 4 个路由在 2026-09-16 拉取上游（Lyum1d/MY-AGENT）时被整体覆盖掉了，
+# 而本地自研的 app/graph.py 与 web/graph.js 都没被替换 —— 结果 graph.py 成了
+# 没人调用的孤儿模块，前端「线索图」视图连同入口一起消失。这里恢复路由。
+@app.get("/api/projects/{pid}/graph/attack")
+async def get_attack_graph(pid: str):
+    """攻击图：项目为根，每条线索一个节点，边表示分支父子关系。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return graph.build_attack_graph(pid)
+
+
+@app.get("/api/projects/{pid}/graph/causal")
+async def get_causal_graph(pid: str):
+    """因果图：证据 → 关键事实 → 漏洞 的推理链。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return graph.build_causal_graph(pid)
+
+
+@app.post("/api/projects/{pid}/graph/causal")
+async def update_causal_graph(pid: str, req: CausalUpdateRequest):
+    """写入因果节点与边（Agent 或人工补充线索用）。
+
+    边 label 会归一化（FALSIFIES→CONTRADICTS 等），
+    SUPPORTS/CONTRADICTS 会触发目标节点的置信度传播。
+    """
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return graph.apply_updates(pid, req.model_dump())
+
+
+@app.post("/api/projects/{pid}/graph/causal/derive")
+async def derive_causal_graph(pid: str):
+    """从已有的工具执行、已证事实、漏洞发现派生整张因果图（会先清空重建）。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return graph.derive(pid)
 
 
 @app.get("/api/projects/{pid}/report")
 async def get_report(pid: str):
     return {"markdown": report.render_project_report(pid)}
-
 
 @app.post("/api/projects/{pid}/report/export")
 async def export_report(pid: str):
@@ -620,6 +715,11 @@ async def delete_session(sid: str):
     """彻底删除一条线索分支（含其下所有子分支）及关联数据。"""
     if not store.get_session_row(sid):
         raise HTTPException(404, "会话不存在")
+    # 运行中的会话不能删：Agent 协程还持有该 Session 对象，每步都会 store.save_step，
+    # 删掉之后它会继续往已删除的 session_id 上写，留下没人能清理的孤儿行。
+    s = sessions.get(sid)
+    if s and s.state in ("running", "awaiting_confirm"):
+        raise HTTPException(409, f"该线索正在执行中（{s.state}），请先等它结束或停止后再删除")
     result = store.delete_session_tree(sid)
     # 同步清理内存中的运行态会话
     for dsid in result.get("deleted_ids", []):
@@ -648,11 +748,19 @@ async def run_session(sid: str, req: RunRequest):
     s = sessions.get(sid)
     if not s:
         raise HTTPException(404, "会话不存在")
-    if s.state == "running":
-        raise HTTPException(409, "该会话正在执行中")
+    # awaiting_confirm 也必须挡：此时 Agent 协程还活着，再起一个会与它**共用**
+    # 同一个 events/control 队列 —— 两个循环抢同一条确认队列、事件交叉、步骤双写。
+    if s.state in ("running", "awaiting_confirm"):
+        raise HTTPException(409, f"该会话正在执行中（{s.state}）")
 
-    s.project = req.project_id
-    asyncio.create_task(_run_agent(s, req.message, req.project_id))
+    # 只在**非空**时覆盖项目归属。原实现无条件赋值，于是前端未选项目（project_id=""）时
+    # 会把已有归属抹掉：项目情报库 / 已证事实不再注入系统提示、步骤也不再归属该项目，
+    # 现象是「Agent 突然开始重复收集已知信息」，而日志里没有任何异常。
+    if req.project_id:
+        s.project = req.project_id
+    # 传 s.project 而不是 req.project_id：_run_agent 结束时会用它落库，
+    # 传原始请求值的话，空 project_id 会把库里的项目归属一并写空（内存保住了、库里没了）。
+    asyncio.create_task(_run_agent(s, req.message, s.project))
     return {"ok": True, "session_id": sid}
 
 
@@ -699,10 +807,24 @@ async def stream_session(sid: str):
 
 @app.post("/api/sessions/{sid}/confirm")
 async def confirm_step(sid: str, req: ConfirmRequest):
+    """回应「当前这一步」的高危确认。
+
+    只应是「正在等待确认」的那个步骤的回应，因此三处都要对上：
+      · 会话确实处于 awaiting_confirm；
+      · 请求带 step_id，且与会话正在等待的步骤一致（拒绝陈旧/重放/伪造）；
+      · 队列里没有积压的未消费确认（正常一轮只有一个待确认步骤）。
+    任一不符直接 409，绝不"先塞进队列等以后用"——那正是绕过闸门的方式。
+    """
     s = sessions.get(sid)
     if not s:
         raise HTTPException(404, "会话不存在")
-    await s.control.put({"approved": req.approved})
+    if s.state != "awaiting_confirm" or not s.pending_step_id:
+        raise HTTPException(409, "当前没有等待确认的步骤")
+    if not req.step_id or req.step_id != s.pending_step_id:
+        raise HTTPException(409, f"确认与当前等待的步骤不匹配（当前：{s.pending_step_id}）")
+    if not s.control.empty():
+        raise HTTPException(409, "已有待处理的确认，请勿重复提交")
+    await s.control.put({"approved": req.approved, "step_id": req.step_id})
     return {"ok": True}
 
 
@@ -711,6 +833,17 @@ async def session_state(sid: str):
     chat = store.list_chat_messages(sid)  # 对话历史（新旧会话通用，旧会话为空列表）
     s = sessions.get(sid)
     if s:
+        # pending_confirm：把「正在等确认的那一步」一并回传。
+        # 确认框只由 SSE 的 need_confirm 事件渲染，页面刷新/断线重连后事件已经过去，
+        # 用户会看到「执行中」却永远等不到可点的按钮，最后只能超时。
+        # 前端据此重绘确认框，才能把「确认必须绑步骤」这条约束闭环。
+        pending = None
+        if s.state == "awaiting_confirm" and s.pending_step_id:
+            for st in s.steps:
+                if st.id == s.pending_step_id:
+                    pending = {"step": agent._step_dict(st),
+                               "risk": st.risk or registry.risk_of(st.tool_alias) or {}}
+                    break
         return {
             "id": s.id,
             "state": s.state,
@@ -721,6 +854,7 @@ async def session_state(sid: str):
             "records": s.records,
             "summary": s.summary,
             "chat": chat,
+            "pending_confirm": pending,
         }
     # 回退到持久化层：服务重启后内存会话已清空，但 store 里仍有记录
     rec = store.get_session(sid)

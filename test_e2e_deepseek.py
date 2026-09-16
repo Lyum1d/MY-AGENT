@@ -89,8 +89,10 @@ async def main():
                     lvl = ev["risk"]["level"]
                     approved = lvl != "L3"
                     print(f"  [确认] {ev['step']['tool_name']} {lvl} → {'放行' if approved else '拒绝'}")
+                    # 必须带上 step_id：后端只接受「正在等待确认的那一步」的回应，
+                    # 不带/不匹配一律 409（防止陈旧或伪造的确认被下一步消费掉）。
                     await c.post(f"{BASE}/api/sessions/{sid}/confirm",
-                                 json={"approved": approved})
+                                 json={"approved": approved, "step_id": ev["step"]["id"]})
                 elif t == "error":
                     print(f"[错误] {ev['data']}")
                 elif t == "answer":

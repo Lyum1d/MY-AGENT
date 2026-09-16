@@ -44,7 +44,9 @@ async def consume(session, stop_state="done"):
             # 测试环境自动拒绝 L3，放行 L2
             approved = ev["risk"].get("level") != "L3"
             print(f"           自动决策：{'放行' if approved else '拒绝(L3)'}")
-            await session.control.put({"approved": approved})
+            # 必须回带 step_id：确认通道要求回复与「正在等待的那一步」绑定，
+            # 缺 step_id 的回应会被丢弃，最终按超时（=拒绝）处理。
+            await session.control.put({"approved": approved, "step_id": s["id"]})
         elif t == "command":
             print(f"[命令] {ev.get('data')}")
         elif t == "output":

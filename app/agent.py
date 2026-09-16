@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import config, store
+from . import graph
 from . import kb, fofa
 from . import pyexec
 from . import replayer
@@ -24,6 +25,9 @@ from .executor import executor
 from .intel import format_intel, update_intel_from_steps
 from .llm import auto_route_candidate, get_backend, parse_tool_arguments
 from .registry import registry
+# 主机形态识别（域名/IP/URL 判定）与「假 TLD」清单统一收敛在 app/scope.py：
+# 与 py_exec 的 target 校验共用同一套口径，避免「一边认、一边不认」的静默缺口。
+from .scope import FAKE_TLDS as _FAKE_TLDS
 
 logger = logging.getLogger(__name__)
 
@@ -102,12 +106,6 @@ L2/L3 工具需要用户授权确认才会执行，你可以正常选择它们�
 # 目标参数中出现这些特征，说明模型把说明文字当成了目标
 _BAD_TARGET_PATTERNS = ("请提供", "请用户", "请确认", "请输入", "未知", "待定", "？", "?", "示例")
 
-# 域名提取时要排除的"假 TLD"（其实是文件扩展名）
-_FAKE_TLDS = {
-    "json", "exe", "jar", "py", "txt", "log", "md", "bat", "vbs", "vbe",
-    "yaml", "yml", "ini", "csv", "xlsx", "xls", "dll", "sys", "cfg", "conf",
-}
-
 
 def extract_target(text: str) -> str:
     """从用户任务描述中提取目标（URL / IP / 域名）。
@@ -138,8 +136,9 @@ def extract_target(text: str) -> str:
 def _is_host_like(target: str) -> bool:
     """判断目标是否像 URL / IP / 域名（而非企业名等自由文本）。
 
-    复用 extract_target 的域名/假 TLD 规则，保证与「从消息提取目标」口径一致：
-    「test.json」这类文件扩展名会被判为 False，不会被误当域名。
+    复用 extract_target 的域名/假 TLD 规则（该规则现已与 app/scope.py 的
+    主机判定共用同一份 FAKE_TLDS），保证「从消息提取目标」与「执行前授权校验」
+    对同一个串的看法一致：「test.json」这类文件扩展名会被判为 False，不会被误当域名。
     """
     t = (target or "").strip()
     if not t:
@@ -280,6 +279,9 @@ class Session:
     records: list[str] = field(default_factory=list)  # 开分支时打包带来的记录
     summary: str = ""                # 最近一轮结论摘要（写回父对话/供其他线索引用）
     subtask: bool = False            # 是否由 split_task 派生的并行子任务（子任务内禁 L2/L3）
+    # 当前正在等待用户确认的步骤 id。确认通道是「一次一步」的交互式，
+    # 必须有归属才能拒绝「陈旧/伪造/重复」的确认指令（详见 _await_confirm）。
+    pending_step_id: str = ""
 
     async def emit(self, event: dict) -> None:
         await self.events.put(event)
@@ -320,6 +322,9 @@ class SessionManager:
             parent_id=row.get("parent_id") or "",
             title=row.get("title") or "",
             records=records if isinstance(records, list) else [],
+            # 必须恢复：subtask=True 时 run() 会拒绝 L2/L3（并行子任务无人应答确认框）。
+            # 丢了标记等于让「子任务内禁高危操作」这道闸门失效。
+            subtask=bool(row.get("subtask") or 0),
         )
         s.target = row.get("target") or ""
         s.state = "idle"
@@ -386,7 +391,8 @@ class Agent:
         # 立即落库，避免中途关闭页面导致整轮记录丢失（树字段一并带上，
         # 分支线索在首次运行后就出现在小地图上）
         store.save_session(session.id, session.project, user_message, session.target,
-                           "running", parent_id=session.parent_id, title=session.title)
+                           "running", parent_id=session.parent_id, title=session.title,
+                           subtask=session.subtask)
         await session.emit({"type": "session_start", "session_id": session.id})
         backend = get_backend(self.backend_name)
         # 漏洞验证类任务自动路由云端：本地小模型在多步推理上明显吃力，
@@ -807,7 +813,12 @@ class Agent:
             note = "事实内容为空：args 应填要记录的事实正文（一句一事）。"
         else:
             try:
-                rec = store.add_fact(session.project, content[:500], source="agent")
+                # 带上会话与最近一步的步骤 id：因果图靠这个溯源把
+                # 「某次工具执行 —揭示→ 该事实」连成边，否则事实会成孤点。
+                last_step = session.steps[-1].id if session.steps else ""
+                rec = store.add_fact(session.project, content[:500], source="agent",
+                                     session_id=session.id, step_id=last_step)
+                graph.on_fact_added(session.project, rec)
                 note = f"已记录已证事实 #{rec.get('id','')}：{content[:120]}"
             except Exception as e:
                 note = f"记录事实失败：{e}"
@@ -1100,19 +1111,60 @@ class Agent:
 
     # ---------- 确认流程 ----------
     async def _await_confirm(self, session: Session, step: Step) -> bool:
+        """等待用户对「这一步」放行/拒绝。
+
+        session.control 是一条 FIFO 队列，历史实现只取队首、不校验归属，于是：
+          · 会话空闲时往 /confirm 发一条 approved=true（接口当时不校验 state），
+            这条会一直躺在队列里，被**下一个**高危步骤直接消费并自动放行——
+            用户根本没看到确认框，L3 的授权闸门等于不存在；
+          · 前端确认按钮没有防重复点击，双击即预支掉下一次的确认。
+        因此这里做三件事：
+          ① 进入等待前把本步 id 挂到 session.pending_step_id，供接口比对；
+          ② 取到回应后校验 step_id 是否就是本步，不是则丢弃并继续等（拒绝重放）；
+          ③ 无论成功/超时/异常，都在 finally 里复位 state 并**排空队列残留**，
+             避免陈旧指令跨步骤累积。
+        """
+        session.pending_step_id = step.id
         session.state = "awaiting_confirm"
         await session.emit({
             "type": "need_confirm",
             "step": self._step_dict(step),
             "risk": step.risk,
         })
+        approved = False
         try:
-            resp = await asyncio.wait_for(session.control.get(), timeout=config.CONFIRM_TIMEOUT)
+            deadline = time.monotonic() + config.CONFIRM_TIMEOUT
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                resp = await asyncio.wait_for(session.control.get(), timeout=remaining)
+                # 严格模式：step_id 必须存在且与本步一致才认，否则丢弃并继续等。
+                # 缺 step_id 的回应一律不放行——宁可等到超时按「拒绝」处理（fail-closed，
+                # 现象可见且可排查），也不接受一条来源不明的放行（fail-open，危险且无声）。
+                rid = str(resp.get("step_id") or "")
+                if rid != step.id:
+                    logger.warning("忽略与当前步骤不匹配的确认指令：step_id=%r 当前=%r",
+                                   rid, step.id)
+                    continue
+                approved = bool(resp.get("approved"))
+                break
         except asyncio.TimeoutError:
             await session.emit({"type": "error", "data": "确认超时，已取消该步骤"})
-            return False
-        session.state = "running"
-        return bool(resp.get("approved"))
+            approved = False
+        finally:
+            session.pending_step_id = ""
+            # 复位状态机：历史实现只在成功路径复位，超时后 state 会永远停在
+            # awaiting_confirm（前端据此一直显示「执行中」，落库也是脏状态）。
+            session.state = "running"
+            # 排空残留：超时/异常后队列里可能还压着用户此前的点击，
+            # 留着就会被下一步白白消费掉。
+            while not session.control.empty():
+                try:
+                    session.control.get_nowait()
+                except Exception:
+                    break
+        return approved
 
     # ---------- 失败归因分层 ----------
     @staticmethod
@@ -1183,10 +1235,19 @@ class Agent:
 
         step.output = "\n".join(chunks)
         step.finished_at = time.time()
+        # 授权边界（退出码 126）必须无条件算失败，且**不受 ignore_exit_code 影响**。
+        # 为什么单独拎出来：126 的"输出"是 executor/pyexec 写的那行 `[错误] 目标不在
+        # 授权白名单内…`，它会让"有实质输出即算成功"的启发式判定成立。对开了
+        # ignore_exit_code 的工具（如 EHole），这会把「越权被拦」误判成「执行成功」，
+        # 于是 _attribute_failure 里那档 SCOPE（要求停手、别换参数绕过）永远送不到模型，
+        # 模型就会一直换参数去撞授权墙——与设计意图正好相反。
+        denied_by_scope = exit_code == 126
         # 部分工具退出码不可信（如 EHole：没命中「重点资产」就返回 1，
         # 但其实已经把指纹打出来了）。有实质输出就按成功算，否则会把成功误判为失败。
-        meaningful = bool(step.output.strip())
-        ok = exit_code == 0 or (tool.ignore_exit_code and meaningful)
+        # 注意：`[错误]` 开头的行是执行器自己的报错，不算「实质输出」。
+        meaningful = any(ln.strip() and not ln.lstrip().startswith("[错误]")
+                         for ln in step.output.splitlines())
+        ok = (not denied_by_scope) and (exit_code == 0 or (tool.ignore_exit_code and meaningful))
         step.status = "done" if ok else "error"
         await session.emit({"type": "step_done", "step": self._step_dict(step)})
         # 每步即时落库

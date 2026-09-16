@@ -55,7 +55,10 @@ async def main():
                     print(f"\n[需确认] {s['tool_name']} | {lvl} | target={s['target']}")
                     approved = lvl != "L3"
                     print(f"         → {'放行' if approved else '拒绝(L3)'}")
-                    await c.post(f"{BASE}/api/sessions/{sid}/confirm", json={"approved": approved})
+                    # 必须带上 step_id：后端只接受「正在等待确认的那一步」的回应，
+                    # 不带/不匹配一律 409（防止陈旧或伪造的确认被下一步消费掉）。
+                    await c.post(f"{BASE}/api/sessions/{sid}/confirm",
+                                 json={"approved": approved, "step_id": s["id"]})
                 elif t == "error":
                     print(f"[错误] {ev['data']}")
                 elif t == "answer":

@@ -29,11 +29,16 @@ _RATE_LOCK = asyncio.Lock()
 
 
 # ---------- 域名白名单 ----------
-# 实现统一在 app/scope.py，与命令行执行器（app/executor.py）共用同一份判断。
+# 实现统一在 app/scope.py，与命令行执行器（app/executor.py）、py_exec 共用同一份判断。
 # 行为变化：此前本模块在 scope.json 缺失时会静默写入 example.com 兜底并据此放行，
 # 现在改为 fail-closed——缺配置即视为「没有授权目标」，直接拒绝，
 # 避免使用者误以为「已经配好授权」。
-
+#
+# 下面两个别名只是为了保留历史入口名（test_replayer.py 按老名字做「两份实现不能漂移」
+# 的一致性断言）。它们**直接指向 scope.py 的函数对象**，因此不是第二份实现，
+# 而是同一份实现的另一个名字——任何人都无法只改其中一处造成判定分叉。
+_host_allowed = scope.host_in_scope
+_load_scope = scope.load_scope
 
 # ---------- 限速 ----------
 async def _rate_limit() -> None:
@@ -57,13 +62,20 @@ def _parse_args(args: str) -> tuple[str, list[tuple[str, str]], dict[str, str], 
     i = 0
     while i < len(tokens):
         t = tokens[i]
-        if t in ("-X", "--method") and i + 1 < len(tokens):
+        # 方法旗标：必须大小写不敏感，且要覆盖 --request / --method / -X=POST 等写法。
+        # 此前只匹配 "^-X[ A-Z]"（仅空格与大写），于是 `-Xpost`、`--request POST`、
+        # `-X=POST` 全都解析不出来 → method 静默保持默认的 GET。因为 GET 本身是允许的，
+        # 不会报任何错，模型以为在测 POST 型接口、实际发的是 GET，直接造成假阴性漏报。
+        if t in ("-X", "--method", "--request") and i + 1 < len(tokens):
             method = tokens[i + 1].upper()
             i += 2
-        elif t == "-X" or t == "--method":
-            return method, query, {}, timeout, "-X 缺少方法名"
-        elif re.match(r"^-X[ A-Z]", t) and len(t) > 2 and not t.startswith("-X="):
+        elif t in ("-X", "--method", "--request"):
+            return method, query, {}, timeout, f"{t} 缺少方法名"
+        elif t.startswith("-X") and len(t) > 2 and not t.startswith("-X="):
             method = t[2:].upper()
+            i += 1
+        elif t.startswith(("-X=", "--method=", "--request=")):
+            method = t.split("=", 1)[1].upper()
             i += 1
         elif t in ("-H", "--header") and i + 1 < len(tokens):
             raw = tokens[i + 1]
