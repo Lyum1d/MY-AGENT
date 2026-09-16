@@ -117,6 +117,7 @@ async def run_py_exec(code: str, target: str = "") -> AsyncIterator[dict]:
     )
     deadline = time.monotonic() + config.PY_EXEC_TIMEOUT
     timed_out = False
+    _buf = b""   # 审计 P2-2：定长 read 的行缓冲（替代 readline，避免 64KB 单行炸通道）
     try:
         # 逐行流式回传；超时则中断并保留已回传部分
         while True:
@@ -128,17 +129,23 @@ async def run_py_exec(code: str, target: str = "") -> AsyncIterator[dict]:
                        "data": f"执行超时（>{config.PY_EXEC_TIMEOUT}s），已中断。请把代码拆小或增加单步耗时上限后再试。"}
                 break
             try:
-                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=min(remaining, 5.0))
+                # 审计 P2-2：readline() 遇到超过 asyncio 流默认 64KB limit 的单行会抛
+                # ValueError，被下面的 except Exception 吞成「执行通道异常」，掩盖真实
+                # 输出。改用定长 read() + 手动切行，超长行由下方 2000 字符截断兜底。
+                raw = await asyncio.wait_for(proc.stdout.read(4096), timeout=min(remaining, 5.0))
             except asyncio.TimeoutError:
                 continue
             if not raw:
                 break
-            text = raw.decode("utf-8", "replace").rstrip()
-            if not text:
-                continue
-            if len(text) > 2000:
-                text = text[:2000] + "…（行过长已截断）"
-            yield {"type": "output", "data": text}
+            _buf += raw
+            *lines, _buf = _buf.split(b"\n")
+            for line in lines:
+                text = line.decode("utf-8", "replace").rstrip("\r")
+                if not text:
+                    continue
+                if len(text) > 2000:
+                    text = text[:2000] + "…（行过长已截断）"
+                yield {"type": "output", "data": text}
     except Exception as e:
         yield {"type": "error", "data": f"执行通道异常：{e}"}
     finally:

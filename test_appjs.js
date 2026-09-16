@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const WEB = path.join('C:', 'Users', 'wang', 'Desktop', 'src-agent', 'web');
+const WEB = path.join(__dirname, 'web');  // 审计 P1-2：相对脚本定位，不写死他人机器路径
 // 和 index.html 一样：先 graph.js 再 app.js（app.js 的 init 里要用 GraphView）
 const SRC = fs.readFileSync(path.join(WEB, 'graph.js'), 'utf8')
   + '\n' + fs.readFileSync(path.join(WEB, 'app.js'), 'utf8');

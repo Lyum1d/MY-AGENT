@@ -201,6 +201,13 @@ async def run_nuclei(tool, target: str, args: str = ""):
         yield {"type": "exit", "code": 1}
         return
     target = (target or "").strip().strip("'\"")
+    # ---- 授权白名单（与 run_replay 对齐）：nuclei_cli 是 L2 通道，此前完全没有
+    # check_scope，target 填任意未授权主机即可直接跑 PoC 模板（审计 P0-1）----
+    denied = scope.check_scope(target)
+    if denied:
+        yield {"type": "error", "data": denied}
+        yield {"type": "exit", "code": 126}
+        return
     if not re.match(r"^https?://", target):
         yield {"type": "error", "data": "target 必须是完整 URL（带 http:// 或 https://）"}
         yield {"type": "exit", "code": 1}

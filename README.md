@@ -423,10 +423,20 @@ python test_tree.py
    `启动控制台.bat` 或 `python run.py`。两者都依赖一个装了项目依赖的解释器，探测顺序见「快速开始」；
    其他电脑使用需自行准备 venv 与工具箱。
 6. **Anthropic 兼容端点的 tool_use 支持** —— 走 messages API 的标准结构，个别兼容端点对 function calling 实现不完整时会退化为纯文本，请以实测为准。
+7. **线索图前端未接回（后端已就绪）** —— `/api/projects/{pid}/graph/attack|causal` 等 4 个路由
+   与 `web/graph.js` 渲染库已在仓库中，但 `index.html` 当前未加载 `graph.js`（v006 拉上游覆盖时
+   前端入口丢失，经确认暂不恢复）。恢复前端时可直接复用 `test_graph_js.js` / `test_graph_e2e.py`
+   的既有期望值。在此之前这些后端路由是「预留能力」。
+8. **授权白名单不区分端口** —— 白名单条目是主机名级（`example.com` 即放行其全部端口）。
+   这是设计取舍：SRC 测试通常按主机授权。若需要按 `host:port` 收紧，需扩展 `scope.json`
+   条目格式与 `host_in_scope` 匹配逻辑。
+9. **`data/scope.json` 已移出版本控制** —— 本机真实授权数据不入库；新环境请复制
+   `data/scope.example.json` 为 `data/scope.json` 再填入授权目标（白名单为空时服务会
+   fail-closed 拒绝一切执行）。
 
 ## 合规
 
-仅限已获得**书面授权**的目标测试。L3 级操作（含 `py_exec` 代码执行）需手动勾选授权确认才可放行。
+仅限已获得**书面授权**的目标测试。L3 级操作（含 `py_exec` 代码执行）需**两次独立确认**才可放行（后端强制：确认必须绑定当前步骤 id，两轮都 approved 才执行，任何一轮拒绝/超时即取消）。
 
 **绝对不能碰的合规红线（必背）**：禁止测试企业内网 / 内部 OA / 员工办公系统 / 第三方合作平台；
 禁止暴力爆破账号、高频端口扫描、DDoS 压测；禁止拖库、批量下载用户隐私数据（确需取证只截图，
