@@ -45,11 +45,24 @@ SYSTEM_PROMPT = """你是一个渗透测试编排助手，服务于 SRC（安全
 8. 事实纪律：只能基于真实工具输出下结论。禁止编造漏洞、凭据、flag、版本号或"疑似成功"。
    区分「已证实的事实」与「待验证的猜测」，报告中结论只先给证据确凿的，再扩展可疑点。
 
+【绝对不能碰的合规红线（必背）】（优先级高于以下所有流程与打法；触及任一条即停止该方向并说明原因）
+ 1. 禁止测试企业内网、内部 OA、员工办公系统、第三方合作平台——只碰授权白名单内的资产。
+ 2. 禁止暴力爆破账号、高频端口扫描、DDoS 压测等影响可用性的行为。
+ 3. 禁止拖库、批量下载用户隐私数据；确需取证只截最小必要截图，不批量保存、不外传。
+ 4. 禁止植入后门、修改/删除服务器文件、篡改订单/密码等真实业务数据。
+ 5. 禁止社工钓鱼、短信轰炸。
+ 6. 禁止横向移动：拿到权限后不得继续探测内网其他主机。
+ 工具「能做到」不等于授权允许越线。若某一步会踩线，改用更保守的做法，或停下来说明原因；
+ 需要展开说明（含越线时的处理方式）时，用 kb_read 读 compliance-redlines。
+
 对话树工作流（多条线索并行推进）：
 9. 发现值得单独深挖的可疑点（注入点/弱口令/未授权接口/可疑目录等）时，调用 propose_branch
    向用户建议开辟新线索，由用户确认；新线索会带上相关记录独立推进，避免当前对话信息过载。
 10. 需要其他线索里已查到的信息时，调用 search_history 按关键词检索（子域名、路径、端口、
     工具结果等），检索到的内容是已证实的工具输出，可直接引用；检索不到就继续用工具查证。
+    另：任务面较宽、子任务之间互不依赖时（例如「同时做子域收集 / 指纹识别 / 目录探测」），
+    调用 split_task 把它们拆成 2~4 份并发执行，全部跑完会自动汇总回本线索，你再基于汇总推进。
+    子任务内只允许 L0/L1 自动执行的工具，L2/L3 会被拒绝——需要人工确认的动作留在主线索做。
 
 知识库与测绘（kb / fofa）：
 11. 进站先调用 kb_read 读「打穿短表」（手法索引，当开场几枪），再按目标特征用 kb_search 找
@@ -158,6 +171,17 @@ def validate_target(target: str) -> str | None:
 _CODE_FENCE_RE = re.compile(r"```[a-zA-Z]*[ \t]*\r?\n(.*?)```", re.S)
 _TARGET_FLAGS = {"-u", "--url", "-t", "--target"}
 
+# 上下文压缩标记：已压缩过的消息不再重复压缩（保证幂等）
+_COMPRESSED_PREFIX = "〔已压缩〕"
+
+# 失败归因分层用的特征词（借鉴 LuaN1ao 的 L0–L5 递进归因，此处只取 L1/L3/L4 三档）
+# L1 = 工具根本没跑起来（措辞取自 executor / pyexec / replayer 的实际报错文案）
+_L1_HINTS = ("超时", "超过总时长", "已终止", "无法启动", "启动异常", "执行异常",
+             "无法连接", "请求失败", "找不到指定的文件")
+# L3 = 连得上但被环境或权限拦下
+_WAF_HINTS = ("403", "401", "429", "waf", "forbidden", "unauthorized", "access denied",
+              "blocked", "captcha", "验证码", "拦截", "速率限制", "too many requests")
+
 
 def _parse_tool_from_markdown(content: str) -> dict | None:
     """从模型输出的 markdown 代码块里恢复工具调用。
@@ -255,6 +279,7 @@ class Session:
     title: str = ""                  # 线索名
     records: list[str] = field(default_factory=list)  # 开分支时打包带来的记录
     summary: str = ""                # 最近一轮结论摘要（写回父对话/供其他线索引用）
+    subtask: bool = False            # 是否由 split_task 派生的并行子任务（子任务内禁 L2/L3）
 
     async def emit(self, event: dict) -> None:
         await self.events.put(event)
@@ -265,10 +290,10 @@ class SessionManager:
         self.sessions: dict[str, Session] = {}
 
     def create(self, project: str = "", parent_id: str = "", title: str = "",
-               records: list[str] | None = None) -> Session:
+               records: list[str] | None = None, subtask: bool = False) -> Session:
         sid = uuid.uuid4().hex[:12]
         s = Session(id=sid, project=project, parent_id=parent_id,
-                    title=title, records=list(records or []))
+                    title=title, records=list(records or []), subtask=subtask)
         self.sessions[sid] = s
         return s
 
@@ -333,7 +358,8 @@ class Agent:
         self.backend_name = backend_name
 
     # ---------- 主循环 ----------
-    async def run(self, session: Session, user_message: str) -> None:
+    async def run(self, session: Session, user_message: str,
+                  max_steps: int | None = None, allow_split: bool = True) -> None:
         session.state = "running"
         session.messages.append({"role": "user", "content": user_message})
         # 对话历史落库：切线索回放时可见用户原始消息
@@ -442,8 +468,14 @@ class Agent:
             except Exception:
                 logger.exception("线索树上下文注入失败")
         consecutive_failures = 0
+        tokens_used = 0        # 本次任务累计 token（成本熔断用）
+        switch_nudged = False  # 「换策略」提醒是否已发过（成功一次后重新武装）
+        step_budget = max_steps or config.MAX_STEPS
 
-        for step_no in range(1, config.MAX_STEPS + 1):
+        for step_no in range(1, step_budget + 1):
+            # 先做上下文压缩：长任务里 session.messages 会一路膨胀，把较早的工具输出
+            # 压成一行摘要，避免小模型被早期细节淹没（详见 docs/LuaN1ao对比分析.md §2）。
+            self._compress_history(session)
             # 每轮重建提醒：小模型在工具失败后容易「忘记」目标并反问用户，
             # 而且会反复调用同一个刚失败的工具，必须显式告诉它试过了什么。
             reminder = self._build_reminder(session)
@@ -462,6 +494,7 @@ class Agent:
             # token 用量落库（仅成功且端点返回 usage 的调用；额度耗尽等失败不计）
             try:
                 _u = result.get("usage") or {}
+                tokens_used += int(_u.get("prompt") or 0) + int(_u.get("completion") or 0)
                 if _u.get("prompt") or _u.get("completion"):
                     store.save_usage(
                         provider_id=backend.name,
@@ -473,6 +506,22 @@ class Agent:
                     )
             except Exception:
                 logger.exception("token 用量落库失败")
+
+            # ---- 成本熔断：本次任务累计 token 超预算即停止 ----
+            # 本地 Ollama 不返回 usage，所以不会触发；云端供应商超限即停，
+            # 避免一个失控任务无声烧钱（原实现只有事后统计、没有运行中的闸门）。
+            if config.RUN_TOKEN_BUDGET and tokens_used > config.RUN_TOKEN_BUDGET:
+                budget_msg = (
+                    f"本次任务累计消耗 token 已达 {tokens_used:,}，超过预算上限 "
+                    f"{config.RUN_TOKEN_BUDGET:,}，为避免继续消耗已停止。"
+                    f"如需继续，可调大环境变量 AGENT_RUN_TOKEN_BUDGET，或改用本地模型。"
+                )
+                await self._write_back(session, budget_msg)
+                await session.emit({"type": "answer", "data": budget_msg})
+                self._persist_intel(session)
+                session.state = "done"
+                await session.emit({"type": "done", "state": "done"})
+                return
 
             # ---- 模型给出思考/说明 ----
             if result.get("content"):
@@ -613,6 +662,9 @@ class Agent:
                 if tool.alias == "propose_branch":
                     await self._propose_branch(session, tc, args)
                     continue
+                if tool.alias == "split_task":
+                    await self._split_task(session, tc, args, allow_split)
+                    continue
 
                 # ---- 内置 kb_search / kb_read / fofa_search（知识库与测绘，L0/L1）----
                 if tool.alias in ("kb_search", "kb_read", "fofa_search"):
@@ -640,6 +692,23 @@ class Agent:
                 )
                 session.steps.append(step)
 
+                # ---- 并行子任务：禁止需要人工确认的工具 ----
+                # split_task 派生的子任务是并发跑的，而确认通道是「一次一步」的交互式，
+                # 且前端只订阅当前会话的 SSE —— 并行时无法逐个弹确认。因此子任务内只放行
+                # L0/L1 自动执行类；L2/L3 直接拒绝，并提示回主线索由人工确认后执行。
+                if session.subtask and not risk.get("auto", False):
+                    msg = (f"子任务内不允许执行需要人工确认的工具（{tool.name}，风险等级 "
+                           f"{risk.get('level')}）。请改用 L0/L1 的只读/探测类工具；"
+                           f"这一步留给主线索，由人工确认后单独执行。")
+                    session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": msg})
+                    step.status = "denied"
+                    await session.emit({"type": "step_denied", "step": self._step_dict(step)})
+                    try:
+                        store.save_step(session.id, self._step_dict(step))
+                    except Exception:
+                        pass
+                    continue
+
                 # ---- 风险闸门 ----
                 if not risk.get("auto", False):
                     approved = await self._await_confirm(session, step)
@@ -662,12 +731,17 @@ class Agent:
                 # 执行成功即重置连续失败计数；失败则累加
                 if step.status == "done":
                     consecutive_failures = 0
+                    switch_nudged = False   # 成功一次后，「换策略」提醒重新武装
                 elif step.status == "error":
                     consecutive_failures += 1
 
-            # 连续多次失败说明思路不对，及时止损避免空转
-            if consecutive_failures >= 3:
-                stop_msg = f"连续 {consecutive_failures} 次执行失败，已停止。请检查目标可达性、工具参数或授权范围。"
+            # 失败止损分两档（借鉴 LuaN1ao EXECUTOR_FAILURE_THRESHOLD 的语义）：
+            # 连续失败先「要求换策略」再继续，只有在更高阈值上仍连续失败才停止。
+            # 原实现连续 3 次即停，但连续三次失败常常只是「同一思路被环境挡住」——
+            # 换策略还有得挖，这也是「没到最大步数就停」的主要原因。
+            if consecutive_failures >= config.FAILURE_STOP_THRESHOLD:
+                stop_msg = (f"连续 {consecutive_failures} 次执行失败，已停止。"
+                            f"请检查目标可达性、工具参数或授权范围。")
                 await self._write_back(session, stop_msg)
                 await session.emit({
                     "type": "answer",
@@ -677,8 +751,26 @@ class Agent:
                 session.state = "done"
                 await session.emit({"type": "done", "state": "done"})
                 return
+            if consecutive_failures >= config.FAILURE_SWITCH_THRESHOLD and not switch_nudged:
+                switch_nudged = True
+                session.messages.append({
+                    "role": "user",
+                    "content": (
+                        f"你已经连续 {consecutive_failures} 次执行失败。"
+                        "现在必须【换策略】，而不是继续换工具重试："
+                        "① 换测试面（换接口、换参数、换相邻资产）；"
+                        "② 换手法（换漏洞类型，或改用「只读差分」的方式取证）；"
+                        "③ 若判断目标当前不可达、或已超出授权白名单，直接给出结论结束，"
+                        "并在结论里说明失败原因与已证实的部分。"
+                        "不要重复调用刚失败过的工具，也不要换汤不换药地调同一类工具。"
+                    ),
+                })
+                await session.emit({
+                    "type": "reasoning",
+                    "data": f"（连续 {consecutive_failures} 次失败：已要求模型换策略而非继续重试）",
+                })
 
-        max_steps_msg = f"已达到最大步数 {config.MAX_STEPS}，停止执行。"
+        max_steps_msg = f"已达到最大步数 {step_budget}，停止执行。"
         await self._write_back(session, max_steps_msg)
         await session.emit({"type": "answer", "data": max_steps_msg})
         self._persist_intel(session)
@@ -716,17 +808,23 @@ class Agent:
     async def _search_history(self, session: Session, tc: dict, keyword: str) -> None:
         """search_history 内置工具：在项目内所有会话的历史工具输出里检索关键词。"""
         kw = (keyword or "").strip()[:80]
+        hits: list[dict] = []
         if not session.project:
             note = "当前会话未关联项目，无法检索历史线索。"
         elif not kw:
             note = "搜索关键词为空：args 应填要检索的关键词（域名、路径、工具名、端口等）。"
         else:
+            err = ""
             try:
                 hits = store.search_history(session.project, kw)
             except Exception as e:
-                hits = []
-                note = f"检索失败：{e}"
-            if not hits:
+                err = str(e)
+                logger.exception("检索历史线索失败")
+            if err:
+                # 原实现里这条错误会被紧随其后的「未检索到」覆盖，模型只能看到
+                # 「没搜到」而看不到真实原因，这里显式区分优先级。
+                note = f"检索失败：{err}"
+            elif not hits:
                 note = f"未检索到包含「{kw}」的历史记录。可换更具体的关键词（如具体路径、子域名、端口）。"
             else:
                 lines = []
@@ -738,7 +836,7 @@ class Agent:
                     )
                 note = f"检索到 {len(hits)} 条包含「{kw}」的历史记录（已证实的工具输出，可直接引用）：\n\n" + "\n\n".join(lines)
         session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
-        await session.emit({"type": "reasoning", "data": f"（检索历史线索：{kw} → {len(hits) if session.project and kw else 0} 条）"})
+        await session.emit({"type": "reasoning", "data": f"（检索历史线索：{kw} → {len(hits)} 条）"})
 
     # ---------- 对话树：建议开辟新线索 ----------
     async def _propose_branch(self, session: Session, tc: dict, args: str) -> None:
@@ -764,6 +862,97 @@ class Agent:
                 f"请继续当前任务，或在当前方向确实告一段落时给出结论结束。")
         session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
         await session.emit({"type": "reasoning", "data": f"（已发出开新线索建议：《{title}》，等待用户确认）"})
+
+    # ---------- 任务分片并行（拆小份 → 并发跑 → 合并） ----------
+    async def _split_task(self, session: Session, tc: dict, args: str, allow_split: bool) -> None:
+        """split_task 内置工具：把当前任务拆成若干子任务并发执行，跑完汇总回本线索。
+
+        设计取舍：
+        · 复用「线索树」基础设施 —— 子任务就是带 parent_id 的子会话，天然出现在小地图上，
+          结论也会经 _write_back 回流（子线索跑完会给父会话发 branch_update 事件）。
+        · 子任务内禁止 L2/L3（落实在 run() 的风险闸门）：确认通道是「一次一步」的交互式，
+          且前端只订阅当前会话的 SSE，并行时弹不出确认，硬跑只会得到无人确认的悬空步骤。
+        · 并发用 asyncio 而不是多进程：本工作负载是 I/O 密集（等模型、等工具），单进程足够；
+          多进程反而要重建事件流与确认通道，收益不抵复杂度。
+        · 并发上限刻意保守（默认 3）：并行 = 对目标同时发更多请求，平台规则禁止影响业务
+          可用性的高并发，云端供应商那边也会推高 token 消耗。
+        """
+        text = (args or "").strip()
+        subs = [ln.strip(" -•*、.\t") for ln in text.splitlines() if ln.strip(" -•*、.\t")]
+        if not allow_split:
+            note = "子任务内不允许再次拆分（避免任务数指数膨胀）。请直接完成你负责的这一份。"
+            session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
+            return
+        if len(subs) < 2:
+            note = ("拆分至少需要 2 个子任务：args 每行填一个，每行要具体到目标与动作。"
+                    "若这个任务本身不需要拆分，就不要调用本工具，直接继续做。")
+            session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
+            await session.emit({"type": "reasoning", "data": "（split_task：子任务不足 2 个，未拆分）"})
+            return
+        subs = subs[: config.SUBTASK_MAX_COUNT]
+
+        parent_task = next((str(m.get("content") or "") for m in session.messages
+                            if m.get("role") == "user"), "") or session.target
+        started_at = time.time()
+        children: list[Session] = []
+        for i, sub in enumerate(subs, 1):
+            c = sessions.create(
+                project=session.project, parent_id=session.id,
+                title=sub[:60] or f"子任务{i}", subtask=True,
+                records=[f"上级任务：{parent_task[:200]}", f"你负责的子任务：{sub}"],
+            )
+            c.target = session.target
+            children.append(c)
+
+        await session.emit({
+            "type": "reasoning",
+            "data": (f"（已拆分为 {len(children)} 个子任务并发执行，完成后自动汇总："
+                     + "；".join(x.title for x in children) + "）"),
+        })
+        sem = asyncio.Semaphore(max(1, config.SUBTASK_MAX_CONCURRENCY))
+
+        async def _run_child(c: Session, sub: str) -> None:
+            async with sem:
+                try:
+                    await self.run(c, sub,
+                                   max_steps=config.SUBTASK_MAX_STEPS, allow_split=False)
+                except Exception:
+                    logger.exception("子任务执行异常：%s", sub)
+
+        await asyncio.gather(*[_run_child(c, s) for c, s in zip(children, subs)])
+
+        # ---- 合并：结论摘要 + 用过的工具 + 期间新增的已证事实 ----
+        blocks: list[str] = []
+        for c in children:
+            done_tools = list(dict.fromkeys(
+                st.tool_alias for st in c.steps if st.status == "done")) or ["（无）"]
+            blocks.append(
+                f"【子任务《{c.title}》· {len(c.steps)} 步 · 用过的工具：{'、'.join(done_tools)}】\n"
+                f"{(c.summary or '（未给出结论）').strip()[:1200]}"
+            )
+        facts_line = ""
+        if session.project:
+            try:
+                fresh = [f for f in store.list_facts(session.project)
+                         if (f.get("created_at") or 0) >= started_at]
+                if fresh:
+                    facts_line = ("\n\n【子任务期间新增的已证事实（可直接引用）】\n"
+                                  + "\n".join(f"- {str(f.get('content'))[:200]}"
+                                              for f in fresh[: config.SUBTASK_MERGE_FACTS]))
+            except Exception:
+                logger.exception("读取子任务新增事实失败")
+
+        merged = ("【任务分片并行结果汇总（已完成，可直接引用，不要重复验证）】\n\n"
+                  + "\n\n".join(blocks) + facts_line
+                  + "\n\n请基于以上汇总继续推进：把还没覆盖的面补齐，或按已证事实组织结论与报告。")
+        session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": merged})
+        await session.emit({"type": "subtask_merged", "data": {
+            "count": len(children),
+            "children": [{"id": c.id, "title": c.title, "steps": len(c.steps),
+                          "summary": (c.summary or "")[:300]} for c in children],
+        }})
+        await session.emit({"type": "reasoning",
+                            "data": f"（{len(children)} 个子任务已完成并汇总回本线索）"})
 
     # ---------- 知识库 / FOFA 测绘 ----------
     async def _kb_fofa_tool(self, session: Session, alias: str, tc: dict, args: str) -> None:
@@ -835,6 +1024,36 @@ class Agent:
                     },
                 })
 
+    # ---------- 上下文压缩（机械式，不调用模型） ----------
+    def _compress_history(self, session: Session) -> None:
+        """把较早的工具输出压成一行摘要，控制上下文膨胀。
+
+        借鉴 LuaN1ao 的「摘要压缩」思路，但**刻意不做 LLM 摘要**：本地小模型写摘要本身
+        就会产生幻觉，等于用一个不可靠环节去修另一个不可靠环节。这里只做确定性裁剪，
+        而且只改 role=tool 消息的 content、绝不删除消息——删消息会破坏
+        assistant.tool_calls 与 role=tool 的 tool_call_id 配对，导致协议直接报错。
+        """
+        msgs = session.messages
+        if len(msgs) <= config.HISTORY_COMPRESS_AFTER_MESSAGES:
+            return
+        keep_from = max(0, len(msgs) - config.HISTORY_KEEP_RECENT)
+        limit = config.HISTORY_SUMMARY_CHARS
+        changed = 0
+        for m in msgs[:keep_from]:
+            if m.get("role") != "tool":
+                continue
+            text = m.get("content") or ""
+            if len(text) <= limit or text.startswith(_COMPRESSED_PREFIX):
+                continue
+            m["content"] = (
+                f"{_COMPRESSED_PREFIX}{text[:limit]}"
+                f"…（原文 {len(text)} 字符已压缩；需要细节可用 search_history 检索）"
+            )
+            changed += 1
+        if changed:
+            logger.info("上下文压缩：%d 条历史工具输出已摘要化（保留最近 %d 条原文）",
+                        changed, config.HISTORY_KEEP_RECENT)
+
     # ---------- 防呆提醒 ----------
     @staticmethod
     def _build_reminder(session: Session) -> str:
@@ -878,12 +1097,44 @@ class Agent:
             "risk": step.risk,
         })
         try:
-            resp = await asyncio.wait_for(session.control.get(), timeout=600)
+            resp = await asyncio.wait_for(session.control.get(), timeout=config.CONFIRM_TIMEOUT)
         except asyncio.TimeoutError:
             await session.emit({"type": "error", "data": "确认超时，已取消该步骤"})
             return False
         session.state = "running"
         return bool(resp.get("approved"))
+
+    # ---------- 失败归因分层 ----------
+    @staticmethod
+    def _attribute_failure(step: Step, exit_code: int | None) -> tuple[str, str]:
+        """判定失败性质，并给出与之一一对应的调整方向。
+
+        借鉴 LuaN1ao 的 L0–L5 递进归因（core/prompts/.../failure_attribution_levels.jinja2），
+        只保留不依赖图谱、也不依赖强模型的三档：
+          L1  工具没跑起来      → 换参数 / 放大超时 / 换同类工具
+          L3  被环境或权限拦下  → 换编码、换参数位置、换手法（换工具通常无效）
+          L4  跑通了但没结果    → 该换测试思路，别在原假设上继续加码
+        多一档 SCOPE：被授权白名单拒绝，属于授权边界，必须停手而不是绕过。
+
+        原实现把三种情况压成同一句「执行失败」，模型分不清是工具坏了还是自己想错了，
+        于是反复换工具、每条都失败——这是「连续失败就停」的根因之一。
+        """
+        out = step.output or ""
+        low = out.lower()
+        # 授权边界：executor / pyexec 均用 126 表示被白名单拒绝
+        if exit_code == 126:
+            return "SCOPE", ("该目标被授权白名单拒绝，属于授权边界：不要换参数或换工具绕过，"
+                             "直接停止对该目标的测试并向用户说明。")
+        # L1：进程没起来 / 超时 / 异常终止
+        if exit_code in (124, 137) or any(h in out for h in _L1_HINTS):
+            return "L1", "工具本身没能正常执行：换参数、放大超时，或改用功能相近的其他工具。"
+        # L3：连得上但被拦
+        if any(h in low for h in _WAF_HINTS):
+            return "L3", ("目标可达但被环境或权限拦下：换编码或换参数位置再试，"
+                          "或换成不需要该权限的手法；这类拦截换工具通常无效。")
+        # L4：其余情况都排除后，视为假设可能不成立
+        return "L4", ("工具执行了但没拿到可用结果：这个假设可能不成立。"
+                      "先换一个测试思路或换一个攻击面，不要在原假设上继续加码。")
 
     # ---------- 执行并收集输出 ----------
     async def _execute(self, session: Session, step: Step, tool_call_id: str) -> None:
@@ -937,11 +1188,18 @@ class Agent:
         # 回喂给模型（截断，防止撑爆上下文）
         content = step.output or "（工具无输出）"
         if not ok:
+            level, guidance = self._attribute_failure(step, exit_code)
             content = (
-                f"【{step.tool_name} 执行失败】退出码 {exit_code}。输出如下：\n{content}\n"
-                f"禁止用同样参数再次调用 {step.tool_name}。"
-                f"请换参数，或改用功能相近的其他工具；"
-                f"若已无其他可行手段，就直接给出结论结束任务。"
+                f"【{step.tool_name} 执行失败｜归因 {level}】退出码 {exit_code}。输出如下：\n{content}\n"
+                f"禁止用同样参数再次调用 {step.tool_name}。{guidance}"
+            )
+        elif not meaningful:
+            # 退出码 0 但完全没有输出：多数情况说明「这个面不存在」，
+            # 明确告诉模型这本身算一种结论，别重复调用同一工具同一参数。
+            content = (
+                f"【{step.tool_name} 执行成功但无任何输出｜归因 L4】"
+                "这可能说明目标不存在该测试面。不要用同样参数重复调用，"
+                "换一个方向或换一种手法再验证。"
             )
         if len(content) > config.MAX_OUTPUT_CHARS:
             content = content[: config.MAX_OUTPUT_CHARS] + f"\n…（输出过长已截断，共 {len(step.output)} 字符）"

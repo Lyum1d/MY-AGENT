@@ -685,32 +685,64 @@ function threadName(n) {
   return n.title || (n.task || '').slice(0, 18) || '未命名对话';
 }
 
+/* 树的父子关系：只保留「父节点确实在本树里」的边，其余当根节点。
+   父线索被删掉、或线索被移到别的项目时，子线索的 parent_id 会指向树外；
+   若照搬会导致整棵子线索在建树时凭空消失，所以这里统一收敛为根。 */
+function treeEdges() {
+  const ids = new Set(state.tree.map(n => n.id));
+  const byParent = {};
+  state.tree.forEach(n => {
+    const pid = (n.parent_id && ids.has(n.parent_id)) ? n.parent_id : '';
+    (byParent[pid] = byParent[pid] || []).push(n);
+  });
+  return byParent;
+}
+
+/* 前序遍历：给每个节点算出深度和第几号，同列的节点按前序号排序后父子连线不会交叉 */
+function treeLayout() {
+  const byParent = treeEdges();
+  const depthOf = {}, orderOf = {};
+  const seen = new Set();
+  let seq = 0;
+  const walk = (pid, d) => (byParent[pid] || []).forEach(n => {
+    if (seen.has(n.id)) return;        // 数据成环时防死循环
+    seen.add(n.id);
+    depthOf[n.id] = d;
+    orderOf[n.id] = seq++;
+    walk(n.id, d + 1);
+  });
+  walk('', 0);
+  // 兜底：成环等原因没被走到的节点，按根节点补上，不让它有洞
+  state.tree.forEach(n => {
+    if (!seen.has(n.id)) {
+      seen.add(n.id);
+      depthOf[n.id] = 0;
+      orderOf[n.id] = seq++;
+    }
+  });
+  const maxDepth = Math.max(0, ...Object.values(depthOf));
+  const cols = Array.from({ length: maxDepth + 1 }, (_, d) =>
+    state.tree.filter(n => depthOf[n.id] === d).sort((a, b) => orderOf[a.id] - orderOf[b.id]));
+  return { cols, depthOf };
+}
+
 function renderTree() {
   const strip = $('treeStrip');
   if (!state.tree.length) {
     strip.innerHTML = '<div class="tree-empty">同一方向聊久了会遗忘细节——发现可疑点就「＋ 分支」拆出独立线索深挖</div>';
     return;
   }
-  const byParent = {};
-  state.tree.forEach(n => (byParent[n.parent_id || ''] = byParent[n.parent_id || ''] || []).push(n));
-  const depthOf = {};
-  const walk = (pid, d) => (byParent[pid] || []).forEach(n => {
-    depthOf[n.id] = d;
-    walk(n.id, d + 1);
-  });
-  walk('', 0);
-  const maxDepth = Math.max(0, ...Object.values(depthOf));
-
-  strip.innerHTML = Array.from({ length: maxDepth + 1 }, (_, d) => {
-    const nodes = state.tree.filter(n => depthOf[n.id] === d);
-    return `<div class="tree-col">
+  const { cols } = treeLayout();
+  strip.innerHTML = cols.map(nodes => `<div class="tree-col">
       ${nodes.map(n => {
         const isCur = n.id === state.sessionId;
         const st = THREAD_STATUS_LABEL[n.status] || n.status;
-        return `<div class="tnode st-${esc(n.status)} ${isCur ? 'cur' : ''}" onclick="openThread('${n.id}')" title="${esc(n.task || '')}">
+        const kids = state.tree.filter(x => x.parent_id === n.id).length;
+        return `<div class="tnode st-${esc(n.status)} ${isCur ? 'cur' : ''}" data-sid="${n.id}"
+          onclick="openThread('${n.id}')" title="${esc(n.task || '')}">
           <button class="tn-del" onclick="event.stopPropagation();deleteThread('${n.id}', this)" title="彻底删除该分支">×</button>
           <div class="tn-name">${esc(threadName(n))}</div>
-          <div class="tn-meta">${st} · ${n.step_count} 步</div>
+          <div class="tn-meta">${st} · ${n.step_count} 步${kids ? ` · ${kids} 子线索` : ''}</div>
           <div class="tn-acts">
             <button onclick="event.stopPropagation();openBranchModal('${n.id}')" title="在此线索下开新分支">＋</button>
             ${n.status !== 'done' ? `<button onclick="event.stopPropagation();setThreadStatus('${n.id}','done')" title="标记已完成">✓</button>` : ''}
@@ -719,9 +751,74 @@ function renderTree() {
           </div>
         </div>`;
       }).join('')}
-    </div>`;
-  }).join('');
+    </div>`).join('');
+  strip.insertAdjacentHTML('afterbegin', '<svg class="tree-lines" id="treeLines"></svg>');
+  drawTreeLines();
 }
+
+/* 父子连线：一条从父节点右沿出发、经竖直主干转到子节点左沿的肘形折线。
+   为什么要用 SVG 而不是纯 CSS：节点宽度随标题变化、每列节点数也不同，
+   纯 CSS 画不出「父节点到它每一个子节点」的准确走向；这里直接读渲染后的
+   实际位置现算，任何节点数、任何标题长度都能画准。
+   坐标统一换算到「内容坐标系」（= SVG 的坐标系）：
+   getBoundingClientRect 给的是视口坐标，减去容器自身再加上滚动量即可，
+   这样无论节点宽窄、容器怎么滚，线都贴在节点边缘。 */
+function drawTreeLines() {
+  const strip = $('treeStrip');
+  const svg = $('treeLines');
+  if (!strip || !svg) return;
+  const w = strip.scrollWidth, h = strip.scrollHeight;
+  // 线索树被隐藏（未选项目）时节点尺寸全是 0，此时按 0 算出来的路径是垃圾数据，直接跳过
+  if (!w || !h) { svg.innerHTML = ''; return; }
+  svg.setAttribute('width', w);
+  svg.setAttribute('height', h);
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+
+  // 高亮「当前线索」的祖先链，一眼看出自己在树的哪一支
+  const parentOf = {};
+  state.tree.forEach(n => { parentOf[n.id] = n.parent_id || ''; });
+  const chain = new Set();
+  for (let x = state.sessionId; x && !chain.has(x); x = parentOf[x]) chain.add(x);
+
+  const sr = strip.getBoundingClientRect();
+  const ox = strip.scrollLeft - sr.left;
+  const oy = strip.scrollTop - sr.top;
+
+  const paths = [];
+  state.tree.forEach(n => {
+    if (!n.parent_id) return;
+    const p = strip.querySelector(`.tnode[data-sid="${n.parent_id}"]`);
+    const c = strip.querySelector(`.tnode[data-sid="${n.id}"]`);
+    if (!p || !c) return;              // 父节点不在本树里（已被提升/跨项目），无连线
+    const pr = p.getBoundingClientRect();
+    const cr = c.getBoundingClientRect();
+    const x1 = pr.right + ox;
+    const y1 = pr.top + oy + pr.height / 2;
+    const x2 = cr.left + ox;
+    const y2 = cr.top + oy + cr.height / 2;
+    const mx = x2 - Math.max(6, (x2 - x1) / 2);          // 竖直主干落在两列之间
+    let d;
+    const r = Math.min(6, Math.abs(y2 - y1) / 2, Math.abs(mx - x1));
+    if (Math.abs(y2 - y1) < 1 || r < 1) {
+      d = `M ${x1} ${y1} H ${mx} V ${y2} H ${x2}`;
+    } else {
+      const dir = y2 > y1 ? 1 : -1;
+      const my1 = y1 + dir * r, my2 = y2 - dir * r;
+      d = `M ${x1} ${y1} H ${mx - r} Q ${mx} ${y1} ${mx} ${my1}`
+        + ` V ${my2} Q ${mx} ${y2} ${mx + r} ${y2} H ${x2}`;
+    }
+    const on = (chain.has(n.id) && chain.has(n.parent_id)) ? ' hl' : '';
+    paths.push(`<path class="tl${on}" d="${d}"/>`);
+  });
+  svg.innerHTML = paths.join('');
+}
+
+/* 窗口尺寸变化会改变节点宽度 → 连线跟着重算（防抖，避免拖拽窗口时狂重排） */
+let _treeLineTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(_treeLineTimer);
+  _treeLineTimer = setTimeout(drawTreeLines, 120);
+});
 
 /* 切换到某条线索：恢复持久化会话并回放历史 */
 async function openThread(sid) {

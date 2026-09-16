@@ -6,6 +6,7 @@ import asyncio
 import json
 from datetime import datetime
 from typing import AsyncIterator
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -21,6 +22,55 @@ from .registry import registry
 app = FastAPI(title="SRC 渗透 Agent", version="0.1.0")
 
 registry.load()
+
+
+# ---------- 本地访问防护 ----------
+# 本服务能调度命令行工具与任意 Python 代码（L3），所以即便只监听 127.0.0.1，
+# 也必须在应用层挡住「同一浏览器里的其他网页」发来的请求（CSRF）和 DNS 重绑定：
+#   1) Host 校验：仅本机绑定时，Host 必须是回环名。恶意站点把自有域名解析到
+#      127.0.0.1（DNS rebinding）后，浏览器发出的请求 Host 是攻击者域名，这里直接拒。
+#   2) 来源校验：带 Origin / Referer 的请求，其主机必须与 Host 一致，否则判定为跨站并拒绝。
+#      浏览器对跨站 POST（含表单）一定会带上 Origin，因此这条能拦住「打开恶意网页
+#      就往 localhost 发请求」的路径。
+# CLI 客户端（curl / 测试脚本）通常不带这两个头，因此不受影响。
+# 注意：这里没有引入访问令牌，非浏览器本地客户端仍无鉴权；如需更强，可在此基础上
+# 增加 X-Auth-Token 校验（前端统一在 fetch 时带上）。
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+def _host_only(netloc: str) -> str:
+    """取 netloc 的主机部分（去掉端口，保留 IPv6 方括号）。"""
+    s = (netloc or "").strip().lower()
+    if not s:
+        return ""
+    if s.startswith("["):
+        return s.split("]", 1)[0] + "]"
+    return s.split(":", 1)[0]
+
+
+def _loopback_bind() -> bool:
+    return (config.HOST or "").strip().lower() in _LOOPBACK_HOSTS
+
+
+@app.middleware("http")
+async def local_request_guard(request, call_next):
+    host = request.headers.get("host", "")
+    # 1) DNS 重绑定防护：仅本机绑定时才强制 Host 为回环名
+    if _loopback_bind() and _host_only(host) not in _LOOPBACK_HOSTS:
+        return JSONResponse(
+            {"detail": f"拒绝非本机 Host 的访问（Host: {host}）。本服务仅限本机使用。"},
+            status_code=403)
+    # 2) 跨站请求防护：来源主机必须与 Host 一致
+    source = request.headers.get("origin") or request.headers.get("referer") or ""
+    if source:
+        try:
+            src_host = _host_only(urlparse(source).netloc)
+        except Exception:
+            src_host = ""
+        if src_host != _host_only(host):
+            return JSONResponse(
+                {"detail": "拒绝跨站请求：请求来源与本站不一致。"}, status_code=403)
+    return await call_next(request)
 
 
 # ---------- 请求模型 ----------
@@ -565,6 +615,19 @@ async def project_tree(pid: str):
     return {"items": store.list_tree(pid)}
 
 
+@app.delete("/api/sessions/{sid}")
+async def delete_session(sid: str):
+    """彻底删除一条线索分支（含其下所有子分支）及关联数据。"""
+    if not store.get_session_row(sid):
+        raise HTTPException(404, "会话不存在")
+    result = store.delete_session_tree(sid)
+    # 同步清理内存中的运行态会话
+    for dsid in result.get("deleted_ids", []):
+        sessions.remove(dsid)
+    # 若当前活动线索被删，前端下次交互会重新选择；这里不做强制跳转
+    return {"ok": True, "deleted": result["count"], "ids": result["deleted_ids"]}
+
+
 @app.put("/api/sessions/{sid}/meta")
 async def update_session_meta(sid: str, req: SessionMetaRequest):
     """线索改名/改状态（active | done | abandoned）。"""
@@ -578,19 +641,6 @@ async def update_session_meta(sid: str, req: SessionMetaRequest):
     if s and req.title:
         s.title = row["title"]  # 运行态(state)与线索状态(status)是两回事，互不影响
     return {"ok": True, "session": row}
-
-
-@app.delete("/api/sessions/{sid}")
-async def delete_session(sid: str):
-    """彻底删除一条线索分支（含其下所有子分支）及关联数据。"""
-    if not store.get_session_row(sid):
-        raise HTTPException(404, "会话不存在")
-    result = store.delete_session_tree(sid)
-    # 同步清理内存中的运行态会话
-    for dsid in result.get("deleted_ids", []):
-        sessions.remove(dsid)
-    # 若当前活动线索被删，前端下次交互会重新选择；这里不做强制跳转
-    return {"ok": True, "deleted": result["count"], "ids": result["deleted_ids"]}
 
 
 @app.post("/api/sessions/{sid}/run")

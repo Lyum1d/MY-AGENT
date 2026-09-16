@@ -1,14 +1,31 @@
 # -*- coding: utf-8 -*-
-"""Agent 端到端测试：不依赖 Web 层，直接在终端跑一轮真实工具调用。"""
+"""Agent 端到端测试：不依赖 Web 层，直接在终端跑一轮真实工具调用。
+
+注意：这是**真跑**的脚本——会调用当前选中的模型（若 current 是云端供应商，
+会真实消耗你的额度）并真实执行工具。因此这里把数据库隔离到临时目录，
+避免污染真实项目 / 漏洞 / 用量数据（原先会写进 data/projects.db，
+包括把云端调用记录计入你的用量统计）。
+"""
 import asyncio
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from app import config, store                  # noqa: E402
 from app.agent import agent, sessions          # noqa: E402
 from app.registry import registry              # noqa: E402
 from app.llm import get_backend                # noqa: E402
+
+# ---- 隔离：数据库落临时目录，绝不动真实 data/projects.db ----
+_TMP = Path(tempfile.mkdtemp(prefix="src_agent_e2e_"))
+store.DB_PATH = _TMP / "test_agent.db"
+store.init_db()
+# 关闭「漏洞类任务自动路由云端」：本脚本要观察的是「当前供应商」的真实表现，
+# 自动路由会在中间把后端换掉，导致现象与预期不一致。
+config.AUTO_ROUTE_VULN = False
+print(f"[隔离] 测试数据库：{store.DB_PATH}")
 
 
 async def consume(session, stop_state="done"):

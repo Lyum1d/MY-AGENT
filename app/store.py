@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -96,14 +97,47 @@ CREATE INDEX IF NOT EXISTS idx_usage_project ON usage_log(project_id);
 """
 
 
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+def _connect() -> sqlite3.Connection:
+    """建立连接并设置并发相关 PRAGMA。
+
+    - WAL：Agent 后台每步都写 steps，与接口的读请求是并发的；默认 rollback journal
+      下写锁会阻塞读，容易出现 "database is locked"。
+    - busy_timeout：拿不到锁时等待而不是立刻抛错（连接串的 timeout 与 PRAGMA 双保险）。
+    - synchronous=NORMAL：WAL 下兼顾安全与写入吞吐。
+    journal_mode 是数据库的持久属性，重复设置无副作用。
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+    except sqlite3.Error:
+        pass
     return conn
 
 
+@contextmanager
+def _db():
+    """数据库连接上下文：正常提交、异常回滚，**并且一定关闭连接**。
+
+    注意：`with sqlite3.connect(...) as c:` 只提交/回滚事务，并不会关闭连接
+    （官方文档明确说明 context manager 不关闭连接）。此前正是用这种写法，
+    连接依赖 CPython 引用计数回收，写法上易被误解为「已关闭」。
+    """
+    conn = _connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def init_db() -> None:
-    with _conn() as c:
+    with _db() as c:
         c.executescript(SCHEMA)
         # 旧库升级：会话树新增列（分支对话树功能）。逐列检查，缺哪个补哪个。
         cols = {r["name"] for r in c.execute("PRAGMA table_info(sessions)").fetchall()}
@@ -124,7 +158,7 @@ def init_db() -> None:
 # ---------- 项目 ----------
 def create_project(name: str, target: str = "", note: str = "") -> dict:
     pid = uuid.uuid4().hex[:12]
-    with _conn() as c:
+    with _db() as c:
         c.execute(
             "INSERT INTO projects (id,name,target,note,created_at) VALUES (?,?,?,?,?)",
             (pid, name, target, note, time.time()),
@@ -133,7 +167,7 @@ def create_project(name: str, target: str = "", note: str = "") -> dict:
 
 
 def list_projects() -> list[dict]:
-    with _conn() as c:
+    with _db() as c:
         rows = c.execute(
             "SELECT p.*, (SELECT COUNT(*) FROM sessions s WHERE s.project_id=p.id) AS session_count,"
             " (SELECT COUNT(*) FROM findings f WHERE f.project_id=p.id) AS finding_count"
@@ -143,7 +177,7 @@ def list_projects() -> list[dict]:
 
 
 def get_project(pid: str) -> dict | None:
-    with _conn() as c:
+    with _db() as c:
         r = c.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
     return dict(r) if r else None
 
@@ -160,7 +194,7 @@ def update_project(pid: str, **fields) -> dict | None:
     if not patch:
         return get_project(pid)
     sets = ", ".join(f"{k}=?" for k in patch)
-    with _conn() as c:
+    with _db() as c:
         cur = c.execute(f"UPDATE projects SET {sets} WHERE id=?", (*patch.values(), pid))
         if cur.rowcount == 0:
             return None
@@ -168,15 +202,27 @@ def update_project(pid: str, **fields) -> dict | None:
 
 
 def delete_project(pid: str) -> bool:
-    with _conn() as c:
-        cur = c.execute("DELETE FROM projects WHERE id=?", (pid,))
-        if cur.rowcount == 0:
+    """删除项目及其全部派生数据。
+
+    补清理此前遗漏的两处：
+      · chat_messages —— 按 session_id 关联，删会话时不会跟着走，会留下孤儿消息；
+      · usage_log —— 保留调用记录本身（计费/统计口径不应因删项目而变），
+        只把 project_id 置空，去掉指向已删项目的悬空引用。
+    同时去掉原先对 projects 表的重复 DELETE（先用 SELECT 判存在）。
+    """
+    with _db() as c:
+        if not c.execute("SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone():
             return False
+        sids = [r["id"] for r in c.execute(
+            "SELECT id FROM sessions WHERE project_id=?", (pid,)).fetchall()]
+        c.execute("DELETE FROM steps WHERE session_id IN (SELECT id FROM sessions WHERE project_id=?)", (pid,))
+        for sid in sids:
+            c.execute("DELETE FROM chat_messages WHERE session_id=?", (sid,))
+        c.execute("DELETE FROM sessions WHERE project_id=?", (pid,))
         c.execute("DELETE FROM findings WHERE project_id=?", (pid,))
         c.execute("DELETE FROM facts WHERE project_id=?", (pid,))
         c.execute("DELETE FROM intel WHERE project_id=?", (pid,))
-        c.execute("DELETE FROM steps WHERE session_id IN (SELECT id FROM sessions WHERE project_id=?)", (pid,))
-        c.execute("DELETE FROM sessions WHERE project_id=?", (pid,))
+        c.execute("UPDATE usage_log SET project_id='' WHERE project_id=?", (pid,))
         c.execute("DELETE FROM projects WHERE id=?", (pid,))
     return True
 
@@ -188,7 +234,7 @@ def save_session(sid: str, project_id: str, task: str, target: str, state: str,
                  summary: str | None = None) -> None:
     """保存/更新会话。树相关列（parent_id/title/context/status/summary）只在显式
     传入时更新，避免普通落库把分支元数据冲掉。"""
-    with _conn() as c:
+    with _db() as c:
         row = c.execute("SELECT id FROM sessions WHERE id=?", (sid,)).fetchone()
         sets = ["project_id=?", "task=?", "target=?", "state=?"]
         vals: list = [project_id, task, target, state]
@@ -226,7 +272,7 @@ def create_branch(parent_sid: str, project_id: str, title: str,
     sid = uuid.uuid4().hex[:12]
     parent = get_session_row(parent_sid)
     pid = project_id or (parent.get("project_id") or "" if parent else "")
-    with _conn() as c:
+    with _db() as c:
         c.execute(
             "INSERT INTO sessions (id,project_id,task,target,state,created_at,"
             "parent_id,title,status,context,summary) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -240,14 +286,14 @@ def create_branch(parent_sid: str, project_id: str, title: str,
 
 def get_session_row(sid: str) -> dict | None:
     """取会话行（含树字段），不含步骤。"""
-    with _conn() as c:
+    with _db() as c:
         r = c.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
     return dict(r) if r else None
 
 
 def list_tree(project_id: str) -> list[dict]:
     """项目内全部会话（按创建时间正序，前端按 parent_id 组装成树）。"""
-    with _conn() as c:
+    with _db() as c:
         rows = c.execute(
             "SELECT id,parent_id,title,task,target,state,status,summary,created_at,"
             " (SELECT COUNT(*) FROM steps st WHERE st.session_id=sessions.id) AS step_count"
@@ -257,41 +303,12 @@ def list_tree(project_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-THREAD_STATUS = ("active", "done", "abandoned")
-
-
-def update_session_meta(sid: str, title: str | None = None,
-                        status: str | None = None) -> dict | None:
-    """更新线索标题/状态（白名单校验，status 只接受三种合法值）。"""
-    patch: dict[str, str] = {}
-    if title is not None and title.strip():
-        patch["title"] = title.strip()[:60]
-    if status is not None:
-        if status not in THREAD_STATUS:
-            raise ValueError(f"非法线索状态：{status}")
-        patch["status"] = status
-    if not patch:
-        return get_session_row(sid)
-    sets = ", ".join(f"{k}=?" for k in patch)
-    with _conn() as c:
-        cur = c.execute(f"UPDATE sessions SET {sets} WHERE id=?", (*patch.values(), sid))
-        if cur.rowcount == 0:
-            return None
-    return get_session_row(sid)
-
-
-def save_summary(sid: str, summary: str) -> None:
-    """保存会话结论摘要（成果回流：供其他线索的上下文注入与前端小地图展示）。"""
-    with _conn() as c:
-        c.execute("UPDATE sessions SET summary=? WHERE id=?", (summary[:1000], sid))
-
-
 def delete_session_tree(sid: str) -> dict:
     """彻底删除一条线索及其所有后代（子分支），并级联清理步骤、对话历史、用量记录。
 
     返回 {deleted_ids: [sid, ...], count: N}。
     """
-    with _conn() as c:
+    with _db() as c:
         # 1) 收集待删节点（含后代）
         to_delete: list[str] = []
         queue = [sid]
@@ -318,6 +335,35 @@ def delete_session_tree(sid: str) -> dict:
     return {"deleted_ids": to_delete, "count": len(to_delete)}
 
 
+THREAD_STATUS = ("active", "done", "abandoned")
+
+
+def update_session_meta(sid: str, title: str | None = None,
+                        status: str | None = None) -> dict | None:
+    """更新线索标题/状态（白名单校验，status 只接受三种合法值）。"""
+    patch: dict[str, str] = {}
+    if title is not None and title.strip():
+        patch["title"] = title.strip()[:60]
+    if status is not None:
+        if status not in THREAD_STATUS:
+            raise ValueError(f"非法线索状态：{status}")
+        patch["status"] = status
+    if not patch:
+        return get_session_row(sid)
+    sets = ", ".join(f"{k}=?" for k in patch)
+    with _db() as c:
+        cur = c.execute(f"UPDATE sessions SET {sets} WHERE id=?", (*patch.values(), sid))
+        if cur.rowcount == 0:
+            return None
+    return get_session_row(sid)
+
+
+def save_summary(sid: str, summary: str) -> None:
+    """保存会话结论摘要（成果回流：供其他线索的上下文注入与前端小地图展示）。"""
+    with _db() as c:
+        c.execute("UPDATE sessions SET summary=? WHERE id=?", (summary[:1000], sid))
+
+
 def search_history(project_id: str, keyword: str, limit: int = 8) -> list[dict]:
     """跨线索检索：在项目内所有会话的工具输出/参数/目标中搜关键词。
 
@@ -327,7 +373,7 @@ def search_history(project_id: str, keyword: str, limit: int = 8) -> list[dict]:
     if not kw or not project_id:
         return []
     like = f"%{kw}%"
-    with _conn() as c:
+    with _db() as c:
         rows = c.execute(
             "SELECT st.session_id, s.title, s.task, st.tool_name, st.tool_alias,"
             " st.target, st.args, st.output, st.status, st.created_at"
@@ -352,7 +398,7 @@ def search_history(project_id: str, keyword: str, limit: int = 8) -> list[dict]:
 
 
 def save_step(sid: str, step: dict) -> None:
-    with _conn() as c:
+    with _db() as c:
         c.execute(
             "INSERT OR REPLACE INTO steps"
             " (id,session_id,tool_alias,tool_name,target,args,risk_level,status,output,created_at)"
@@ -373,7 +419,7 @@ def save_step(sid: str, step: dict) -> None:
 
 
 def list_sessions(project_id: str | None = None) -> list[dict]:
-    with _conn() as c:
+    with _db() as c:
         if project_id:
             rows = c.execute(
                 "SELECT * FROM sessions WHERE project_id=? ORDER BY created_at DESC", (project_id,)
@@ -389,7 +435,7 @@ def get_session(sid: str) -> dict | None:
     用于「服务重启后」回看历史会话——内存里的 SessionManager 在重启后清空，
     但 SQLite 里仍存着，详情接口应能回退到这里。
     """
-    with _conn() as c:
+    with _db() as c:
         s = c.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
         if not s:
             return None
@@ -408,7 +454,7 @@ def save_chat_message(sid: str, role: str, content: str, kind: str = "") -> None
     text = (content or "").strip()
     if not text:
         return
-    with _conn() as c:
+    with _db() as c:
         c.execute(
             "INSERT INTO chat_messages (id,session_id,role,kind,content,created_at)"
             " VALUES (?,?,?,?,?,?)",
@@ -417,7 +463,7 @@ def save_chat_message(sid: str, role: str, content: str, kind: str = "") -> None
 
 
 def list_chat_messages(sid: str) -> list[dict]:
-    with _conn() as c:
+    with _db() as c:
         rows = c.execute(
             "SELECT role,kind,content,created_at FROM chat_messages"
             " WHERE session_id=? ORDER BY created_at ASC, rowid ASC",
@@ -430,7 +476,7 @@ def list_chat_messages(sid: str) -> list[dict]:
 def save_usage(provider_id: str, model: str, prompt_tokens: int, completion_tokens: int,
                session_id: str = "", project_id: str = "", duration_ms: int = 0) -> None:
     """记录一次 LLM 调用的 token 用量（仅成功且有 usage 数据的调用）。"""
-    with _conn() as c:
+    with _db() as c:
         c.execute(
             "INSERT INTO usage_log (id,ts,session_id,project_id,provider_id,model,"
             "prompt_tokens,completion_tokens,duration_ms) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -456,14 +502,14 @@ def list_usage(project_id: str = "", model: str = "", days: int = 0,
         vals.append(time.time() - days * 86400)
     q += " ORDER BY ts DESC LIMIT ?"
     vals.append(max(1, min(limit, 5000)))
-    with _conn() as c:
+    with _db() as c:
         rows = c.execute(q, vals).fetchall()
     return [dict(r) for r in rows]
 
 
 def clear_usage(days: int = 0) -> int:
     """清空用量记录；days>0 只删最近 N 天之外的……即保留最近 N 天，删除更早的。"""
-    with _conn() as c:
+    with _db() as c:
         if days > 0:
             cur = c.execute("DELETE FROM usage_log WHERE ts<?", (time.time() - days * 86400,))
         else:
@@ -475,7 +521,7 @@ def clear_usage(days: int = 0) -> int:
 def add_finding(project_id: str, title: str, severity: str, target: str,
                 detail: str = "", evidence: str = "") -> dict:
     fid = uuid.uuid4().hex[:12]
-    with _conn() as c:
+    with _db() as c:
         c.execute(
             "INSERT INTO findings (id,project_id,title,severity,target,detail,evidence,created_at)"
             " VALUES (?,?,?,?,?,?,?,?)",
@@ -485,7 +531,7 @@ def add_finding(project_id: str, title: str, severity: str, target: str,
 
 
 def list_findings(project_id: str) -> list[dict]:
-    with _conn() as c:
+    with _db() as c:
         rows = c.execute(
             "SELECT * FROM findings WHERE project_id=? ORDER BY created_at DESC", (project_id,)
         ).fetchall()
@@ -493,7 +539,7 @@ def list_findings(project_id: str) -> list[dict]:
 
 
 def delete_finding(fid: str) -> bool:
-    with _conn() as c:
+    with _db() as c:
         c.execute("DELETE FROM findings WHERE id=?", (fid,))
     return True
 
@@ -505,7 +551,7 @@ def add_fact(project_id: str, content: str, source: str = "manual") -> dict:
     if not content:
         return {}
     fid = uuid.uuid4().hex[:12]
-    with _conn() as c:
+    with _db() as c:
         c.execute(
             "INSERT INTO facts (id,project_id,content,source,created_at) VALUES (?,?,?,?,?)",
             (fid, project_id, content, source, time.time()),
@@ -515,7 +561,7 @@ def add_fact(project_id: str, content: str, source: str = "manual") -> dict:
 
 
 def list_facts(project_id: str) -> list[dict]:
-    with _conn() as c:
+    with _db() as c:
         rows = c.execute(
             "SELECT * FROM facts WHERE project_id=? ORDER BY created_at DESC", (project_id,)
         ).fetchall()
@@ -523,14 +569,14 @@ def list_facts(project_id: str) -> list[dict]:
 
 
 def delete_fact(fid: str) -> bool:
-    with _conn() as c:
+    with _db() as c:
         c.execute("DELETE FROM facts WHERE id=?", (fid,))
     return True
 
 
 # ---------- 项目情报库 ----------
 def get_intel(project_id: str) -> dict:
-    with _conn() as c:
+    with _db() as c:
         r = c.execute("SELECT data FROM intel WHERE project_id=?", (project_id,)).fetchone()
     if not r:
         return {}
@@ -549,7 +595,7 @@ def merge_intel(project_id: str, patch: dict) -> dict:
         cur = set(str(v) for v in data.get(k, []))
         cur.update(str(v) for v in vals if v)
         data[k] = sorted(cur)[:200]
-    with _conn() as c:
+    with _db() as c:
         c.execute(
             "INSERT OR REPLACE INTO intel (project_id,data,updated_at) VALUES (?,?,?)",
             (project_id, json.dumps(data, ensure_ascii=False), time.time()),
@@ -558,7 +604,7 @@ def merge_intel(project_id: str, patch: dict) -> dict:
 
 
 def delete_intel(project_id: str) -> bool:
-    with _conn() as c:
+    with _db() as c:
         c.execute("DELETE FROM intel WHERE project_id=?", (project_id,))
     return True
 

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from . import config
+from .scope import check_scope
 
 logger = None  # 延迟引入 logging，避免无谓开销
 
@@ -37,7 +38,7 @@ def _scope_check_target(target: str) -> str | None:
     但它的 target 仅用于留档归类，模型时常填企业名（如「腾讯」）以待后续资产扩展，
     这类值白名单里本就不存在，强制校验会误伤正常流程，故：
       · 含空格 / 含非 ASCII / 不含「.」 → 视为自由文本，跳过本校验；
-      · 其余（域名、URL、IP）→ 走与 executor 同一份 check_scope。
+      · 其余（域名、URL、IP）→ 走与 executor / replayer 同一份 scope.check_scope。
 
     局限：代码内部实际请求的主机无法静态解析，本校验只覆盖声明的 target；
     真正的边界仍是 L3 的用户确认 + 书面授权，二者缺一不可。
@@ -45,7 +46,6 @@ def _scope_check_target(target: str) -> str | None:
     t = (target or "").strip()
     if not t or " " in t or not t.isascii() or "." not in t:
         return None
-    from .executor import check_scope  # 延迟导入：executor 不依赖 pyexec，此处无循环
     return check_scope(t)
 
 

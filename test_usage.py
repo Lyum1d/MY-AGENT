@@ -135,7 +135,9 @@ def test_api(pid):
     print("== C. API ==")
     from fastapi.testclient import TestClient
     from app.main import app
-    client = TestClient(app)
+    # base_url 用回环地址：app.main 的本地访问防护会校验 Host，
+    # TestClient 默认的 testserver 会被判为「非本机 Host」而拒绝。
+    client = TestClient(app, base_url="http://127.0.0.1")
     r = client.get("/api/usage/summary")
     check("GET summary", r.status_code == 200 and r.json()["total"]["calls"] > 0)
     r = client.get("/api/usage/daily?days=7")

@@ -201,6 +201,42 @@ def _file_mtime() -> float:
         return 0.0
 
 
+def _usable(p: dict) -> bool:
+    """该供应商是否「现在就能用」：已启用 + 端点与模型齐全 + 本地或已填 Key。"""
+    return bool(
+        p.get("enabled")
+        and p.get("base_url")
+        and p.get("model")
+        and (p.get("local") or p.get("api_key"))
+    )
+
+
+def _pick_default(providers: list[dict]) -> str:
+    """挑选默认供应商：**云端优先，本地兜底**。
+
+    变更（用户 2026-09-15）：此前无论何种情况都回退到本地 ollama（"本地优先"），
+    现在改为保留本地接口可用、但默认优先云端：
+      1. `config.PREFERRED_PROVIDER`（默认 deepseek），前提是它已启用且配置完整；
+      2. 其它任何「已启用 + 配置完整 + 非本地」的供应商（按 providers 顺序）；
+      3. 本地 ollama —— 仅当没有任何可用云端时才兜底；
+      4. 最后再退到列表第一个，保证永远不返回空。
+    全新安装且未填任何 Key 时，第 2/3 步都落空于云端，最终仍会选到 ollama，不会变砖。
+    """
+    usable = [p for p in providers if _usable(p)]
+    pref = (config.PREFERRED_PROVIDER or "").strip()
+    if pref:
+        for p in usable:
+            if p["id"] == pref:
+                return p["id"]
+    for p in usable:
+        if not p.get("local"):
+            return p["id"]
+    for p in usable:
+        if p.get("local"):
+            return p["id"]
+    return providers[0]["id"] if providers else "ollama"
+
+
 def cfg() -> dict:
     """读取完整配置（带迁移与默认值兜底）。文件被外部改动时自动重载。"""
     global _cache, _cache_mtime
@@ -229,8 +265,10 @@ def cfg() -> dict:
     if _migrate_legacy(cfg_data):
         _write(cfg_data)
 
-    if not any(p["id"] == cfg_data["current"] and p["enabled"] for p in providers):
-        cfg_data["current"] = "ollama"
+    # 当前选择失效（被删/停用/Key 被清空）时：按「云端优先、本地兜底」重新挑，
+    # 而不是无脑回退到本地 ollama。
+    if not any(p["id"] == cfg_data["current"] and _usable(p) for p in providers):
+        cfg_data["current"] = _pick_default(providers)
     _cache = cfg_data
     _cache_mtime = _file_mtime()
     return _cache
@@ -301,8 +339,9 @@ def current() -> dict:
     p = get(current_id())
     if p and p["enabled"]:
         return p
-    p = get("ollama")
-    return p or cfg()["providers"][0]
+    # 回退同样走「云端优先」：不再无脑回退到本地 ollama
+    picked = get(_pick_default(cfg()["providers"]))
+    return picked or cfg()["providers"][0]
 
 
 # ---------- 增删改 ----------
@@ -376,7 +415,8 @@ def delete(pid: str) -> bool:
     if len(c["providers"]) == before:
         return False
     if c["current"] == pid:
-        c["current"] = "ollama"
+        # 删掉的正是当前选择：按「云端优先、本地兜底」重新挑一个
+        c["current"] = _pick_default(c["providers"])
     save(c)
     return True
 

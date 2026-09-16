@@ -83,19 +83,27 @@ def _bucket() -> dict[str, Any]:
 
 
 def _accumulate(bucket: dict[str, Any], row: dict) -> None:
+    """累加一条调用记录（token 与费用一起算）。
+
+    费用顺带在这里算，避免 summary() 对「分模型 / 分项目」各自再回扫一遍全部记录。
+    注意：cost 累计时**不四舍五入**，全部累加完再统一 round —— 逐步 round 会累积
+    舍入误差，结果与「整体求和后 round 一次」不一致（实测把 0.0061 算成了 0.006）。
+    """
     p, c = row["prompt_tokens"], row["completion_tokens"]
+    pin, pout, _ = _price_for(row["provider_id"], row["model"])
     bucket["calls"] += 1
     bucket["prompt"] += p
     bucket["completion"] += c
     bucket["tokens"] += p + c
+    bucket["cost"] += (p * pin + c * pout) / 1_000_000
 
 
-def _cost_of(rows: list[dict]) -> float:
-    total = 0.0
+def _pack(rows: list[dict]) -> dict[str, Any]:
+    b = _bucket()
     for r in rows:
-        pin, pout, _ = _price_for(r["provider_id"], r["model"])
-        total += (r["prompt_tokens"] * pin + r["completion_tokens"] * pout) / 1_000_000
-    return round(total, 4)
+        _accumulate(b, r)
+    b["cost"] = round(b["cost"], 4)
+    return b
 
 
 def summary() -> dict[str, Any]:
@@ -108,32 +116,18 @@ def summary() -> dict[str, Any]:
     today_rows = [r for r in rows if r["ts"] >= today_start]
     month_rows = [r for r in rows if r["ts"] >= month_start]
 
-    def pack(b: dict[str, Any], rs: list[dict]) -> dict[str, Any]:
-        for r in rs:
-            _accumulate(b, r)
-        b["cost"] = _cost_of(rs)
-        return b
-
     by_model: dict[str, dict] = {}
     by_project: dict[str, dict] = {}
     for r in rows:
-        mk = f"{r['provider_id']}:{r['model']}"
-        b = by_model.setdefault(mk, _bucket())
-        _accumulate(b, r)
-        pk = r["project_id"] or ""
-        pb = by_project.setdefault(pk, _bucket())
-        _accumulate(pb, r)
-    for name, b in by_model.items():
-        rs = [r for r in rows if f"{r['provider_id']}:{r['model']}" == name]
-        b["cost"] = _cost_of(rs)
-    for name, b in by_project.items():
-        rs = [r for r in rows if (r["project_id"] or "") == name]
-        b["cost"] = _cost_of(rs)
+        _accumulate(by_model.setdefault(f"{r['provider_id']}:{r['model']}", _bucket()), r)
+        _accumulate(by_project.setdefault(r["project_id"] or "", _bucket()), r)
+    for b in (*by_model.values(), *by_project.values()):
+        b["cost"] = round(b["cost"], 4)
 
     return {
-        "today": pack(_bucket(), today_rows),
-        "month": pack(_bucket(), month_rows),
-        "total": pack(_bucket(), rows),
+        "today": _pack(today_rows),
+        "month": _pack(month_rows),
+        "total": _pack(rows),
         "by_model": by_model,
         "by_project": by_project,
         "generated_at": now,

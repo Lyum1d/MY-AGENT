@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -32,16 +34,30 @@ class LLMBackend(ABC):
 
 
 # ---------- URL 归一化 ----------
-def _ensure_v1(url: str) -> str:
-    """OpenAI 兼容端点统一补 /v1。
+# 路径里已出现的版本段（/v1、/v4、/v2、/api/v3、/v1beta ...）
+_VERSION_SEG_RE = re.compile(r"(?:^|/)v\d+[a-z0-9.\-]*(?:/|$)", re.I)
 
-    用户常粘贴 https://api.deepseek.com 或 http://localhost:11434，
-    而各厂商的聊天路径都要求以 /v1 结尾（LM Studio / OpenRouter 等自带 /v1 的不动）。
+
+def _ensure_v1(url: str) -> str:
+    """OpenAI 兼容端点补 /v1 —— 只对「路径里还没有版本段」的端点补。
+
+    用户常粘贴 https://api.deepseek.com 或 http://localhost:11434，需要补 /v1；
+    但不少厂商的 Base URL 自带版本段、而且**不是 v1**：
+
+        zhipu       https://open.bigmodel.cn/api/paas/v4
+        baidu       https://qianfan.baidubce.com/v2
+        volcengine  https://ark.cn-beijing.volces.com/api/v3
+        gemini      https://generativelanguage.googleapis.com/v1beta/openai
+
+    旧实现只判断 endswith("/v1")，会把上面这些拼成 .../v4/v1/chat/completions
+    这类不存在的路径（404）。改为「路径已含版本段就不再追加」。
     """
     u = (url or "").strip().rstrip("/")
     if not u:
         return u
-    return u if u.endswith("/v1") else u + "/v1"
+    if _VERSION_SEG_RE.search(urlparse(u).path or ""):
+        return u
+    return u + "/v1"
 
 
 def _strip_v1(url: str) -> str:

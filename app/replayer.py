@@ -20,7 +20,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import httpx
 
-from . import config
+from . import config, scope
 
 _UA = "SRC-Agent-Replay/1.0 (authorized bug-bounty test)"
 _ALLOWED_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -29,34 +29,10 @@ _RATE_LOCK = asyncio.Lock()
 
 
 # ---------- 域名白名单 ----------
-def _load_scope() -> list[str]:
-    """读取授权域名白名单。文件不存在时以 example.com 为默认并自动创建。"""
-    p = config.SCOPE_FILE
-    if not p.exists():
-        try:
-            p.write_text(json.dumps({
-                "_说明": "HTTP 重放器只允许请求这些域名及其子域。新增授权目标时编辑此文件。",
-                "domains": ["example.com"],
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-        return ["example.com"]
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        return [d for d in data.get("domains", []) if isinstance(d, str) and d.strip()]
-    except Exception:
-        return []
-
-
-def _host_allowed(host: str, scope: list[str]) -> bool:
-    host = host.lower()
-    for d in scope:
-        d = d.lower().strip()
-        if not d:
-            continue
-        if host == d or host.endswith("." + d):
-            return True
-    return False
+# 实现统一在 app/scope.py，与命令行执行器（app/executor.py）共用同一份判断。
+# 行为变化：此前本模块在 scope.json 缺失时会静默写入 example.com 兜底并据此放行，
+# 现在改为 fail-closed——缺配置即视为「没有授权目标」，直接拒绝，
+# 避免使用者误以为「已经配好授权」。
 
 
 # ---------- 限速 ----------
@@ -128,13 +104,10 @@ async def run_replay(url: str, args: str = ""):
         return
 
     parsed = urlparse(url)
-    host = parsed.hostname or ""
-    scope = _load_scope()
-    if not _host_allowed(host, scope):
+    denied = scope.check_scope(url)
+    if denied:
         yield {"type": "error",
-               "data": f"域名 {host} 不在授权白名单内（data/scope.json）。"
-                       f"当前白名单：{', '.join(scope) or '(空)'}。"
-                       f"仅允许测试已获书面授权的目标。"}
+               "data": denied + " 重放器仅允许请求已获书面授权且在 data/scope.json 内的目标。"}
         yield {"type": "exit", "code": 1}
         return
 

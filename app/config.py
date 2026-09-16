@@ -51,7 +51,15 @@ DEEPSEEK_KEY_FILE = USER_HOME / ".deepseek_api_key"      # 一行 Key（旧版�
 LLM_ANTHROPIC_FILE = USER_HOME / ".llm_anthropic.json"   # {"base_url","api_key","model"}（旧版，同上）
 LLM_PROVIDERS_FILE = USER_HOME / ".src_agent_llm.json"   # 通用供应商配置（现行）
 
-DEFAULT_BACKEND = "ollama"  # 供应商 id；可选 ollama / deepseek / anthropic / 任意自定义 id
+# ---------- 默认供应商（云端优先）----------
+# 变更（用户 2026-09-15）：此前一律回退到本地 ollama（"本地优先"），
+# 现在改为「保留本地模型接口可用，但默认优先云端」。解析顺序见 providers._pick_default：
+#   1. 本项指定的供应商（若已启用且配置完整）
+#   2. 其它任何「已启用 + 配置完整 + 非本地」的供应商
+#   3. 本地 ollama（仅在前两者都不可用时兜底）
+# 留空则跳过第 1 步，完全按 2 → 3 自动挑选。
+PREFERRED_PROVIDER = os.getenv("AGENT_PREFERRED_PROVIDER", "deepseek")
+DEFAULT_BACKEND = PREFERRED_PROVIDER  # 兼容旧名（旧语义即"默认后端"）
 
 # ---------- 风险分级 ----------
 # L0 只读/本地分析 -> 自动执行
@@ -75,6 +83,39 @@ TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "600"))  # 单工具总时长上限
 TOOL_IDLE_TIMEOUT = int(os.getenv("TOOL_IDLE_TIMEOUT", "120"))  # 无输出多久判定卡死（秒）
 MAX_OUTPUT_LINES = int(os.getenv("MAX_OUTPUT_LINES", "2000"))  # 单工具最多回传多少行
 MAX_OUTPUT_CHARS = 8000  # 回喂给模型的最大字符数，超出截断防止撑爆上下文
+# L2/L3 等用户确认的等待上限（秒），超时按「拒绝」处理
+CONFIRM_TIMEOUT = int(os.getenv("AGENT_CONFIRM_TIMEOUT", "600"))
+# 单次决策回传给模型的工具 schema 上限（工具过多会拖慢本地小模型）
+MAX_TOOL_SCHEMAS = int(os.getenv("AGENT_MAX_TOOL_SCHEMAS", "40"))
+# 项目情报库每类条目上限（注入上下文前会截断）
+INTEL_CAP = int(os.getenv("INTEL_CAP", "150"))
+
+# ---- 上下文压缩（机械式，不调用模型）----
+# 借鉴 LuaN1ao 的「摘要压缩」思路，但刻意改用确定性裁剪：本地小模型写摘要本身会产生
+# 幻觉，等于用一个不可靠环节去修另一个不可靠环节。只压 role=tool 消息的正文，绝不删消息。
+HISTORY_COMPRESS_AFTER_MESSAGES = int(os.getenv("HISTORY_COMPRESS_AFTER_MESSAGES", "24"))
+HISTORY_KEEP_RECENT = int(os.getenv("HISTORY_KEEP_RECENT", "12"))   # 最近 N 条保持原文
+HISTORY_SUMMARY_CHARS = int(os.getenv("HISTORY_SUMMARY_CHARS", "300"))  # 压缩后每条保留多少字
+
+# ---- 失败止损分两档（借鉴 LuaN1ao EXECUTOR_FAILURE_THRESHOLD 的语义）----
+# 连续失败到 SWITCH 档 → 要求模型「换策略」，而不是直接停；到 STOP 档才停止。
+FAILURE_SWITCH_THRESHOLD = int(os.getenv("AGENT_FAILURE_SWITCH", "3"))
+FAILURE_STOP_THRESHOLD = int(os.getenv("AGENT_FAILURE_STOP", "6"))
+
+# ---- 单次任务 token 预算（成本熔断）----
+# 本地 Ollama 不返回 usage，因此不会触发；云端供应商超限即停止，避免无声烧钱。
+RUN_TOKEN_BUDGET = int(os.getenv("AGENT_RUN_TOKEN_BUDGET", "800000"))
+
+# ---- 任务分片并行（split_task：拆小份 → 并发跑 → 合并）----
+# 子任务并发上限。**不要调太高**：并行意味着对目标同时发起更多请求，
+# 平台规则禁止影响业务可用性的高并发；同时也会推高云端 token 消耗。
+SUBTASK_MAX_CONCURRENCY = int(os.getenv("SUBTASK_MAX_CONCURRENCY", "3"))
+# 单个子任务的步数预算（比主任务小，避免一个子任务吃光预算）
+SUBTASK_MAX_STEPS = int(os.getenv("SUBTASK_MAX_STEPS", "8"))
+# 单次最多拆几个子任务
+SUBTASK_MAX_COUNT = int(os.getenv("SUBTASK_MAX_COUNT", "4"))
+# 合并回主线索时，最多带上多少条子任务期间新增的已证事实
+SUBTASK_MERGE_FACTS = int(os.getenv("SUBTASK_MERGE_FACTS", "20"))
 
 # ---------- 服务 ----------
 HOST = os.getenv("HOST", "127.0.0.1")

@@ -5,6 +5,7 @@
   --panel-3: #212734;
   --border: #262c38;
   --border-soft: #1f2530;
+  --tree-line: #3d4658;
   --text: #e6e9ef;
   --muted: #8b93a3;
   --accent: #6d7cff;
@@ -35,6 +36,7 @@
   --panel-3: #eef1f6;
   --border: #e3e7ef;
   --border-soft: #eef1f6;
+  --tree-line: #c6cedd;
   --text: #1b2433;
   --muted: #64748b;
   --accent: #4f6ef7;
@@ -386,17 +388,25 @@ button.icon-btn { font-size: 16px; padding: 6px 10px; line-height: 1; }
   border: 1px solid var(--border); border-radius: 6px; margin-top: 2px;
 }
 .tree-strip {
-  flex: 1; display: flex; gap: 14px; overflow-x: auto; padding: 2px 0; min-height: 46px;
-  align-items: flex-start;
+  /* position: relative 是 SVG 连线的定位基准（节点 offsetLeft/offsetTop 相对它计算）；
+     纵向也给个上限，线索多的时候不让树冠把聊天区挤没 */
+  position: relative;
+  flex: 1; display: flex; gap: 26px; overflow: auto; padding: 2px 0;
+  min-height: 46px; max-height: 240px; align-items: flex-start;
 }
 .tree-empty { font-size: 12px; color: var(--placeholder); padding: 10px 2px; }
 .tree-col {
   display: flex; flex-direction: column; gap: 6px; flex-shrink: 0;
-  border-left: 1px dashed var(--border); padding-left: 10px; min-width: 150px;
+  min-width: 150px; position: relative; z-index: 1;
 }
-.tree-col:first-child { border-left: none; padding-left: 0; }
+/* 父子连线层：铺满整个可滚动内容区，随内容一起滚动；不拦截鼠标 */
+.tree-lines {
+  position: absolute; left: 0; top: 0; z-index: 0; pointer-events: none; overflow: visible;
+}
+.tree-lines path.tl { fill: none; stroke: var(--tree-line); stroke-width: 1.5; }
+.tree-lines path.tl.hl { stroke: var(--accent); stroke-width: 2; }
 .tnode {
-  position: relative; border: 1px solid var(--border); border-radius: 9px;
+  position: relative; z-index: 1; border: 1px solid var(--border); border-radius: 9px;
   background: var(--panel-2); padding: 6px 9px; cursor: pointer;
   transition: border-color .15s, background .15s; min-width: 140px; max-width: 190px;
 }
@@ -408,6 +418,7 @@ button.icon-btn { font-size: 16px; padding: 6px 10px; line-height: 1; }
 .tnode.st-abandoned .tn-name::after { content: ' −'; color: var(--muted); }
 .tn-name { font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 16px; }
 .tn-meta { font-size: 11px; color: var(--muted); margin-top: 1px; }
+/* 彻底删除：卡片右上角 ×，悬停才显形（避免误点） */
 .tn-del {
   position: absolute; top: 3px; right: 4px;
   padding: 0 4px; font-size: 13px; line-height: 1;
@@ -416,11 +427,22 @@ button.icon-btn { font-size: 16px; padding: 6px 10px; line-height: 1; }
 }
 .tnode:hover .tn-del { opacity: 1; }
 .tn-del:hover { color: var(--danger); }
-.tn-acts { display: none; gap: 4px; margin-top: 5px; }
-.tnode:hover .tn-acts { display: flex; }
-.tn-acts button {
-  padding: 1px 7px; font-size: 11px; border-radius: 5px; line-height: 1.4;
+/* 操作按钮悬停时就地替换「状态 · N 步」那一行。
+   两个约束决定了这个写法：
+     1) 不能撑高节点——连线按节点位置算好后是固定的，节点一长高连线就脱开。
+        用 visibility:hidden 隐藏原文字（仍占位）+ 绝对定位浮层 → 尺寸恒定；
+     2) 不能压在标题上——标题是识别线索的主要信息，于是让它替换次要的元信息行。 */
+.tn-acts {
+  display: none; position: absolute; left: 9px; bottom: 5px; z-index: 2;
+  gap: 3px; align-items: center;
 }
+.tnode:hover .tn-acts { display: flex; }
+.tnode:hover .tn-meta { visibility: hidden; }
+.tn-acts button {
+  padding: 0 6px; font-size: 11px; border-radius: 5px; line-height: 1.6;
+  background: transparent; border-color: transparent; color: var(--muted);
+}
+.tn-acts button:hover { background: var(--panel-3); border-color: var(--border); color: var(--text); }
 .tree-acts { display: flex; flex-direction: column; gap: 5px; flex-shrink: 0; }
 .tree-acts button { white-space: nowrap; }
 

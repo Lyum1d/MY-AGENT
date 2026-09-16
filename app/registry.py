@@ -315,6 +315,20 @@ class ToolRegistry:
                 "exists": True,
             },
             {
+                "name": "任务分片并行",
+                "alias": "split_task",
+                "description": "把一个较大的任务拆成 2~4 个互相独立的小份，**并发执行**，全部跑完再把结果汇总回当前线索。"
+                               "适合目标面宽、子任务互不依赖的场景（如：同时做子域收集 / 指纹识别 / 目录探测）。"
+                               "子任务内只允许自动执行的 L0/L1 只读与探测类工具；需要人工确认的 L2/L3 会被直接拒绝"
+                               "（并行时无法逐个弹确认）——这类操作请留在主线索里单独做。",
+                "risk_level": "L0",
+                "risk_reason": "纯本地编排：只创建子会话并调度，本身不向目标发起任何请求",
+                "caveat": "args 每行填一个子任务描述（2~4 行，每行具体到目标与动作，例如「对 example.com 收集子域」）；"
+                          "拆之前先确认子任务之间没有依赖关系。并发上限、子任务步数上限见 config.py 的 SUBTASK_* 配置。",
+                "executable": "builtin://split_task",
+                "exists": True,
+            },
+            {
                 "name": "知识库检索",
                 "alias": "kb_search",
                 "description": "在 SRC 漏洞挖掘知识库（按漏洞类型的测试指南：越权/注入/SSRF/XSS/上传/"
@@ -484,13 +498,16 @@ class ToolRegistry:
         }
 
     # ---------- function calling schema ----------
-    def build_schemas(self, max_tools: int = 40) -> list[dict[str, Any]]:
+    def build_schemas(self, max_tools: int | None = None) -> list[dict[str, Any]]:
         """为可编排工具生成 function calling schema。
 
-        max_tools 限制数量：工具太多会拖慢本地小模型的决策速度。
+        max_tools 限制数量：工具太多会拖慢本地小模型的决策速度；默认取
+        config.MAX_TOOL_SCHEMAS（可用环境变量 AGENT_MAX_TOOL_SCHEMAS 调整）。
         按风险从低到高排序，优先保留低危工具。
         内置工具（重放器等核心能力）始终保留，不参与配额竞争。
         """
+        if max_tools is None:
+            max_tools = config.MAX_TOOL_SCHEMAS
         order = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
         tools = sorted(self.usable_scriptable(), key=lambda t: order.get(t.risk_level, 2))
         builtins = [t for t in tools if t.type == "内置"]

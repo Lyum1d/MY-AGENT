@@ -22,16 +22,49 @@ from . import config
 FOFA_API = "https://fofa.info/api/v1/search/all"
 
 
+def _parse_flat_yaml(text: str) -> dict:
+    """无 pyyaml 时的极简解析：只支持本项目 config.yaml 用到的扁平 key: value。
+
+    背景：config.yaml 此前只在装了 pyyaml 时才能读，而 requirements.txt 没声明该依赖，
+    导致 FOFA 永远提示「未配置」。这里补一个内置兜底，装不装 pyyaml 功能都可用。
+    不追求通用 YAML 语义（嵌套/列表/多行），够用即可；有 pyyaml 时优先走 pyyaml。
+    """
+    out: dict[str, object] = {}
+    for line in (text or "").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or ":" not in line or line.startswith("-"):
+            continue
+        key, val = line.split(":", 1)
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if not key:
+            continue
+        out[key] = int(val) if val.isdigit() else val
+    return out
+
+
 def _load_fofa_conf() -> dict[str, str]:
     """从 config.yaml 读 fofaEmail/fofaKey（个人配置不入库）。"""
     out = {"email": "", "key": "", "size": 100}
     cfg_path = config.APP_DIR / "config.yaml"
-    if not (yaml and cfg_path.exists()):
+    if not cfg_path.exists():
         return out
     try:
-        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        text = cfg_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return out
+
+    data: object = {}
+    if yaml is not None:
+        try:
+            data = yaml.safe_load(text) or {}
+        except Exception:
+            data = _parse_flat_yaml(text)
+    else:
+        # 未安装 pyyaml：走内置兜底解析（config.yaml 已加入 requirements，正常应有）
+        data = _parse_flat_yaml(text)
+    if not isinstance(data, dict):
+        return out
+
     out["email"] = str(data.get("fofaEmail") or "").strip()
     out["key"] = str(data.get("fofaKey") or "").strip()
     try:
@@ -39,6 +72,7 @@ def _load_fofa_conf() -> dict[str, str]:
     except Exception:
         out["size"] = 100
     return out
+
 
 
 def is_configured() -> bool:

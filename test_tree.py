@@ -22,6 +22,10 @@ from app.registry import registry                         # noqa: E402
 _TMP = Path(tempfile.mkdtemp(prefix="src_agent_tree_test_"))
 store.DB_PATH = _TMP / "test_tree.db"
 config.LLM_PROVIDERS_FILE = _TMP / "providers_test.json"
+# 关闭「漏洞类任务自动路由云端」：本机若存在 ~/.deepseek_api_key，它会被迁移进
+# 供应商配置、使 deepseek 变为可用；此时任务文案含「验证 / 注入」就会触发自动路由，
+# 把下面注入的 FakeBackend 换成真实云端模型，断言随之随机失败。测试必须与机器环境无关。
+config.AUTO_ROUTE_VULN = False
 providers.invalidate()
 store.init_db()
 registry.load()
@@ -147,7 +151,7 @@ def test_store_layer():
           res["deleted_ids"])
     check("删除后根会话不存在", store.get_session_row("del_root") is None)
     check("删除后孙会话不存在", store.get_session_row("del_grand") is None)
-    with store._conn() as _c:
+    with store._db() as _c:
         left_steps = _c.execute("SELECT COUNT(*) FROM steps WHERE session_id='del_child'").fetchone()[0]
         left_chat = _c.execute("SELECT COUNT(*) FROM chat_messages WHERE session_id='del_child'").fetchone()[0]
     check("级联清理步骤", left_steps == 0, left_steps)
@@ -159,7 +163,9 @@ def test_adopt_and_api(pid):
     print("== B. 会话恢复与 API ==")
     from fastapi.testclient import TestClient
     from app.main import app
-    client = TestClient(app)
+    # base_url 用回环地址：app.main 的本地访问防护会校验 Host，
+    # TestClient 默认的 testserver 会被判为「非本机 Host」而拒绝。
+    client = TestClient(app, base_url="http://127.0.0.1")
 
     # adopt：把 store 里的会话恢复进内存
     r = client.post("/api/sessions", json={"sid": "root1"})

@@ -8,6 +8,8 @@ env/
 
 # 运行时数据库
 *.db
+*.db-wal
+*.db-shm
 *.sqlite3
 *.sqlite
 

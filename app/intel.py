@@ -11,10 +11,10 @@ import json
 import re
 from urllib.parse import urlparse
 
-from . import store
+from . import config, store
 
-# 每类情报上限，防止撑爆上下文
-_CAP = 150
+# 每类情报上限，防止撑爆上下文（默认 150，可用环境变量 INTEL_CAP 调整）
+_CAP = config.INTEL_CAP
 _URL_RE = re.compile(r"https?://[^\s\"'<>（）()【】\[\]{}|\\]+")
 _API_PATH_RE = re.compile(r"[\"'](/(?:api|v[0-9]|admin|actuator)[^\"'\s\\]{1,90})[\"']")
 _IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
