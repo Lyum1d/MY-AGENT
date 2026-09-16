@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime
 from typing import AsyncIterator
 from urllib.parse import urlparse
@@ -21,6 +22,8 @@ from .llm import current_backend_name, get_backend, set_backend
 from .registry import registry
 
 app = FastAPI(title="SRC 渗透 Agent", version="0.1.0")
+
+logger = logging.getLogger(__name__)
 
 registry.load()
 
@@ -772,6 +775,18 @@ async def _run_agent(session, message: str, project_id: str):
         await session.emit({"type": "error", "data": f"Agent 异常：{e}"})
         await session.emit({"type": "done", "state": "error"})
     finally:
+        # 记忆沉淀必须放 finally：原先「情报库」与「结论摘要」只在 run() 的正常收尾路径写，
+        # 模型调用一旦报错（402 / 限流 / 超时）就整轮跳过 —— 实测有一轮 3 步全部成功、
+        # 产出 57 条存活子域，情报库仍然是 0 行，而且没有任何提示。
+        # 而同期写入的「已证事实 + 因果图」走的是执行中同步落库，反而留住了，
+        # 于是同一次中断里一半记忆活着、一半没了。
+        # merge_intel 按类去重，重复调用是安全的（run() 正常收尾时已经调过一次）。
+        try:
+            agent._persist_intel(session)
+            if session.state == "error":
+                agent.persist_interrupted(session, reason="模型调用失败或任务异常结束")
+        except Exception:
+            logger.exception("记忆沉淀失败（不影响步骤落库）")
         store.save_session(session.id, project_id, message, session.target, session.state)
         for st in session.steps:
             store.save_step(session.id, agent._step_dict(st))

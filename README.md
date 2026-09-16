@@ -184,6 +184,39 @@ ModuleNotFoundError: No module named 'uvicorn'」这类打不开的情况不会�
 > 调高并发前请先想清楚：并行 = 对目标同时发起更多请求。平台规则禁止影响业务可用性的高并发，
 > 云端供应商那边也会推高 token 消耗（有 `RUN_TOKEN_BUDGET` 兜底，但那是总量闸门、不是速率闸门）。
 
+### 记忆机制与「约束的强制边界」
+
+**六层记忆**（写入时机不同，异常时的存活情况也不同）：
+
+| 层 | 载体 | 写入时机 |
+|---|---|---|
+| 工作记忆 | `Session.messages`（内存） | ReAct 每步；超阈值由 `_compress_history` 确定性压缩（不调 LLM，只改内容、不删消息以保 `tool_calls` 配对） |
+| 对话原文 | 表 `chat_messages` | 用户消息 / 模型说明 / 最终结论；**切回线索续聊时会被还原成 messages 交给模型**（此前只用于前端回放，导致「继续聊 = 失忆」） |
+| 已证事实 | 表 `facts` + 因果图 `causal_nodes/edges` | `note_fact` 调用时（执行中即时落库） |
+| 项目情报库 | 表 `intel`（每项目一行 JSON） | `_persist_intel()`：run() 正常收尾 **以及 `_run_agent` 的 finally**（异常中断同样沉淀） |
+| 跨线索 | `records` / `summary` / 线索树 | 开分支打包时 / 给出结论时 |
+| 知识记忆 | `data/kb` 49 篇 + `data/rules` 12 篇 | 静态文件，按需 `kb_search` / `kb_read` |
+
+**检索面**：内置 `search_history` 覆盖 **工具执行输出 + 已证事实 + 项目情报库** 三类，
+结果按 `step / fact / intel` 标注来源。步骤输出落库时保留**首尾**（`STEP_OUTPUT_HEAD` /
+`STEP_OUTPUT_TAIL`），不再只留尾部。
+
+**⚠ 约束的强制边界（重要，别混为一谈）**
+
+| 类别 | 例子 | 强制？ | 拦在哪 |
+|---|---|---|---|
+| **执行层闸门** | 授权白名单、L2/L3 二次确认 | ✅ 强制 | `app/scope.py`（fail-closed）、`run()` 的风险闸门 |
+| **提示词约定** | SYSTEM_PROMPT 里的合规红线（禁爆破 / 禁拖库 / 禁横向移动）、「进站先 `kb_read` 打穿短表」 | ❌ **只是建议** | 无强制层，模型可以不听 |
+
+写在系统提示词里的合规红线属于**第二类**：它是给模型的强约束说明，但
+**没有任何代码在执行前校验它**。实测例子：`oneforall` 分级为 L0（自动放行），
+而它内部会跑 massdns + 9 万条字典的子域爆破 —— 提示词里的「禁止暴力爆破」没有拦住它，
+也拦不住（分级只到"工具名"粒度，不看"动作"）。
+
+需要**必须有强制性**的约束，请放在执行层，而不是提示词里：
+`data/scope.json`（目标粒度）、`data/risk_grades.json`（工具粒度）、
+`data/tool_overrides.json` 的 `disabled`（不进模型工具清单）。
+
 ## 工具能力边界
 
 工具箱 199 个工具 + 10 个内置能力；其中 **54 个可编排**（有 stdout，能进自动化流水线，
@@ -382,6 +415,12 @@ src-agent/
 | `HISTORY_COMPRESS_AFTER_MESSAGES` | 消息数超过多少触发上下文压缩 | 24 | `HISTORY_COMPRESS_AFTER_MESSAGES` |
 | `HISTORY_KEEP_RECENT` | 压缩时保留最近多少条原文 | 12 | `HISTORY_KEEP_RECENT` |
 | `HISTORY_SUMMARY_CHARS` | 压缩后每条保留多少字 | 300 | `HISTORY_SUMMARY_CHARS` |
+| `RESTORE_CHAT_MAX` | 续聊时最多还原多少条历史对话 | 24 | `AGENT_RESTORE_CHAT_MAX` |
+| `RESTORE_CHAT_CHARS` | 续聊还原时单条截断字符 | 1200 | `AGENT_RESTORE_CHAT_CHARS` |
+| `STEP_OUTPUT_HEAD` / `_TAIL` | 步骤输出落库保留的首/尾字符数 | 1500 / 2000 | `AGENT_STEP_OUTPUT_HEAD` / `_TAIL` |
+| `FACT_INJECT_MAX` | 系统提示最多注入多少条已证事实 | 20 | `AGENT_FACT_INJECT_MAX` |
+| `RECORD_INJECT_MAX` | 最多注入多少条开局打包记录 | 20 | `AGENT_RECORD_INJECT_MAX` |
+| `BRANCH_INJECT_MAX` | 最多注入多少条其他线索摘要 | 8 | `AGENT_BRANCH_INJECT_MAX` |
 | `ENFORCE_SCOPE` | 执行前强制授权白名单 | 开 | `ENFORCE_SCOPE` |
 | `PORT` / `HOST` | 监听端口 / 地址 | 8770 / 127.0.0.1 | `PORT` / `HOST` |
 

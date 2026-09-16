@@ -4,7 +4,7 @@ const path = require('path');
 const vm = require('vm');
 
 const SRC = fs.readFileSync(
-  path.join(__dirname, 'web', 'graph.js')  // 审计 P1-2, 'utf8');
+  path.join(__dirname, 'web', 'graph.js'), 'utf8');  // 审计 P1-2：相对脚本定位，不写死他人机器路径
 
 /* ---------- 伪 DOM（含事件记录） ---------- */
 class FakeNode {

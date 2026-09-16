@@ -51,6 +51,7 @@ PY_TESTS = [
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),
     ("对话树", "test_tree.py", False),
+    ("记忆机制（续聊恢复/异常沉淀/溯源）", "test_memory.py", False),
     ("Token 用量统计", "test_usage.py", False),
     ("知识库与 FOFA", "test_kb_fofa.py", False),
     ("供应商模块（Python 层）", "test_multi_llm.py", False),
