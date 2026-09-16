@@ -432,14 +432,23 @@ def save_summary(sid: str, summary: str) -> None:
 
 
 def search_history(project_id: str, keyword: str, limit: int = 8) -> list[dict]:
-    """跨线索检索：在项目内所有会话的工具输出/参数/目标中搜关键词。
+    """跨线索检索：在项目内的**工具执行 + 已证事实 + 项目情报**里搜关键词。
 
     供内置工具 search_history 使用，实现「新对话调取历史对话内容」。
+
+    覆盖面（此前只搜 steps 一张表，比工具描述承诺的范围小得多，模型搜不到就会
+    「以为没查过」而重新查一遍）：
+      · steps —— 工具输出 / 参数 / 目标 / 工具名（工具执行记忆）
+      · facts —— 已证事实正文（note_fact 记下的结论性记忆）
+      · intel —— 项目情报库 JSON（跨会话沉淀的子域 / IP / API / 技术栈）
+    事实与情报都带 kind 标记，调用方按类型渲染，模型才能分辨
+    「这是工具原文，还是已证结论，还是沉淀过的资产清单」。
     """
     kw = (keyword or "").strip()
     if not kw or not project_id:
         return []
     like = f"%{kw}%"
+    out: list[dict] = []
     with _db() as c:
         rows = c.execute(
             "SELECT st.session_id, s.title, s.task, st.tool_name, st.tool_alias,"
@@ -450,18 +459,51 @@ def search_history(project_id: str, keyword: str, limit: int = 8) -> list[dict]:
             " ORDER BY st.created_at DESC LIMIT ?",
             (project_id, like, like, like, like, limit),
         ).fetchall()
-    out = []
-    for r in rows:
-        d = dict(r)
-        text = d.get("output") or ""
-        pos = text.find(kw)
-        if pos >= 0:
-            start = max(0, pos - 120)
-            d["snippet"] = ("…" if start else "") + text[start:pos + 220].strip() + "…"
-        else:
-            d["snippet"] = text[:220].strip()
-        out.append(d)
-    return out
+        for r in rows:
+            d = dict(r)
+            d["kind"] = "step"
+            text = d.get("output") or ""
+            pos = text.find(kw)
+            if pos >= 0:
+                start = max(0, pos - 120)
+                d["snippet"] = ("…" if start else "") + text[start:pos + 220].strip() + "…"
+            else:
+                d["snippet"] = text[:220].strip()
+            out.append(d)
+
+        for r in c.execute(
+            "SELECT id, content, session_id, step_id, created_at FROM facts"
+            " WHERE project_id=? AND content LIKE ? ORDER BY created_at DESC LIMIT ?",
+            (project_id, like, limit),
+        ).fetchall():
+            d = dict(r)
+            d["kind"] = "fact"
+            text = d.get("content") or ""
+            pos = text.find(kw)
+            start = max(0, pos - 60) if pos >= 0 else 0
+            d["snippet"] = text[start:start + 300].strip()
+            out.append(d)
+
+        for r in c.execute(
+            "SELECT data, updated_at FROM intel WHERE project_id=?", (project_id,)
+        ).fetchall():
+            try:
+                data = json.loads(r["data"] or "{}")
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                continue
+            for k, vals in data.items():
+                if not isinstance(vals, list):
+                    continue
+                hit = [str(v) for v in vals if kw.lower() in str(v).lower()]
+                if hit:
+                    out.append({
+                        "kind": "intel", "key": k, "matches": hit[:10],
+                        "total": len(vals), "created_at": r["updated_at"],
+                        "snippet": "、".join(hit[:10]),
+                    })
+    return out[: max(limit, 12)]
 
 
 def save_step(sid: str, step: dict) -> None:

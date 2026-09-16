@@ -31,6 +31,70 @@ from .scope import FAKE_TLDS as _FAKE_TLDS
 
 logger = logging.getLogger(__name__)
 
+# 「记忆类」内置工具：它们不走风险闸门，但**必须留下步骤记录**。
+# 否则「读了哪篇知识库 / 记了哪条事实 / 搜了什么关键词」在 steps 表里完全不可见：
+#   ① 不进「本轮已尝试过的工具」提醒 → 模型可能反复读同一篇、反复搜同一个词；
+#   ② search_history 只搜 steps 表 → 这些动作检索不到；
+#   ③ 审计层面没有任何痕迹（只有 SSE 里一闪而过的 reasoning）。
+# 这个集合同时用于「按内容回查事实来源」时排除内置步骤 —— 它们的 output 是知识库正文
+# 或操作回执，拿它当工具执行证据会把因果图连到错误的地方。
+BUILTIN_STEP_TOOLS = frozenset({
+    "note_fact", "search_history", "propose_branch", "split_task",
+    "kb_search", "kb_read", "fofa_search",
+})
+
+# 记忆注入上限（值在 config 里，可用环境变量调；超限会在注入块尾部写明未展示条数）
+FACT_INJECT_MAX = config.FACT_INJECT_MAX
+RECORD_INJECT_MAX = config.RECORD_INJECT_MAX
+BRANCH_INJECT_MAX = config.BRANCH_INJECT_MAX
+
+_OUTPUT_GAP = "\n…（中略 {n} 字符；落库版本保留了首尾，细节可用 search_history 检索）…\n"
+
+
+def clip_output(text: str) -> str:
+    """步骤输出落库前的裁剪：**保留头 + 尾**，中间折叠。
+
+    此前只存尾部（`output[-2000:]`），于是工具开头的关键结果永久丢失 ——
+    而命中统计、存活清单首屏恰恰常在输出最前面；同时上下文压缩又告诉模型
+    「可用 search_history 检索」，等于给了一张兑不了现的空头支票。
+    """
+    s = text or ""
+    head, tail = config.STEP_OUTPUT_HEAD, config.STEP_OUTPUT_TAIL
+    if len(s) <= head + tail:
+        return s
+    return s[:head] + _OUTPUT_GAP.format(n=len(s) - head - tail) + s[-tail:]
+
+
+def restore_messages(sid: str) -> list[dict]:
+    """把落库的对话原文还原成「可续聊的 messages」。
+
+    为什么需要：`adopt()` 重建会话时原先只搬 steps/target/summary/records，
+    唯独漏了 messages —— 于是「继续聊」时模型对之前所有轮次零记忆，
+    而前端仍能从 chat_messages 看到完整对话，人和模型看到的历史不一致。
+
+    只还原对话层（用户原话 + 模型说明/结论）。工具输出不在 chat_messages 里，
+    由 steps 表、情报库、已证事实库另行注入，这里不重复搬运。
+    """
+    try:
+        rows = store.list_chat_messages(sid)
+    except Exception:
+        logger.exception("续聊记忆恢复失败")
+        return []
+    out: list[dict] = []
+    for m in rows[-config.RESTORE_CHAT_MAX:]:
+        text = (m.get("content") or "").strip()
+        if not text:
+            continue
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        text = text[: config.RESTORE_CHAT_CHARS]
+        # 相邻同角色合并：还原出的历史里常出现连续多条 assistant（reasoning + answer），
+        # 严格的 OpenAI 兼容端点对这种序列不接受，合成一条最稳。
+        if out and out[-1]["role"] == role:
+            out[-1]["content"] += "\n" + text
+            continue
+        out.append({"role": role, "content": text})
+    return out
+
 
 SYSTEM_PROMPT = """你是一个渗透测试编排助手，服务于 SRC（安全应急响应中心）漏洞挖掘场景。
 
@@ -293,6 +357,36 @@ class Session:
         await self.events.put(event)
 
 
+def attribute_source_step(session: "Session", content: str) -> str:
+    """给一条「已证事实」找它**真正的来源步骤**。
+
+    原实现是 `session.steps[-1].id` —— 取「当前最后执行的那一步」，而不是「产出这条事实的那一步」。
+    同一步内连记多条事实没问题，但只要模型是「执行 A → B 之后才回头记 A 的产出」，
+    事实就会挂到 B 上，因果图随之连出 `Evidence(B) --REVEALS--> KeyFact(其实来自 A)` 的错误边。
+    实测上一轮侥幸正确（两条事实确实都源自 ehole），那是巧合，不是机制保证。
+
+    这里改成**按内容回查找证**：事实正文里的 token 能在哪一步的输出里找到，就归到那一步
+    （从最近往前找）；找不到再回退到「最近的一个非内置步骤」，语义与原来一致但更贴近事实。
+    """
+    if not session.steps:
+        return ""
+    # 内置步骤的 output 是知识库正文/操作回执，不能当工具执行证据
+    steps = [st for st in session.steps if st.tool_alias not in BUILTIN_STEP_TOOLS]
+    if not steps:
+        return session.steps[-1].id
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9._:/-]{3,}", content or "")[:8]
+    if tokens:
+        for st in reversed(steps):
+            out = st.output or ""
+            if out and all(t in out for t in tokens):
+                return st.id
+        for st in reversed(steps):
+            out = st.output or ""
+            if out and sum(1 for t in tokens if t in out) >= 2:
+                return st.id
+    return steps[-1].id
+
+
 class SessionManager:
     def __init__(self) -> None:
         self.sessions: dict[str, Session] = {}
@@ -310,6 +404,7 @@ class SessionManager:
 
         内存里已有则直接返回；store 里也没有返回 None。
         历史步骤一并装回：续聊时「已尝试过的工具」提醒、开分支的记录挑选都依赖它。
+        **对话原文也一并装回**（见下方 restore_messages）——否则「继续聊」就是一个失忆的会话。
         """
         s = self.sessions.get(sid)
         if s:
@@ -335,6 +430,11 @@ class SessionManager:
         s.target = row.get("target") or ""
         s.state = "idle"
         s.summary = row.get("summary") or ""
+        # 续聊记忆：把落库的对话原文装回 messages。
+        # 少了这一步，「切回线索继续聊」等于失忆 —— 模型看不到任何历史轮次（用户原话、
+        # 自己的判断、结论全丢），而前端依然能从 chat_messages 回放完整对话，
+        # 于是人和模型看到的历史不一致，用户会以为「它记得」。
+        s.messages = restore_messages(sid)
         for st in rec["steps"]:
             s.steps.append(Step(
                 id=st.get("id") or uuid.uuid4().hex[:12],
@@ -448,7 +548,12 @@ class Agent:
             try:
                 _facts = store.list_facts(session.project)
                 if _facts:
-                    _fl = "\n".join(f"- {f['content']}" for f in _facts[:20])
+                    _fl = "\n".join(f"- {f['content']}" for f in _facts[:FACT_INJECT_MAX])
+                    if len(_facts) > FACT_INJECT_MAX:
+                        # 超出上限原先是无提示的：模型既不知道"还有更多"，
+                        # 也没动机去检索，于是会重复收集已经查过的东西。
+                        _fl += (f"\n（另有 {len(_facts) - FACT_INJECT_MAX} 条未展示；"
+                                f"需要时用 search_history 按关键词检索事实库）")
                     system += (
                         "\n\n【已证事实库（工具输出已证实，可直接引用、不得推翻或重复验证；"
                         "报告中基于这些事实组织结论）】\n" + _fl
@@ -458,7 +563,9 @@ class Agent:
         # 注入对话树上下文：①本线索开局打包记录 ②同项目其他线索的进展摘要。
         # 目的：单对话过长会遗忘细节，把方向拆到独立线索里深挖，跨线索信息按需取用。
         if session.records:
-            rec_lines = "\n".join(f"- {r}" for r in session.records[:20])
+            rec_lines = "\n".join(f"- {r}" for r in session.records[:RECORD_INJECT_MAX])
+            if len(session.records) > RECORD_INJECT_MAX:
+                rec_lines += (f"\n（另有 {len(session.records) - RECORD_INJECT_MAX} 条未展示）")
             system += (
                 "\n\n【本线索开局背景（从上级对话打包带来的已查记录，可直接引用，"
                 "不要重复验证，也不要质疑其真实性）】\n" + rec_lines
@@ -469,10 +576,12 @@ class Agent:
                            if t["id"] != session.id and (t.get("summary") or t.get("task"))]
                 if _others:
                     _ol = []
-                    for t in _others[:8]:
+                    for t in _others[:BRANCH_INJECT_MAX]:
                         name = t.get("title") or (t.get("task") or "")[:24] or "未命名线索"
                         brief = t.get("summary") or (t.get("task") or "")[:80]
                         _ol.append(f"- 线索《{name}》（{t.get('status', 'active')}）：{brief}")
+                    if len(_others) > BRANCH_INJECT_MAX:
+                        _ol.append(f"（另有 {len(_others) - BRANCH_INJECT_MAX} 条线索未展示）")
                     system += (
                         "\n\n【同项目其他线索的进展（并行推进的其他对话，详情可用 "
                         "search_history 工具按关键词检索，不要臆测其内容）】\n" + "\n".join(_ol)
@@ -672,25 +781,24 @@ class Agent:
                         "data": f"工具名 `{alias}` 不存在，已自动纠正为 `{tool.alias}`（{tool.name}）",
                     })
 
-                # ---- 内置 note_fact：记录已证事实（不进执行计划/不走风险闸门）----
-                if tool.alias == "note_fact":
-                    await self._note_fact(session, tc, target, args)
-                    continue
-
-                # ---- 内置 search_history / propose_branch（对话树能力，L0，不走风险闸门）----
-                if tool.alias == "search_history":
-                    await self._search_history(session, tc, args or target)
-                    continue
-                if tool.alias == "propose_branch":
-                    await self._propose_branch(session, tc, args)
-                    continue
-                if tool.alias == "split_task":
-                    await self._split_task(session, tc, args, allow_split)
-                    continue
-
-                # ---- 内置 kb_search / kb_read / fofa_search（知识库与测绘，L0/L1）----
-                if tool.alias in ("kb_search", "kb_read", "fofa_search"):
-                    await self._kb_fofa_tool(session, tool.alias, tc, args)
+                # ---- 内置「记忆类」工具：不走风险闸门，但**要留下步骤记录** ----
+                # 原先这几条直接 continue，于是「读过哪篇知识库 / 记了哪条事实 / 搜了什么词」
+                # 在 steps 表里完全不可见：不在「本轮已尝试过的工具」提醒里（会重复读），
+                # search_history 也搜不到，审计上更是无痕。
+                # 注意顺序：**先执行、后补记**。执行时 steps[-1] 仍是上一条真实工具步骤，
+                # 事实溯源要用它；反过来先入列会让 note_fact 把事实挂到自己头上。
+                if tool.alias in BUILTIN_STEP_TOOLS:
+                    if tool.alias == "note_fact":
+                        note = await self._note_fact(session, tc, target, args)
+                    elif tool.alias == "search_history":
+                        note = await self._search_history(session, tc, args or target)
+                    elif tool.alias == "propose_branch":
+                        note = await self._propose_branch(session, tc, args)
+                    elif tool.alias == "split_task":
+                        note = await self._split_task(session, tc, args, allow_split)
+                    else:  # kb_search / kb_read / fofa_search
+                        note = await self._kb_fofa_tool(session, tool.alias, tc, args)
+                    self._record_builtin_step(session, tc, tool, target, args, note)
                     continue
 
                 # ---- 校验目标（模型会把中文句子当目标传入） ----
@@ -801,16 +909,87 @@ class Agent:
 
     # ---------- 情报沉淀 ----------
     def _persist_intel(self, session: Session) -> None:
-        """会话结束时，把本轮工具输出沉淀进项目情报库，供下轮注入。"""
+        """把本轮工具输出沉淀进项目情报库，供下轮注入；可重复调用（merge_intel 按类去重）。
+
+        调用点有两处：run() 的正常收尾，以及 `_run_agent` 的 finally。
+        加 finally 那次是有原因的：原先只在「正常收尾」沉淀，模型调用一旦报错就直接
+        return，整轮产出在记忆层面归零 —— 实测上一轮 3 步全部成功、产出 57 条存活子域，
+        情报库仍然是 0 行，而且没有任何提示。
+
+        只取**真实外部工具**的输出：内置 kb_read 的正文里全是 target.com 这类占位示例，
+        一起抽进来会往情报库灌假主机。
+        """
         if not session.project:
             return
         try:
-            update_intel_from_steps(session.project, [st.output for st in session.steps])
+            outputs = [st.output for st in session.steps
+                       if st.tool_alias not in BUILTIN_STEP_TOOLS]
+            update_intel_from_steps(session.project, outputs)
         except Exception:
             logger.exception("项目情报沉淀失败")
 
+    def persist_interrupted(self, session: Session, reason: str = "") -> None:
+        """异常结束时兜一层「部分成果」摘要，让中断也留下可复用的记忆。
+
+        与 `_write_back` 的区别：那条只走「给出最终结论」的路径，异常时不会触发。
+        这里用步骤清单拼一句可注入的摘要（其他线索的上下文注入会展它），
+        并以「【中断】」开头，让读到的人能分辨这是完整结论还是半程快照。
+        """
+        if not session.project or session.summary:
+            return          # 已有正式结论就别用半程快照盖掉它
+        try:
+            done = [st for st in session.steps if st.status == "done"]
+            tools = list(dict.fromkeys(
+                st.tool_name or st.tool_alias for st in done)) or ["（无）"]
+            head = (session.target or "").strip()
+            msg = (f"【中断】线索未跑完（{reason or '执行中断'}）；共 {len(session.steps)} 步、"
+                   f"其中 {len(done)} 步成功。已用工具：{'、'.join(tools[:8])}。"
+                   f"目标：{head or '未识别'}。")
+            if session.id:
+                msg += f"（会话 {session.id}，详情可在该线索内查看或检索）"
+            session.summary = msg
+            store.save_summary(session.id, msg)
+            logger.info("已写入中断摘要：%s", session.id)
+        except Exception:
+            logger.exception("中断摘要写入失败")
+
+
     # ---------- 已证事实记录 ----------
-    async def _note_fact(self, session: Session, tc: dict, target: str, args: str) -> None:
+    @staticmethod
+    def _record_builtin_step(session: Session, tc: dict, tool, target: str,
+                             args: str, note: str) -> None:
+        """把一次内置「记忆类」工具调用补记成步骤（只留痕，不影响风险闸门）。
+
+        它们本来就是 L0、无外部动作，所以不走闸门；但必须留痕 —— 否则
+        「读了哪篇知识库 / 记了哪条事实 / 搜了什么关键词」既不在「本轮已尝试过的工具」
+        提醒里（模型会反复读同一篇），也搜不到、审计不到。
+        顺序上必须在处理函数**之后**调用：note_fact 的事实溯源会用非内置步骤回退，
+        先入列会让它把事实挂到自己头上。
+        """
+        now = time.time()
+        # 风险元数据回退：registry 未 load（如单测直接 import）时 risk_of 会返回 None，
+        # 那样落库的 risk_level 会变成空串。内置记忆类工具本身就不过闸门，
+        # 这里至少把等级据实填上，别在库里留一个"未知等级"。
+        risk = registry.risk_of(tool.alias) or {
+            "level": getattr(tool, "risk_level", "") or "L0",
+            "name": "", "auto": True, "double_confirm": False,
+            "reason": getattr(tool, "risk_reason", "") or "",
+            "tool": tool.name,
+        }
+        session.steps.append(Step(
+            id=tc["id"],
+            tool_alias=tool.alias,
+            tool_name=tool.name,
+            target=target or "",
+            args=args or "",
+            risk=risk,
+            status="done",
+            output=clip_output(note or ""),
+            started_at=now,
+            finished_at=now,
+        ))
+
+    async def _note_fact(self, session: Session, tc: dict, target: str, args: str) -> str:
         """note_fact 内置工具执行：写入项目事实库并回馈模型。"""
         content = (args or "").strip() or (target or "").strip()
         if not session.project:
@@ -819,21 +998,24 @@ class Agent:
             note = "事实内容为空：args 应填要记录的事实正文（一句一事）。"
         else:
             try:
-                # 带上会话与最近一步的步骤 id：因果图靠这个溯源把
+                # 带上会话与**真正的来源步骤**：因果图靠这个溯源把
                 # 「某次工具执行 —揭示→ 该事实」连成边，否则事实会成孤点。
-                last_step = session.steps[-1].id if session.steps else ""
+                # 来源步骤按事实正文回查（见 attribute_source_step），
+                # 不再无脑取 steps[-1]——那会把 A 的产出挂到后执行的 B 上。
+                src_step = attribute_source_step(session, content)
                 rec = store.add_fact(session.project, content[:500], source="agent",
-                                     session_id=session.id, step_id=last_step)
+                                     session_id=session.id, step_id=src_step)
                 graph.on_fact_added(session.project, rec)
                 note = f"已记录已证事实 #{rec.get('id','')}：{content[:120]}"
             except Exception as e:
                 note = f"记录事实失败：{e}"
         session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
         await session.emit({"type": "reasoning", "data": f"（{note}）"})
+        return note
 
     # ---------- 对话树：跨线索检索 ----------
-    async def _search_history(self, session: Session, tc: dict, keyword: str) -> None:
-        """search_history 内置工具：在项目内所有会话的历史工具输出里检索关键词。"""
+    async def _search_history(self, session: Session, tc: dict, keyword: str) -> str:
+        """search_history 内置工具：在项目内的工具执行 / 已证事实 / 项目情报里检索关键词。"""
         kw = (keyword or "").strip()[:80]
         hits: list[dict] = []
         if not session.project:
@@ -852,21 +1034,32 @@ class Agent:
                 # 「没搜到」而看不到真实原因，这里显式区分优先级。
                 note = f"检索失败：{err}"
             elif not hits:
-                note = f"未检索到包含「{kw}」的历史记录。可换更具体的关键词（如具体路径、子域名、端口）。"
+                note = (f"未检索到包含「{kw}」的历史记录"
+                        f"（检索范围：工具执行输出、已证事实、项目情报库）。"
+                        f"可换更具体的关键词（如具体路径、子域名、端口）。")
             else:
                 lines = []
                 for h in hits:
+                    if h.get("kind") == "fact":
+                        lines.append(f"【已证事实】{h.get('snippet', '')}")
+                        continue
+                    if h.get("kind") == "intel":
+                        lines.append(f"【项目情报·{h.get('key')}】{h.get('snippet', '')}"
+                                     f"（该类共 {h.get('total')} 条）")
+                        continue
                     src = h.get("title") or (h.get("task") or "")[:24] or "未命名线索"
                     lines.append(
                         f"【线索《{src}》· {h.get('tool_name') or h.get('tool_alias')} → {h.get('target') or '-'}】\n"
                         f"{h.get('snippet', '')}"
                     )
-                note = f"检索到 {len(hits)} 条包含「{kw}」的历史记录（已证实的工具输出，可直接引用）：\n\n" + "\n\n".join(lines)
+                note = (f"检索到 {len(hits)} 条包含「{kw}」的历史记录"
+                        f"（工具输出 / 已证事实 / 项目情报，均可直接引用）：\n\n" + "\n\n".join(lines))
         session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
         await session.emit({"type": "reasoning", "data": f"（检索历史线索：{kw} → {len(hits)} 条）"})
+        return note
 
     # ---------- 对话树：建议开辟新线索 ----------
-    async def _propose_branch(self, session: Session, tc: dict, args: str) -> None:
+    async def _propose_branch(self, session: Session, tc: dict, args: str) -> str:
         """propose_branch 内置工具：向用户展示「开新线索」卡片，用户确认后才真正创建。
 
         卡片候选记录 = 本会话最近的工具步骤摘要（前端可勾选打包带走）。
@@ -889,9 +1082,10 @@ class Agent:
                 f"请继续当前任务，或在当前方向确实告一段落时给出结论结束。")
         session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
         await session.emit({"type": "reasoning", "data": f"（已发出开新线索建议：《{title}》，等待用户确认）"})
+        return note
 
     # ---------- 任务分片并行（拆小份 → 并发跑 → 合并） ----------
-    async def _split_task(self, session: Session, tc: dict, args: str, allow_split: bool) -> None:
+    async def _split_task(self, session: Session, tc: dict, args: str, allow_split: bool) -> str:
         """split_task 内置工具：把当前任务拆成若干子任务并发执行，跑完汇总回本线索。
 
         设计取舍：
@@ -909,13 +1103,13 @@ class Agent:
         if not allow_split:
             note = "子任务内不允许再次拆分（避免任务数指数膨胀）。请直接完成你负责的这一份。"
             session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
-            return
+            return note
         if len(subs) < 2:
             note = ("拆分至少需要 2 个子任务：args 每行填一个，每行要具体到目标与动作。"
                     "若这个任务本身不需要拆分，就不要调用本工具，直接继续做。")
             session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
             await session.emit({"type": "reasoning", "data": "（split_task：子任务不足 2 个，未拆分）"})
-            return
+            return note
         subs = subs[: config.SUBTASK_MAX_COUNT]
 
         parent_task = next((str(m.get("content") or "") for m in session.messages
@@ -980,9 +1174,10 @@ class Agent:
         }})
         await session.emit({"type": "reasoning",
                             "data": f"（{len(children)} 个子任务已完成并汇总回本线索）"})
+        return merged
 
     # ---------- 知识库 / FOFA 测绘 ----------
-    async def _kb_fofa_tool(self, session: Session, alias: str, tc: dict, args: str) -> None:
+    async def _kb_fofa_tool(self, session: Session, alias: str, tc: dict, args: str) -> str:
         """kb_search / kb_read / fofa_search 内置工具执行。"""
         arg = (args or "").strip()
         try:
@@ -1019,8 +1214,10 @@ class Agent:
         except Exception as e:
             note = f"{alias} 执行异常：{e}"
             logger.exception("%s 执行异常", alias)
-        session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note[: config.MAX_OUTPUT_CHARS + 2000]})
+        body = note[: config.MAX_OUTPUT_CHARS + 2000]
+        session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": body})
         await session.emit({"type": "reasoning", "data": f"（{alias} → {'OK' if '失败' not in note and '异常' not in note else '见结果'}）"})
+        return body
 
     # ---------- 对话树：结论回流 ----------
     async def _write_back(self, session: Session, answer: str) -> None:
@@ -1040,7 +1237,11 @@ class Agent:
         except Exception:
             logger.exception("结论摘要落库失败")
         if session.parent_id:
-            parent = sessions.get(session.parent_id)
+            # 父会话不在内存时（服务重启过、或父线索从未被打开）原先直接丢弃事件，
+            # 且不留任何痕迹。改成从持久化层把它装回内存：事件会留在它的队列里，
+            # 用户下次打开父线索时随 SSE 补投。摘要本身早已落库，内容不会真丢，
+            # 这里补的是「实时通知」这条通路。
+            parent = sessions.get(session.parent_id) or sessions.adopt(session.parent_id)
             if parent:
                 await parent.emit({
                     "type": "branch_update",
@@ -1074,7 +1275,8 @@ class Agent:
                 continue
             m["content"] = (
                 f"{_COMPRESSED_PREFIX}{text[:limit]}"
-                f"…（原文 {len(text)} 字符已压缩；需要细节可用 search_history 检索）"
+                f"…（原文 {len(text)} 字符已在本轮上下文中压缩；"
+                f"留档保留了首尾，可用 search_history 按关键词检索）"
             )
             changed += 1
         if changed:
@@ -1311,7 +1513,9 @@ class Agent:
             "args": step.args,
             "risk": step.risk,
             "status": step.status,
-            "output": step.output[-2000:],
+            # 落库/回前端前统一裁剪：头 + 尾都保留（原来只留尾部 output[-2000:]，
+            # 会把工具开头的关键结果永久丢掉，而上下文压缩又提示模型「可检索」）。
+            "output": clip_output(step.output),
             "elapsed": round(step.finished_at - step.started_at, 1) if step.finished_at and step.started_at else None,
         }
 

@@ -97,6 +97,30 @@ HISTORY_COMPRESS_AFTER_MESSAGES = int(os.getenv("HISTORY_COMPRESS_AFTER_MESSAGES
 HISTORY_KEEP_RECENT = int(os.getenv("HISTORY_KEEP_RECENT", "12"))   # 最近 N 条保持原文
 HISTORY_SUMMARY_CHARS = int(os.getenv("HISTORY_SUMMARY_CHARS", "300"))  # 压缩后每条保留多少字
 
+# ---------- 续聊记忆恢复（SessionManager.adopt） ----------
+# 服务重启、或切回某条线索继续聊时，把落库的对话原文还原成「给模型的 messages」。
+# 不还原会怎样：会话对象被重建时 messages 一片空白，模型对之前所有轮次零记忆，
+# 而前端仍能从 chat_messages 看到完整对话 —— 人和模型看到的历史不一致，
+# 用户会以为「它记得」，实际它什么都不记得。
+# 只还原对话层（用户原话 + 模型说明/结论）；工具输出不在 chat_messages 里，
+# 由 steps 表 / 情报库 / 已证事实库另行注入，这里不重复搬运。
+RESTORE_CHAT_MAX = int(os.getenv("AGENT_RESTORE_CHAT_MAX", "24"))        # 最多还原多少条
+RESTORE_CHAT_CHARS = int(os.getenv("AGENT_RESTORE_CHAT_CHARS", "1200"))  # 单条截断字符
+
+# ---------- 步骤输出落库裁剪 ----------
+# 此前只存尾部（output[-2000:]），导致工具开头的关键结果（命中统计、存活清单首页）
+# 永久丢失，而上下文压缩又提示模型「可用 search_history 检索」——提示与事实不符。
+# 改为头 + 尾都保留，中间以省略标记连接。
+STEP_OUTPUT_HEAD = int(os.getenv("AGENT_STEP_OUTPUT_HEAD", "1500"))
+STEP_OUTPUT_TAIL = int(os.getenv("AGENT_STEP_OUTPUT_TAIL", "2000"))
+
+# ---------- 记忆注入上限 ----------
+# 超过上限的条目会在注入块尾部写明「另有 N 条未展示」，不再是无声截断 ——
+# 否则模型既不知道「还有更多记忆它看不见」，也没动机去检索，只会重复收集。
+FACT_INJECT_MAX = int(os.getenv("AGENT_FACT_INJECT_MAX", "20"))      # 已证事实库
+RECORD_INJECT_MAX = int(os.getenv("AGENT_RECORD_INJECT_MAX", "20"))  # 本线索开局记录
+BRANCH_INJECT_MAX = int(os.getenv("AGENT_BRANCH_INJECT_MAX", "8"))   # 同项目其他线索摘要
+
 # ---- 失败止损分两档（借鉴 LuaN1ao EXECUTOR_FAILURE_THRESHOLD 的语义）----
 # 连续失败到 SWITCH 档 → 要求模型「换策略」，而不是直接停；到 STOP 档才停止。
 FAILURE_SWITCH_THRESHOLD = int(os.getenv("AGENT_FAILURE_SWITCH", "3"))
