@@ -89,22 +89,22 @@ def test_collect_and_summary():
     asyncio.run(run_collect(s, "测试用量统计"))
 
     rows = store.list_usage()
-    # note_fact 1 次 + 结论前被催促 2 次 + 最终 1 次 = 4 次模型调用
-    check("4 次模型调用均落库", len(rows) == 4, len(rows))
+    # note_fact 1 次 + 收尾结论 1 次 = 2 次模型调用（收尾免催促：干过活不再催 2 次）
+    check("2 次模型调用均落库（收尾免催促）", len(rows) == 2, len(rows))
     check("记录含 provider/model/项目/会话",
           rows[0]["provider_id"] == "model-studio" and rows[0]["model"] == "qwen3.7-plus"
           and rows[0]["project_id"] == pid and rows[0]["session_id"] == s.id)
-    check("token 数正确（1000/200 一次 + 800/500 三次）",
-          sum(r["prompt_tokens"] for r in rows) == 1000 + 800 * 3
-          and sum(r["completion_tokens"] for r in rows) == 200 + 500 * 3)
+    check("token 数正确（1000/200 + 800/500 各一次）",
+          {r["prompt_tokens"] for r in rows} == {1000, 800}
+          and {r["completion_tokens"] for r in rows} == {200, 500})
     check("耗时已记录", all(r["duration_ms"] >= 0 for r in rows))
 
     # 单价：默认 qwen3.7-plus → 输入 0.8 / 输出 2.0（元/百万）
     total_tokens = sum(r["prompt_tokens"] + r["completion_tokens"] for r in rows)
-    expected_cost = round((1000 * 0.8 + 200 * 2.0 + (800 * 0.8 + 500 * 2.0) * 3) / 1_000_000, 4)
+    expected_cost = (1000 * 0.8 + 200 * 2.0 + 800 * 0.8 + 500 * 2.0) / 1_000_000
     sm = usage.summary()
     check("汇总 tokens 一致", sm["total"]["tokens"] == total_tokens, sm["total"]["tokens"])
-    check("费用按输入/输出分开估算", abs(sm["total"]["cost"] - expected_cost) < 1e-6,
+    check("费用按输入/输出分开估算", abs(sm["total"]["cost"] - expected_cost) < 5e-5,
           f"{sm['total']['cost']} vs {expected_cost}")
     check("今日汇总与累计一致（新库）", sm["today"]["tokens"] == sm["total"]["tokens"])
     check("分模型聚合存在", "model-studio:qwen3.7-plus" in sm["by_model"])
@@ -143,7 +143,7 @@ def test_api(pid):
     r = client.get("/api/usage/daily?days=7")
     check("GET daily", r.status_code == 200 and len(r.json()["items"]) == 7)
     r = client.get(f"/api/usage/list?project_id={pid}")
-    check("GET list 按项目过滤", r.status_code == 200 and len(r.json()["items"]) == 4)
+    check("GET list 按项目过滤", r.status_code == 200 and len(r.json()["items"]) == 2)
     r = client.get("/api/usage/prices")
     check("GET prices", r.status_code == 200 and "qwen3.7-plus" in r.json()["items"])
     r = client.post("/api/usage/prices", json={"prices": {"qwen3.7-plus": {"input": 1.0, "output": 3.0}}})

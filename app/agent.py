@@ -470,6 +470,8 @@ class Agent:
         consecutive_failures = 0
         tokens_used = 0        # 本次任务累计 token（成本熔断用）
         switch_nudged = False  # 「换策略」提醒是否已发过（成功一次后重新武装）
+        tools_used = False     # 本次任务是否已实际执行过工具（收尾免催促的依据）
+        session.nudges = 0     # 催促计数按轮重置：催促防护对每轮任务独立生效
         step_budget = max_steps or config.MAX_STEPS
 
         for step_no in range(1, step_budget + 1):
@@ -555,7 +557,12 @@ class Agent:
             if not tool_calls:
                 # 本地小模型两种常见退化：① 反问用户要目标 ② 只描述计划不调用工具。
                 # 两者都催促一次，仍不动手就认定它已给出结论。
-                if session.nudges < 2:
+                #
+                # 收尾免催促（2026-09-16）：本次任务已经实际执行过工具的话，
+                # 模型此刻给的就是正常结论——直接收尾。原实现一律催促 2 次，
+                # 每个会话收尾多付 2 次 LLM 调用，split_task 多子任务场景成倍放大。
+                # 只有「整轮没碰过任何工具、纯嘴上输出」时才需要催促。
+                if session.nudges < 2 and not tools_used:
                     session.nudges += 1
                     session.messages.append({
                         "role": "user",
@@ -597,6 +604,9 @@ class Agent:
                 params = parse_tool_arguments(fn.get("arguments", "{}"))
                 target = str(params.get("target", "")).strip()
                 args = str(params.get("args", "") or "").strip()
+                # 本轮发生过任何工具调用交互（含内置工具/被拒调用）即视为「模型在动手」，
+                # 后续给出结论时直接收尾、不再催促（收尾免催促的判定依据）
+                tools_used = True
 
                 # ---- 校验工具名（模型会拼错甚至编造） ----
                 tool, fuzzy = registry.resolve(alias)

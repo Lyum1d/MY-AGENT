@@ -168,6 +168,85 @@ async def main():
     store.delete_project(proj2["id"])
     check("目标注入测试项目已清理", store.get_project(proj2["id"]) is None)
 
+    print("== E. 收尾免催促（干过活直接收尾，纯嘴遁仍催促） ==")
+    proj3 = store.create_project("收尾催促测试", "smoke.local", "跑完即删")
+
+    class FakeToolUser:
+        """第 1 轮调 note_fact，第 2 轮给结论 → 应 0 次催促、共 2 次调用。"""
+        name = "ollama"
+        label = "本地 Ollama"
+        model = "fake-smoke-model"
+        local = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def available(self):
+            return True
+
+        async def chat(self, messages, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "tool_calls": [{
+                        "id": "e1", "type": "function",
+                        "function": {"name": "note_fact",
+                                     "arguments": json.dumps({"args": "干过活的收尾测试"}, ensure_ascii=False)},
+                    }],
+                    "content": "",
+                }
+            return {"tool_calls": [], "content": "工具已执行完毕，这是最终结论。"}
+
+    ft = FakeToolUser()
+    agent_mod.get_backend = lambda name=None: ft
+    s4 = sessions.create(project=proj3["id"])
+    ev4 = []
+
+    async def consume4():
+        while True:
+            e = await s4.events.get()
+            ev4.append(e)
+            if e.get("type") == "done":
+                return
+
+    c4 = asyncio.create_task(consume4())
+    await agent.run(s4, "冒烟：干完活收尾不应被催促")
+    await asyncio.wait_for(c4, timeout=15)
+    check("干过活收尾：LLM 只调用 2 次（省 2 次催促）", ft.calls == 2, ft.calls)
+    check("干过活收尾：全程无催促事件",
+          not any("催促" in str(e.get("data", "")) for e in ev4 if e.get("type") == "reasoning"))
+    check("干过活收尾：结论正常落盘",
+          any("最终结论" in str(e.get("data", "")) for e in ev4 if e.get("type") == "answer"))
+
+    class FakeChatter(FakeToolUser):
+        """从不调工具，只给结论 → 应催促 2 次后才收尾（共 3 次调用）。"""
+
+        async def chat(self, messages, tools=None):
+            self.calls += 1
+            return {"tool_calls": [], "content": "我觉得任务应该完成了。"}
+
+    fc = FakeChatter()
+    agent_mod.get_backend = lambda name=None: fc
+    s5 = sessions.create(project=proj3["id"])
+    ev5 = []
+
+    async def consume5():
+        while True:
+            e = await s5.events.get()
+            ev5.append(e)
+            if e.get("type") == "done":
+                return
+
+    c5 = asyncio.create_task(consume5())
+    await agent.run(s5, "冒烟：纯嘴遁仍应被催促")
+    await asyncio.wait_for(c5, timeout=15)
+    check("纯嘴遁：催促 2 次后才收尾（共 3 次调用）", fc.calls == 3, fc.calls)
+    nudge_events = [e for e in ev5 if e.get("type") == "reasoning" and "催促" in str(e.get("data", ""))]
+    check("纯嘴遁：发出 2 次催促事件", len(nudge_events) == 2, len(nudge_events))
+
+    store.delete_project(proj3["id"])
+    check("收尾催促测试项目已清理", store.get_project(proj3["id"]) is None)
+
 
 asyncio.run(main())
 print(f"\n结果：{len(ok)} 通过 / {len(fail)} 失败")
