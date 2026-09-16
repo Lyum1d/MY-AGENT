@@ -23,12 +23,17 @@ from typing import AsyncIterator
 
 from . import config
 from .registry import Tool
-from .scope import check_scope
+from .scope import check_scope, first_unauthorized_host_in_argv
+from .scope import load_scope
 # 向后兼容别名：白名单逻辑已收敛到 app/scope.py（唯一实现），
 # 但 test_scope.py / test_replayer.py 等既有套件是按历史名字导入的，
 # 这里保留同名入口，避免为了改名而改动（进而弱化）那些安全断言。
 from .scope import host_in_scope as _host_in_scope  # noqa: F401
 from .scope import target_host as _target_host      # noqa: F401
+
+# 模板渲染时 {exe} 的占位符：exe 路径可能含空格，直接渲染进模板再 shlex.split
+# 会被拆成多个 token（审计 P2-1），故用占位符过 split 后再还原为真实路径
+_EXE_TOKEN = "__SRC_AGENT_EXE__"
 
 
 # ---------- 授权范围（白名单）校验 ----------
@@ -275,9 +280,11 @@ class LocalExecutor(Executor):
             clean_args = _strip_target_arg(args, flag)
             # 按工具白名单剥掉模型臆造的非法旗标（如 dirsearch 的 --depth）
             clean_args = _filter_unknown_flags(clean_args, tool.allowed_flags, tool.value_flags)
-            rendered = tmpl.format(exe=tool.executable, target=norm, args=clean_args or "")
+            rendered = tmpl.format(exe=_EXE_TOKEN, target=norm, args=clean_args or "")
             # 模板里的 {args} 可能为空，需清理多余空白
-            cmd.extend([p for p in shlex.split(rendered, posix=False) if p])
+            parts = [p for p in shlex.split(rendered, posix=False) if p]
+            # {exe} 用占位符还原：exe 路径可能含空格，进 shlex 会被拆碎（审计 P2-1）
+            cmd.extend([tool.executable if p == _EXE_TOKEN else p for p in parts])
         else:
             cmd.append(tool.executable)
             if args:
@@ -306,6 +313,22 @@ class LocalExecutor(Executor):
             return
 
         cmd = self.build_command(tool, target, args)
+
+        # ---- 最终 argv 主机级复核（审计 P0-2/P0-3 的根治层）----
+        # 白名单此前只覆盖 target：args 可走私 --url evil.com（dirsearch 里与 -u 同义，
+        # 后者覆盖前者）；url 型 target 可用「授权域/+空格」夹带第二个目标。此处对
+        # 最终 argv 逐 token 抽主机复核，无论走私走 target、args 还是模板，spawn 前必拦。
+        if config.ENFORCE_SCOPE:
+            bad = first_unauthorized_host_in_argv(cmd)
+            if bad:
+                idx, host = bad
+                yield {"type": "error", "data": (
+                    f"命令行第 {idx + 1} 个参数包含不在授权白名单内的目标「{host or '（无法解析）'}」，"
+                    f"已拒绝执行。args 中不得夹带未授权目标"
+                    f"（当前白名单：{', '.join(load_scope())}）。")}
+                yield {"type": "exit", "code": 126}
+                return
+
         yield {"type": "command", "data": " ".join(f'"{c}"' if " " in c else c for c in cmd)}
 
         env = os.environ.copy()

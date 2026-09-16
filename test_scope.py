@@ -24,6 +24,8 @@ _TMP = Path(tempfile.mkdtemp(prefix="src_agent_scope_test_"))
 _ORIG_SCOPE = config.SCOPE_FILE
 
 from app.executor import _host_in_scope, _target_host, check_scope   # noqa: E402
+from app.scope import (find_hosts, load_scope,                      # noqa: E402
+                       first_unauthorized_host_in_argv)
 
 ok, fail = [], []
 
@@ -127,6 +129,36 @@ for _mod in ("executor", "replayer"):
     _src = (ROOT / "app" / f"{_mod}.py").read_text(encoding="utf-8")
     check(f"{_mod} 不自带白名单实现（只调用 app/scope.py）",
           ("scope.load_scope" in _src) or ("from .scope import" in _src))
+
+config.SCOPE_FILE = _ORIG_SCOPE
+
+# ---- 审计 P0-2/P0-3 绕过用例固化（2026-09-16）：这些形态必须永远被拒绝 ----
+set_scope(["example.com", "jiaoyu.cn"])
+_scope2 = load_scope()
+check("白名单加载非空", bool(_scope2), _scope2)
+
+# P0-3：url 型 target 用「授权域/+空格」夹带第二目标（修复前放行）
+_argv3 = ["tool.exe", "finger", "-u", "https://jiaoyu.cn/", "evil.com"]
+_e3 = first_unauthorized_host_in_argv(_argv3)
+check("P0-3 url 型空格夹带被 argv 复核拦截",
+      _e3 is not None and _e3[1] == "evil.com", _e3)
+# P0-2：args 走私（executor argv 复核层抓，这里验证 find_hosts 抽取正确）
+_hosts = find_hosts("--url https://evil.com")
+check("P0-2 find_hosts 抽出走私主机", "evil.com" in _hosts, _hosts)
+_early = [h for tkn in ("--url", "https://evil.com") for h in find_hosts(tkn)
+          if not _host_in_scope(h, _scope2)]
+check("P0-2 argv 复核能发现越权主机", "evil.com" in _early, _early)
+# 路径形态 token 不得被 find_hosts 抽成主机（避免复核层误杀）
+check("本地路径不产出主机", find_hosts("E:\\tool\\dirsearch.py") == [],
+      find_hosts("E:\\tool\\dirsearch.py"))
+# URL scheme 不得被盘符正则误判成本地路径（复核层曾因此漏检 evil.com）
+check("URL token 不被盘符正则跳过", bool(find_hosts("https://evil.com")))
+# P2-3：尾点 FQDN 归一
+check("P2-3 尾点 FQDN 归一后放行",
+      _host_in_scope(_target_host("www.jiaoyu.cn."), ["jiaoyu.cn"]))
+# 第五节：前导点/后缀变体仍全部拒绝
+for _h in ("evil-jiaoyu.cn", "notjiaoyu.cn", "jiaoyu.cn.evil.com", "www.jiaoyu.cn.evil.com"):
+    check(f"后缀变体拒绝：{_h}", not _host_in_scope(_h, _scope2))
 
 config.SCOPE_FILE = _ORIG_SCOPE
 

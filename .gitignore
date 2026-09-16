@@ -42,3 +42,11 @@ update_backup_*/
 update_state.json
 build/
 update.spec
+
+# ---- 审计 P0-4：敏感数据不得入库（2026-09-16）----
+# scope.json 本机含真实授权靶标，已移出版本控制（模板见 data/scope.example.json）
+data/scope.json
+# 损坏库备份与历史 .git 存档含真实交战数据
+data/*corrupt*
+data/*.bak_*
+.git_broken*/

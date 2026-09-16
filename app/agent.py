@@ -159,6 +159,12 @@ def validate_target(target: str) -> str | None:
         return "目标包含多个空格，疑似自然语言句子"
     if any(p in target for p in _BAD_TARGET_PATTERNS):
         return f"目标包含说明性文字「{target[:30]}」"
+    # URL 形态的目标不允许任何空白（审计 P0-3）：'https://授权域/ evil.com' 这类
+    # 夹带会绕过 target_host（空格落在 path 里）并在渲染后被 shlex 切成第二个目标。
+    # 企业名等非 URL 目标不受影响（中文企业名天然无空白；含空格的英文名仍可走
+    # 企业名扩展工具，此处仅拦 URL 形态）。
+    if "://" in target and re.search(r"\s", target):
+        return "URL 目标中包含空白字符，疑似夹带多个目标"
     return None
 
 
@@ -1111,7 +1117,7 @@ class Agent:
 
     # ---------- 确认流程 ----------
     async def _await_confirm(self, session: Session, step: Step) -> bool:
-        """等待用户对「这一步」放行/拒绝。
+        """等待用户对「这一步」放行/拒绝。L3（double_confirm）强制两轮确认。
 
         session.control 是一条 FIFO 队列，历史实现只取队首、不校验归属，于是：
           · 会话空闲时往 /confirm 发一条 approved=true（接口当时不校验 state），
@@ -1123,14 +1129,34 @@ class Agent:
           ② 取到回应后校验 step_id 是否就是本步，不是则丢弃并继续等（拒绝重放）；
           ③ 无论成功/超时/异常，都在 finally 里复位 state 并**排空队列残留**，
              避免陈旧指令跨步骤累积。
+        审计 P1-1 追加：risk.double_confirm 的步骤（L3）此前「二次确认」只是前端
+        勾选框 UX，服务端一次 approved 即放行。现改为后端强制两轮：第一轮 approved
+        后发出第二个确认框（second=True），第二轮再 approved 才真正放行；
+        任何一轮拒绝/超时都按拒绝处理。
         """
+        if not await self._confirm_round(session, step, second=False):
+            return False
+        if step.risk.get("double_confirm"):
+            if not await self._confirm_round(session, step, second=True):
+                return False
+        return True
+
+    async def _confirm_round(self, session: Session, step: Step, second: bool) -> bool:
+        """单轮确认等待（step_id 严格校验 + 超时 fail-closed + 排空队列）。"""
         session.pending_step_id = step.id
         session.state = "awaiting_confirm"
         await session.emit({
             "type": "need_confirm",
             "step": self._step_dict(step),
             "risk": step.risk,
+            "second": second,
         })
+        if second:
+            await session.emit({
+                "type": "reasoning",
+                "data": f"（{step.tool_name} 为 L3 高危操作，已收到第一次确认，"
+                        "请再次确认以完成二次授权）",
+            })
         approved = False
         try:
             deadline = time.monotonic() + config.CONFIRM_TIMEOUT

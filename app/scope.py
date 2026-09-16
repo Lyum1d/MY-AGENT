@@ -125,7 +125,9 @@ def target_host(target: str) -> str:
     except Exception:
         host = ""
     if host:
-        return host
+        # 尾点 FQDN（'www.jiaoyu.cn.'）会被 urlparse 原样保留，导致子域匹配失败；
+        # 统一去掉尾点（审计 P2-3，方向仍是 fail-closed）
+        return host.rstrip(".")
     # 解析失败：至少去掉端口，避免 "example.com:8080" 这类绕过精确匹配
     return t.split("/", 1)[0].split("@")[-1].split(":")[0]
 
@@ -154,4 +156,36 @@ def check_scope(target: str) -> str | None:
         return (f"目标「{host or target}」不在授权白名单内，已拒绝执行。"
                 f"当前白名单：{', '.join(scope)}。"
                 f"新增授权目标请编辑 data/scope.json。")
+    return None
+
+
+def first_unauthorized_host_in_argv(tokens: list[str]) -> tuple[int, str] | None:
+    """对最终 argv 逐 token 抽主机并过白名单（审计 P0-2/P0-3 的根治层）。
+
+    白名单此前只覆盖 target：args 可走私 --url evil.com，url 型 target 可用
+    「授权域/+空格」夹带第二个目标。本函数对 spawn 前的最终 argv 逐 token
+    复核，无论走私走 target、args 还是模板渲染，都会被拦下。
+
+    返回第一个含越权主机的 (下标, 主机)；全部放行返回 None。
+    argv[0]（解释器/exe 路径）与本地路径形态的 token（盘符/绝对路径）跳过。
+    白名单为空时返回 (1, '')，由调用方按 fail-closed 处理。
+    """
+    scope_list = load_scope()
+    if not scope_list:
+        return 1, ""
+    for i, tok in enumerate(tokens):
+        if i == 0:
+            continue
+        t = (tok or "").strip()
+        if not t:
+            continue
+        # 本地路径形态（盘符 + 斜杠，或以 / 开头的绝对路径）不是测试目标。
+        # ⚠️ 必须 re.match 锚定 token 开头：用 re.search 会把 URL scheme 里的
+        # 's:/'（http**s:/**）误判成盘符，导致所有 http(s) URL token 被跳过、
+        # argv 复核形同虚设（此坑在首次实现时真实踩中）。
+        if re.match(r"[A-Za-z]:[\\/]", t) or t.startswith("/"):
+            continue
+        for h in find_hosts(t):
+            if h in _DENY_HOSTS or not host_in_scope(h, scope_list):
+                return i, h
     return None
