@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -353,11 +354,16 @@ class Session:
     # 当前正在等待用户确认的步骤 id。确认通道是「一次一步」的交互式，
     # 必须有归属才能拒绝「陈旧/伪造/重复」的确认指令（详见 _await_confirm）。
     pending_step_id: str = ""
-    # ---- 取消（v011 P1-5）----
+    # ---- 取消（v011 P1-5 / v012 后半硬终止）----
     # 软取消：在步骤边界与确认等待处响应。正在执行的工具步骤让它跑完
     # （单步本就有总时长上限），不中途硬杀——硬终止需要把取消信号穿透
     # 执行器进程管理，另行迭代。
-    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # ⚠️ 必须用 threading.Event 而不是 asyncio.Event：Session 可能在某个
+    # 事件循环里创建、在另一个循环里运行（adopt 恢复/测试多次 asyncio.run），
+    # asyncio.Event 跨循环 wait 会抛 "bound to a different event loop"
+    # （实测踩中）。threading.Event 的 is_set/set 无循环绑定，执行器侧
+    # 只需轮询 is_set()，完全等价。
+    cancel_event: "threading.Event" = field(default_factory=threading.Event)
     # 事件落库游标：emit 时由 store.save_event 返回并回填到事件里（_seq），
     # 供 SSE 断线重放去重（Last-Event-ID 之后只发增量）。
     last_seq: int = 0
@@ -1492,27 +1498,19 @@ class Agent:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise asyncio.TimeoutError
-                # v011 P1-5：等待确认的同时竞争监听取消请求——用户点了取消
-                # 就不必再干等确认倒计时。取消按拒绝处理（fail-closed 路径）。
-                wait_confirm = asyncio.ensure_future(session.control.get())
-                wait_cancel = asyncio.ensure_future(session.cancel_event.wait())
+                # v011/v012：等待确认的同时响应取消请求。cancel_event 是
+                # threading.Event（无循环绑定），不能进 asyncio.wait——用
+                # 0.1s 分片轮询：每片等确认队列，片间查取消标志。
+                # 取消按拒绝处理（fail-closed 路径）。
                 try:
-                    done, _pending = await asyncio.wait(
-                        {wait_confirm, wait_cancel},
-                        timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
-                finally:
-                    for t in (wait_confirm, wait_cancel):
-                        if not t.done():
-                            t.cancel()
-                if wait_cancel in done and wait_confirm not in done:
-                    logger.info("确认等待期间收到取消请求（session=%s）", session.id)
-                    approved = False
-                    break
-                if wait_confirm in done:
-                    resp = wait_confirm.result()
-                else:
-                    # 超时（两个 future 都没完成）
-                    raise asyncio.TimeoutError
+                    resp = await asyncio.wait_for(session.control.get(),
+                                                  timeout=min(remaining, 0.1))
+                except asyncio.TimeoutError:
+                    if session.cancel_event.is_set():
+                        logger.info("确认等待期间收到取消请求（session=%s）", session.id)
+                        approved = False
+                        break
+                    continue
                 # 严格模式：step_id 必须存在且与本步一致才认，否则丢弃并继续等。
                 # 缺 step_id 的回应一律不放行——宁可等到超时按「拒绝」处理（fail-closed，
                 # 现象可见且可排查），也不接受一条来源不明的放行（fail-open，危险且无声）。
@@ -1584,17 +1582,30 @@ class Agent:
 
         chunks: list[str] = []
         exit_code = None
-        # 内置工具走 app/replayer.py 托管运行器（不 spawn 工具箱子进程）
+        step_cancelled = False
+        # 内置工具走 app/replayer.py 托管运行器（不 spawn 工具箱子进程）；
+        # v012 后半：四个通道全部接入取消硬终止（cancel_event 由用户
+        # /api/sessions/{sid}/cancel 置位）。
         if tool.alias == "httpreplay":
-            gen = replayer.run_replay(step.target, step.args)
+            gen = replayer.run_replay(step.target, step.args,
+                                      cancel_event=session.cancel_event)
         elif tool.alias == "nuclei_cli":
-            gen = replayer.run_nuclei(tool, step.target, step.args)
+            gen = replayer.run_nuclei(tool, step.target, step.args,
+                                      cancel_event=session.cancel_event)
         elif tool.alias == "py_exec":
-            gen = pyexec.run_py_exec(step.args, step.target)
+            gen = pyexec.run_py_exec(step.args, step.target,
+                                     cancel_event=session.cancel_event)
         else:
-            gen = executor.run(tool, step.target, step.args)
+            gen = executor.run(tool, step.target, step.args,
+                               cancel_event=session.cancel_event)
         async for ev in gen:
             etype = ev.get("type")
+            if etype == "cancelled":
+                step_cancelled = True
+                chunks.append(f"[取消] {ev['data']}")
+                await session.emit({"type": "output", "step_id": step.id,
+                                    "data": f"[取消] {ev['data']}"})
+                continue
             if etype == "output":
                 chunks.append(ev["data"])
                 await session.emit({"type": "output", "step_id": step.id, "data": ev["data"]})
@@ -1616,6 +1627,16 @@ class Agent:
         # 于是 _attribute_failure 里那档 SCOPE（要求停手、别换参数绕过）永远送不到模型，
         # 模型就会一直换参数去撞授权墙——与设计意图正好相反。
         denied_by_scope = exit_code == 126
+        # v012 后半：被取消的步骤不算失败也不回喂模型——外层循环的取消检查
+        # 会立即收尾（persist_interrupted），这里只保证状态落库正确。
+        if step_cancelled:
+            step.status = "cancelled"
+            await session.emit({"type": "step_done", "step": self._step_dict(step)})
+            try:
+                store.save_step(session.id, self._step_dict(step))
+            except Exception:
+                pass
+            return
         # 部分工具退出码不可信（如 EHole：没命中「重点资产」就返回 1，
         # 但其实已经把指纹打出来了）。有实质输出就按成功算，否则会把成功误判为失败。
         # 注意：`[错误]` 开头的行是执行器自己的报错，不算「实质输出」。

@@ -247,7 +247,7 @@ def _scope_check_target(target: str) -> str | None:
     return None
 
 
-async def run_py_exec(code: str, target: str = "") -> AsyncIterator[dict]:
+async def run_py_exec(code: str, target: str = "", cancel_event=None) -> AsyncIterator[dict]:
     """执行一段 Python 代码，产出与 executor 一致的事件流。
 
     yield: {"type": "output"|"error"|"exit", "data":..., "code":...}
@@ -317,10 +317,24 @@ async def run_py_exec(code: str, target: str = "") -> AsyncIterator[dict]:
         yield {"type": "output", "data": "#（提示）Job Object 不可用，超时将用 taskkill 杀树兜底"}
     deadline = time.monotonic() + config.PY_EXEC_TIMEOUT
     timed_out = False
+    cancelled = False
     _buf = b""   # 审计 P2-2：定长 read 的行缓冲（替代 readline，避免 64KB 单行炸通道）
     try:
         # 逐行流式回传；超时则中断并保留已回传部分
         while True:
+            # v012 后半：取消硬终止——Job Object 关句柄即终止整树
+            if cancel_event is not None and cancel_event.is_set():
+                job.close()
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                if not tree_killed_by_job:
+                    _kill_tree_fallback(proc.pid)
+                timed_out = False
+                cancelled = True
+                yield {"type": "cancelled", "data": "已收到取消请求，代码执行已终止（整棵进程树）"}
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
@@ -371,7 +385,9 @@ async def run_py_exec(code: str, target: str = "") -> AsyncIterator[dict]:
             if os.name == "nt":
                 _kill_tree_fallback(proc.pid)
         shutil.rmtree(workdir, ignore_errors=True)
-    if not timed_out:
+    if cancelled:
+        yield {"type": "exit", "code": 130}   # 130 = SIGINT 语义，区别于超时 124 / 越权 126
+    elif not timed_out:
         yield {"type": "exit", "code": rc}
     else:
         yield {"type": "exit", "code": 124}

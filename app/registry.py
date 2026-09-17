@@ -42,6 +42,8 @@ class Tool:
     caveat: str = ""                # 已知注意事项，会写进给模型的工具说明
     allowed_flags: list = field(default_factory=list)  # 合法旗标白名单（为空=不校验）
     value_flags: list = field(default_factory=list)    # 其中需要吞掉下一个 token 的取值旗标
+    disallowed_flags: list = field(default_factory=list)  # 明确禁止的旗标黑名单（v012 P2-2），命中即剔除并记录
+    target_type: str = ""                              # target 形态声明（v012 P2-2）：url|domain|host，空=不校验
     stdin_input: str = ""               # 启动时写入子进程 stdin 的内容（用于绕开交互式提问）
 
     def to_dict(self) -> dict[str, Any]:
@@ -205,6 +207,10 @@ class ToolRegistry:
                 tool.caveat = ov.get("caveat", "") or ""
                 tool.allowed_flags = list(ov.get("allowed_flags") or [])
                 tool.value_flags = list(ov.get("value_flags") or [])
+                # v012 P2-2：manifest 渐进版——disallowed_flags 黑名单与
+                # target_type 形态声明（url|domain|host），均从 overrides 读入
+                tool.disallowed_flags = list(ov.get("disallowed_flags") or [])
+                tool.target_type = str(ov.get("target_type") or "").strip().lower()
                 tool.stdin_input = ov.get("stdin_input", "") or ""
 
             if scriptable:
@@ -520,8 +526,17 @@ class ToolRegistry:
             full = f"{t.name}（{t.category}）：{desc}。风险等级 {t.risk_level}。"
             if t.caveat:
                 full += f"注意：{t.caveat}"
+            # v012 P2-2：target 形态声明写进模型说明，从源头减少参数幻觉
+            if t.target_type == "url":
+                full += "target 必须是完整 URL（带 http:// 或 https://）。"
+            elif t.target_type == "domain":
+                full += "target 必须是裸域名（不要带协议或路径）。"
+            elif t.target_type == "host":
+                full += "target 必须是域名或 IP（不要带协议、路径或端口）。"
             if t.allowed_flags:
                 full += "合法参数（args 只允许使用这些旗标，其余会被自动丢弃）：" + ", ".join(sorted(set(t.allowed_flags))) + "。"
+            if t.disallowed_flags:
+                full += "禁止使用以下旗标（会被自动剔除）：" + ", ".join(t.disallowed_flags) + "。"
             schemas.append(
                 {
                     "type": "function",

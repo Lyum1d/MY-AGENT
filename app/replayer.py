@@ -104,9 +104,14 @@ def _parse_args(args: str) -> tuple[str, list[tuple[str, str]], dict[str, str], 
 
 
 # ---------- 主入口 ----------
-async def run_replay(url: str, args: str = ""):
+async def run_replay(url: str, args: str = "", cancel_event=None):
     """HTTP 重放器事件流。事件格式与 executor.run 一致。"""
     url = (url or "").strip().strip("'\"")
+    # v012 后半：取消硬终止——发请求前检查，置位即放弃本次请求
+    if cancel_event is not None and cancel_event.is_set():
+        yield {"type": "cancelled", "data": "已收到取消请求，已跳过本次请求"}
+        yield {"type": "exit", "code": 0}
+        return
     yield {"type": "tool", "data": "HTTP 重放器"}
 
     # 1. URL 合法性
@@ -192,7 +197,7 @@ async def run_replay(url: str, args: str = ""):
 
 
 # ---------- nuclei 托管运行 ----------
-async def run_nuclei(tool, target: str, args: str = ""):
+async def run_nuclei(tool, target: str, args: str = "", cancel_event=None):
     """运行 data/bin/nuclei.exe（若存在）。与 executor 相同的事件流格式。"""
     exe = tool.executable
     yield {"type": "tool", "data": "Nuclei CLI"}
@@ -237,6 +242,21 @@ async def run_nuclei(tool, target: str, args: str = ""):
     lines = 0
     truncated = False
     while True:
+        # v012 后半：取消硬终止（与 executor.run 相同语义）
+        if cancel_event is not None and cancel_event.is_set():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                import subprocess as _sp
+                _sp.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                        capture_output=True, timeout=10,
+                        creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+            except Exception:
+                pass
+            yield {"type": "cancelled", "data": "已收到取消请求，nuclei 进程已终止"}
+            break
         remaining = deadline - time.time()
         if remaining <= 0:
             proc.kill()
