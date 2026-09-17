@@ -139,7 +139,7 @@ check("溯源命中的步骤 -> 事实 生成 REVEALS 边",
           and e["label"] == "REVEALS" for e in cg["edges"]),
       [e["label"] for e in cg["edges"]])
 
-store.delete_fact(fact["id"])
+store.delete_fact(pid, fact["id"])   # v010 P1-3：签名改为 (project_id, fid)
 graph.on_fact_deleted(pid, fact["id"])
 check("删除事实后节点被清理", store.get_causal_node(pid, f"fact:{fact['id']}") is None)
 

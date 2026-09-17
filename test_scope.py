@@ -162,6 +162,52 @@ for _h in ("evil-jiaoyu.cn", "notjiaoyu.cn", "jiaoyu.cn.evil.com", "www.jiaoyu.c
 
 config.SCOPE_FILE = _ORIG_SCOPE
 
+# ---- v010 目标列表文件内容校验（P0-2 收窄后的剩余真空）----
+# argv 复核看不到 -l/--list/--urls/--input 指向的文件**内容**——列表里写
+# evil.com 即可绕过全部校验。这组用例钉住 first_unauthorized_target_list_in_argv。
+from app.scope import first_unauthorized_target_list_in_argv   # noqa: E402
+
+set_scope(["example.com", "jiaoyu.cn"])
+_lf = _TMP / "targets.txt"
+
+_lf.write_text("https://jiaoyu.cn\nhttps://example.com/admin\n", encoding="utf-8")
+check("列表文件全授权 → 放行",
+      first_unauthorized_target_list_in_argv(
+          ["nuclei", "-l", str(_lf)]) is None)
+
+_lf.write_text("jiaoyu.cn\nevil.com\nsub.example.com\n", encoding="utf-8")
+check("列表文件含未授权域名 → 拦截 evil.com",
+      first_unauthorized_target_list_in_argv(
+          ["nuclei", "-l", str(_lf)]) == ("-l", "evil.com"))
+
+_lf.write_text("# 注释行\nhttp://jiaoyu.cn:8443/x\n192.168.1.10\n", encoding="utf-8")
+check("列表文件含未授权 IP → 拦截",
+      first_unauthorized_target_list_in_argv(
+          ["httpx", "--list", str(_lf)]) == ("--list", "192.168.1.10"))
+
+check("无列表参数 → 放行",
+      first_unauthorized_target_list_in_argv(
+          ["nuclei", "-u", "https://jiaoyu.cn/"]) is None)
+check("列表旗标后无值 → 放行（交工具自行报错）",
+      first_unauthorized_target_list_in_argv(
+          ["nuclei", "-l", "-t", "cves"]) is None)
+check("文件不存在 → 放行（执行时工具自然失败）",
+      first_unauthorized_target_list_in_argv(
+          ["nuclei", "-l", str(_TMP / "no_such.txt")]) is None)
+check("白名单为空 → fail-closed（返回空元组）",
+      (first_unauthorized_target_list_in_argv.__doc__ or "").find("fail-closed") >= 0)
+
+_lf.write_text("a" * (2 * 1024 * 1024), encoding="utf-8")
+check("超大列表文件 → 按 <oversized> 拒绝",
+      first_unauthorized_target_list_in_argv(
+          ["nuclei", "-l", str(_lf)]) == ("-l", "<oversized>"))
+
+# executor 接入断言：最终 argv 复核后必须跟一条列表文件复核
+check("executor.run 已接入目标列表文件复核",
+      "first_unauthorized_target_list_in_argv(cmd)" in src)
+
+config.SCOPE_FILE = _ORIG_SCOPE
+
 print(f"\n{'=' * 56}")
 print(f"  通过 {len(ok)} 项，失败 {len(fail)} 项")
 for name in fail:

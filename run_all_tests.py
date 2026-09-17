@@ -27,6 +27,18 @@ import time
 import urllib.request
 from pathlib import Path
 
+# Windows GBK 控制台乱码快修（v010）：测试脚本全 UTF-8 输出。
+# 背景：默认 stdout 编码跟控制台代码页（GBK/cp936）走，带中文/框线的测试
+#   输出会变成乱码，甚至让人把「乱码」误判成「异常」。三层保险：
+#   ① 本进程 stdout/stderr 强制 UTF-8；
+#   ② 环境变量 PYTHONIOENCODING=utf-8 —— 子套件进程继承（见下方 subprocess 调用）；
+#   ③ 子进程命令行统一带 -X utf8。
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
 ROOT = Path(__file__).resolve().parent
 PORT = 8770
 BASE = f"http://127.0.0.1:{PORT}"
@@ -44,6 +56,9 @@ KNOWN_ENV_FAIL = "命中关键词时会路由到 deepseek 供应商"
 PY_TESTS = [
     # 授权红线排第一：越权是本项目最不能接受的失败，宁可它先红
     ("授权白名单（安全红线）", "test_scope.py", False),
+    ("py_exec 沙箱（v010 P0-1）", "test_sandbox.py", False),
+    ("云端外发脱敏（v010 P0-4）", "test_redact.py", False),
+    ("数据归属校验（v010 P1-3）", "test_ownership.py", False),
     ("工具分级与配置一致性（第二道闸门）", "test_registry.py", False),
     ("代码执行通道 py_exec（L3）", "test_pyexec.py", False),
     ("HTTP 重放器（授权与只读）", "test_replayer.py", False),
@@ -192,6 +207,10 @@ def run_cmd(args: list[str], timeout: int = 600) -> tuple[int, str]:
     # 探测 localhost 时别让代理插一脚
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         env.pop(k, None)
+    # 子套件强制 UTF-8（v010）：PYTHONIOENCODING 已在模块顶部 setdefault；
+    # python 命令行统一加 -X utf8（双保险）
+    if args and args[0].lower().endswith(("python.exe", "python")):
+        args = list(args) + ["-X", "utf8"]
     try:
         p = subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout, env=env)

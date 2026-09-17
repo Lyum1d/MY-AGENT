@@ -24,6 +24,7 @@ from typing import AsyncIterator
 from . import config
 from .registry import Tool
 from .scope import check_scope, first_unauthorized_host_in_argv
+from .scope import first_unauthorized_target_list_in_argv
 from .scope import load_scope
 # 向后兼容别名：白名单逻辑已收敛到 app/scope.py（唯一实现），
 # 但 test_scope.py / test_replayer.py 等既有套件是按历史名字导入的，
@@ -326,6 +327,18 @@ class LocalExecutor(Executor):
                     f"命令行第 {idx + 1} 个参数包含不在授权白名单内的目标「{host or '（无法解析）'}」，"
                     f"已拒绝执行。args 中不得夹带未授权目标"
                     f"（当前白名单：{', '.join(load_scope())}）。")}
+                yield {"type": "exit", "code": 126}
+                return
+            # ---- 目标列表文件内容复核（v010）----
+            # argv 逐 token 复核看不到 -l/--list/--urls/--input 指向的文件**内容**；
+            # 列表里写 evil.com 即可绕过上面的全部校验。这里对列表文件逐行过白名单。
+            bad_list = first_unauthorized_target_list_in_argv(cmd)
+            if bad_list:
+                flag, host = bad_list
+                yield {"type": "error", "data": (
+                    f"目标列表参数 {flag} 指向的文件中包含不在授权白名单内的目标"
+                    f"「{host}」，已拒绝执行。目标列表文件内的每个目标都必须在"
+                    f"授权白名单内（当前白名单：{', '.join(load_scope())}）。")}
                 yield {"type": "exit", "code": 126}
                 return
 

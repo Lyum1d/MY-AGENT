@@ -171,3 +171,30 @@ ENFORCE_SCOPE = os.getenv("ENFORCE_SCOPE", "1") == "1"
 PY_EXEC_TIMEOUT = int(os.getenv("PY_EXEC_TIMEOUT", "90"))    # 单段代码上限（秒），超时中断
 PY_EXEC_MAX_CHARS = 6000    # 单段代码最大字符数
 PY_EXEC_DIR = DATA_DIR / "scripts" / "exec"  # 代码留档目录（按目标分子目录）
+
+# ---- py_exec 沙箱（v010 P0-1：进程级隔离）----
+# 背景：py_exec 在宿主解释器里执行模型直出的任意 Python，此前 env=os.environ
+#   完整继承宿主环境——DeepSeek/FOFA/代理凭据等全部对子进程可见，且 proc.kill()
+#   只杀直接子进程，脚本再起的子进程会残留。
+# 沙箱分级实现（容器/受控代理属架构级方案，另行规划）：
+#   ① 环境变量白名单：子进程只继承下方内置白名单 + 用户扩展文件里的变量；
+#   ② 临时工作目录：执行 cwd 用一次性临时目录，结束后清理（留档仍在 PY_EXEC_DIR）；
+#   ③ Windows Job Object：KILL_ON_JOB_CLOSE —— 超时/异常关闭句柄即终止整棵进程树。
+# PY_EXEC_ENV_ALLOW_JSON：用户可扩展的「允许继承」变量名清单（JSON 数组，可选）。
+#   为什么不做成 data/*.json 强制项：允许哪些变量是本机个性化配置（如某些脚本
+#   需要 HTTP_PROXY 走 Burp），做成「缺省内置 + 用户可选扩展」最省事且不影响他人。
+PY_EXEC_ENV_ALLOW_JSON = DATA_DIR / "pyexec_env_allow.json"
+PY_EXEC_TMP_ROOT = DATA_DIR / "scripts" / "tmp"   # 一次性工作目录的父目录（自动创建）
+
+# ---------- 云端外发控制（v010 P0-4） ----------
+# 背景：默认路由是「云端优先」（见 _pick_default 注释），工具输出里的 Cookie、
+#   Authorization、内网路径、凭据会原样进入 LLM 请求。漏洞类任务几乎必然触碰
+#   这些内容，等于把目标站点的会话凭据交给云端供应商。
+# 模式（环境变量 AGENT_CLOUD_EGRESS，默认 redact）：
+#   local_only —— 一切请求只允许本地供应商；选中云端时直接拒绝并提示切换本地。
+#   redact     —— 允许上云，但发送前对 messages 做脱敏（Cookie/Bearer/JWT/
+#                 password= 形态键值对/邮箱/手机号），并记录命中摘要到日志。
+#   allow      —— 不做任何处理（仅在你明确知道并接受外发风险时使用）。
+# 注意：脱敏作用于**发往云端的那份副本**，session.messages 原文不受影响，
+#   本地供应商（local=True）不经过脱敏（数据不出本机）。
+CLOUD_EGRESS_MODE = os.getenv("AGENT_CLOUD_EGRESS", "redact").strip().lower()

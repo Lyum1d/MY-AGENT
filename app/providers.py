@@ -18,7 +18,7 @@ import re
 import uuid
 from typing import Any
 
-from . import config
+from . import config, redact
 
 STORE_VERSION = 1
 
@@ -223,6 +223,10 @@ def _pick_default(providers: list[dict]) -> str:
     全新安装且未填任何 Key 时，第 2/3 步都落空于云端，最终仍会选到 ollama，不会变砖。
     """
     usable = [p for p in providers if _usable(p)]
+    # 云端外发策略 local_only（v010 P0-4）：默认路由跳过一切云端供应商，
+    # 只在本地供应商里挑。redact/allow 模式不改变「云端优先」的既有顺序。
+    if not redact.cloud_allowed():
+        usable = [p for p in usable if p.get("local")]
     pref = (config.PREFERRED_PROVIDER or "").strip()
     if pref:
         for p in usable:
