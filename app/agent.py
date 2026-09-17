@@ -571,9 +571,15 @@ class Agent:
         # 注入项目情报库：历史会话沉淀的子域/API/技术栈，避免重复收集
         if session.project:
             system += format_intel(store.get_intel(session.project))
-            # 注入已证事实库（note_fact / 人工登记），已证实内容无需重复验证
+            # 注入已证事实库（note_fact / 人工登记），已证实内容无需重复验证。
+            # v012 P1-1：只注入 verified——candidate（AI 记录且无溯源背书）不能
+            # 冒充「已证」喂回给模型自我强化；数量附在提示里供 review。
             try:
-                _facts = store.list_facts(session.project)
+                _all_facts = store.list_facts(session.project)
+                _facts = [f for f in _all_facts
+                          if (f.get("status") or "verified") == "verified"]
+                _cand_n = sum(1 for f in _all_facts
+                              if f.get("status") == "candidate")
                 if _facts:
                     _fl = "\n".join(f"- {f['content']}" for f in _facts[:FACT_INJECT_MAX])
                     if len(_facts) > FACT_INJECT_MAX:
@@ -581,6 +587,9 @@ class Agent:
                         # 也没动机去检索，于是会重复收集已经查过的东西。
                         _fl += (f"\n（另有 {len(_facts) - FACT_INJECT_MAX} 条未展示；"
                                 f"需要时用 search_history 按关键词检索事实库）")
+                    if _cand_n:
+                        _fl += (f"\n（另有 {_cand_n} 条候选事实待人工复核，"
+                                f"不得直接当作已证结论引用）")
                     system += (
                         "\n\n【已证事实库（工具输出已证实，可直接引用、不得推翻或重复验证；"
                         "报告中基于这些事实组织结论）】\n" + _fl
@@ -1304,17 +1313,30 @@ class Agent:
                 r = kb.read(arg)
                 note = f"【{r.get('file', arg)}】\n{r.get('content') or r.get('error', '')}"
             else:  # fofa_search
-                r = await fofa.search(arg)
-                if r.get("error"):
-                    note = f"FOFA 查询失败：{r['error']}"
+                # v012 P2-3：FOFA 是全网测绘，查询词里没有任何授权主机就等于
+                # 在授权范围外收集资产。要求查询语句至少包含一个授权白名单
+                # 内的主机（domain="..." 里的种子），否则拒绝执行该次查询。
+                from .scope import check_scope, find_hosts
+                _q_hosts = [h for h in find_hosts(arg)
+                            if check_scope(h) is None and h not in
+                            ("localhost", "0.0.0.0")]
+                if not _q_hosts:
+                    note = ("FOFA 查询被拒绝：查询语句中未包含任何授权白名单内的主机。"
+                            "请在 domain/host 参数中使用已获书面授权的目标"
+                            "（见项目授权信息），不要查询授权范围之外的资产。")
                 else:
-                    body = "\n".join(
-                        f"- {x.get('host', '')} | {x.get('ip', '')}:{x.get('port', '')}"
-                        f" | {(x.get('title') or '')[:40]} | {(x.get('server') or '')[:30]}"
-                        for x in r.get("results", [])
-                    )
-                    note = (f"FOFA 查询「{r['query']}」返回 {r['count']} 条（消耗 F点：{r.get('consumed_fpoint', '?')}）：\n{body}"
-                            "\n按「一种子闭环」：把这些活面挖完再查下一个种子。")
+                    r = await fofa.search(arg)
+                    if r.get("error"):
+                        note = f"FOFA 查询失败：{r['error']}"
+                    else:
+                        body = "\n".join(
+                            f"- {x.get('host', '')} | {x.get('ip', '')}:{x.get('port', '')}"
+                            f" | {(x.get('title') or '')[:40]} | {(x.get('server') or '')[:30]}"
+                            for x in r.get("results", [])
+                        )
+                        note = (f"FOFA 查询「{r['query']}」返回 {r['count']} 条（消耗 F点：{r.get('consumed_fpoint', '?')}）：\n{body}"
+                            "\n按「一种子闭环」：把这些活面挖完再查下一个种子。"
+                            "\n（注意：返回结果仅授权域名的资产可直接测试，其他资产仅作参考）")
         except Exception as e:
             note = f"{alias} 执行异常：{e}"
             logger.exception("%s 执行异常", alias)

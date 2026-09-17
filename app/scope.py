@@ -96,18 +96,72 @@ def find_hosts(text: str) -> list[str]:
 
 
 def load_scope() -> list[str]:
-    """读取授权白名单。文件缺失或解析失败返回空列表（长度 0 = 未配置任何授权）。"""
+    """读取授权白名单的**主机合并视图**：domains 数组 + targets[].host 合并去重。
+
+    v012 P2-3 起支持结构化 targets 写法——所有既有的主机级校验
+    （check_scope / argv 逐 token 复核 / 目标列表文件 / py_exec）都消费本函数，
+    因此结构化条目的 host 自动获得与 domains 同等的白名单资格；
+    端口/协议细粒度限制由 check_scope 额外处理。
+    文件缺失或解析失败返回空列表（长度 0 = 未配置任何授权）。
+    """
+    entries = _read_scope_raw()
+    if entries is None:
+        return []
+    hosts: list[str] = []
+    for e in entries:
+        if e["host"] not in hosts:
+            hosts.append(e["host"])
+    return hosts
+
+
+def _read_scope_raw() -> list[dict] | None:
+    """读原始 scope.json 并归一化为结构化条目；文件缺失/解析失败返回 None。"""
     p = config.SCOPE_FILE
     if not p.exists():
-        return []
+        return None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return []
+        return None
+    out: list[dict] = []
     domains = data.get("domains", [])
-    if not isinstance(domains, list):
-        return []
-    return [d.strip().lower() for d in domains if isinstance(d, str) and d.strip()]
+    if isinstance(domains, list):
+        for d in domains:
+            if isinstance(d, str) and d.strip():
+                out.append({"host": d.strip().lower(), "ports": None, "schemes": None})
+    for t in (data.get("targets") or []):
+        if not isinstance(t, dict):
+            continue
+        host = str(t.get("host") or "").strip().lower()
+        if not host:
+            continue
+        ports = t.get("ports")
+        schemes = t.get("schemes")
+        try:
+            ports_set = {int(x) for x in ports} if isinstance(ports, list) and ports else None
+        except (TypeError, ValueError):
+            ports_set = None
+        out.append({
+            "host": host,
+            "ports": ports_set,
+            "schemes": {str(x).strip().lower() for x in schemes}
+                       if isinstance(schemes, list) and schemes else None,
+        })
+    return out
+
+
+def load_scope_targets() -> list[dict]:
+    """读取结构化授权条目（v012 P2-3）。
+
+    scope.json 支持两种写法（可混用）：
+      {"domains": ["example.com", ...]}                     —— 旧写法，主机级，端口/协议不限
+      {"targets": [{"host": "example.com", "ports": [80, 443],
+                    "schemes": ["https"]}, ...]}            —— 新写法，可限定端口/协议
+    归一化输出：[{host, ports(set|None), schemes(set|None)}]；
+    ports/schemes 未声明 = 不限（向后兼容：旧 domains 的效果）。
+    """
+    entries = _read_scope_raw()
+    return entries if entries is not None else []
 
 
 def target_host(target: str) -> str:
@@ -146,7 +200,14 @@ def host_in_scope(host: str, scope: list[str]) -> bool:
 
 
 def check_scope(target: str) -> str | None:
-    """校验 target 是否在授权白名单内。返回 None 表示放行，否则返回拒绝原因。"""
+    """校验 target 是否在授权白名单内。返回 None 表示放行，否则返回拒绝原因。
+
+    v012 P2-3：scope.json 里条目声明了 ports/schemes 时，target 里的端口与
+    协议也一并校验（host 命中但端口/协议不在授权列表 → 拒绝）；
+    条目未声明则不限制（完全向后兼容旧的 domains 写法）。
+    无法从 target 解析出端口/协议时按「未指定」放行（工具会在连接层报错，
+    授权层不做猜测——猜错方向的授权比不授权更危险）。
+    """
     host = target_host(target)
     scope = load_scope()
     if not scope:
@@ -157,7 +218,45 @@ def check_scope(target: str) -> str | None:
         return (f"目标「{host or target}」不在授权白名单内，已拒绝执行。"
                 f"当前白名单：{', '.join(scope)}。"
                 f"新增授权目标请编辑 data/scope.json。")
+    # ---- 端口/协议细粒度校验（仅当 host 命中的条目声明了 ports/schemes）----
+    port, scheme = _parse_port_scheme(target)
+    if port is not None or scheme is not None:
+        for entry in load_scope_targets():
+            if not host_in_scope(host, [entry["host"]]):
+                continue
+            if entry["ports"] is not None and port is not None and port not in entry["ports"]:
+                return (f"目标「{host}:{port}」的端口不在授权范围内"
+                        f"（授权端口：{sorted(entry['ports'])}），已拒绝执行。")
+            if (entry["schemes"] is not None and scheme is not None
+                    and scheme not in entry["schemes"]):
+                return (f"目标「{scheme}://{host}」的协议不在授权范围内"
+                        f"（授权协议：{sorted(entry['schemes'])}），已拒绝执行。")
     return None
+
+
+def _parse_port_scheme(target: str) -> tuple[int | None, str | None]:
+    """从 target 提取 (端口, 协议)。解析不出返回 (None, None)。"""
+    t = (target or "").strip().lower()
+    if not t:
+        return None, None
+    scheme = None
+    port = None
+    if "://" in t:
+        scheme = t.split("://", 1)[0] or None
+    try:
+        u = urlparse(t if "://" in t else "http://" + t)
+        scheme = scheme or (u.scheme or None)
+        if u.port:
+            port = int(u.port)
+    except ValueError:
+        # host:port 形态：urlparse 对裸 host:port 的 .port 会抛 ValueError
+        if ":" in t and "/" not in t:
+            tail = t.rsplit(":", 1)[-1]
+            if tail.isdigit():
+                port = int(tail)
+    except Exception:
+        pass
+    return port, scheme
 
 
 def first_unauthorized_host_in_argv(tokens: list[str]) -> tuple[int, str] | None:
