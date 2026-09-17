@@ -21,6 +21,11 @@ from app.registry import registry                         # noqa: E402
 _TMP = Path(tempfile.mkdtemp(prefix="src_agent_kb_test_"))
 store.DB_PATH = _TMP / "test_kb.db"
 config.LLM_PROVIDERS_FILE = _TMP / "providers_test.json"
+# v012：fofa_search 增加授权约束（查询词必须含白名单主机）——本套件必须
+# 改道 SCOPE_FILE 到临时文件并放行 example.com，否则会依赖本机真实
+# data/scope.json（里面有真实授权靶标、没有 example.com），测试既脆弱又危险。
+config.SCOPE_FILE = _TMP / "scope_test.json"
+config.SCOPE_FILE.write_text('{"domains": ["example.com"]}', encoding="utf-8")
 providers.invalidate()
 store.init_db()
 registry.load()

@@ -102,11 +102,15 @@ empty_md = report.render_project_report(pid)
 check("无漏洞时如实说明（不编造）", "暂无已确认的漏洞" in empty_md)
 check("报告带授权声明", "书面授权" in empty_md)
 
-store.add_finding(pid, "低危漏洞", "低危", "demo.example.com", detail="低危详情")
+# v012 P1-1：报告的「已确认漏洞」章节只收 status=confirmed——这 4 条模拟
+# 人工确认后的状态；AI 默认登记是 draft，会进附录（见 test_evidence.py）。
+store.add_finding(pid, "低危漏洞", "低危", "demo.example.com", detail="低危详情",
+                  status="confirmed")
 store.add_finding(pid, "严重漏洞", "严重", "demo.example.com",
-                  detail="严重详情", evidence="curl -i http://demo.example.com/ -> 200 root")
-store.add_finding(pid, "高危漏洞", "高危", "demo.example.com")
-store.add_finding(pid, "等级缺失漏洞", "", "demo.example.com")
+                  detail="严重详情", evidence="curl -i http://demo.example.com/ -> 200 root",
+                  status="confirmed")
+store.add_finding(pid, "高危漏洞", "高危", "demo.example.com", status="confirmed")
+store.add_finding(pid, "等级缺失漏洞", "", "demo.example.com", status="confirmed")
 
 md = report.render_project_report(pid)
 order = [m for m in re.findall(r"\|\s*\d+\s*\|\s*([^|]+?)\s*\|", md)]
@@ -114,11 +118,13 @@ check("漏洞按危害等级排序（严重在最前）",
       order[0] == "严重漏洞" if order else False, order[:4])
 check("等级缺失的漏洞排在最后而不是崩掉",
       "等级缺失漏洞" in order and order[-1] == "等级缺失漏洞", order[-3:])
-check("漏洞清单是表格且含目标列", "| 序号 | 漏洞名称 | 危害等级 | 影响目标 |" in md)
+# v012 P1-2：清单升级为 5 列（新增「类型」列，单元格转义）
+check("漏洞清单是表格且含目标列",
+      "| 序号 | 漏洞名称 | 类型 | 危害等级 | 影响目标 |" in md)
 check("漏洞详情带复现证据（补天格式要求）", "```" in md and "curl -i" in md)
 check("漏洞详情带修复建议", "修复建议" in md)
-check("漏洞数量统计正确", "**漏洞数量**：4" in md,
-      [l for l in md.splitlines() if "漏洞数量" in l])
+check("漏洞数量统计正确（v012 改为已确认/候选两行）", "**已确认漏洞**：4" in md,
+      [l for l in md.splitlines() if "已确认" in l])
 
 print("=== 6. 报告导出 ===")
 path = report.export_report(pid)

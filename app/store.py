@@ -211,6 +211,22 @@ def init_db() -> None:
             exist = {r["name"] for r in c.execute(f"PRAGMA table_info({tbl})").fetchall()}
             if col not in exist:
                 c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ddl}")
+        # v012 P1-1：事实/漏洞状态模型 + 漏洞结构化字段。
+        # 存量数据一律视为已验证（保持旧行为）；新增记录由写入方按来源定状态。
+        for tbl, col, ddl in (
+            ("facts", "status", "TEXT DEFAULT 'verified'"),
+            ("findings", "status", "TEXT DEFAULT 'draft'"),
+            ("findings", "vuln_type", "TEXT DEFAULT ''"),
+            ("findings", "cwe", "TEXT DEFAULT ''"),
+            ("findings", "cvss", "TEXT DEFAULT ''"),
+            ("findings", "impact_scope", "TEXT DEFAULT ''"),
+            ("findings", "reproduction", "TEXT DEFAULT ''"),
+            ("findings", "remediation", "TEXT DEFAULT ''"),
+            ("findings", "review_note", "TEXT DEFAULT ''"),
+        ):
+            exist = {r["name"] for r in c.execute(f"PRAGMA table_info({tbl})").fetchall()}
+            if col not in exist:
+                c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ddl}")
         # 服务重启后内存里的运行态会话已丢，落库的 running 状态会永远卡住，
         # 这里统一标记为 interrupted，避免前端显示「执行中」的僵尸会话。
         # awaiting_confirm 同理（确认通道随进程消失，不可能再有人回应）。
@@ -681,18 +697,52 @@ def clear_usage(days: int = 0) -> int:
 
 # ---------- 漏洞发现 ----------
 def add_finding(project_id: str, title: str, severity: str, target: str,
-                detail: str = "", evidence: str = "", session_id: str = "") -> dict:
+                detail: str = "", evidence: str = "", session_id: str = "",
+                status: str = "draft", vuln_type: str = "", cwe: str = "",
+                cvss: str = "", impact_scope: str = "", reproduction: str = "",
+                remediation: str = "") -> dict:
+    """登记漏洞发现（v012 P1-1 状态模型）。
+
+    status：draft（候选，默认——AI 与首次登记都是候选）| needs_review |
+            confirmed（人工确认，可进正式报告）| closed。
+    「AI 只能产候选」由默认值保证：调用方不显式传 confirmed 就进不了报告的
+    已确认章节。结构化字段（vuln_type/cwe/cvss/...）供报告增强使用。
+    """
     fid = uuid.uuid4().hex[:12]
     with _db() as c:
         c.execute(
             "INSERT INTO findings (id,project_id,title,severity,target,detail,evidence,"
-            "session_id,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            "session_id,created_at,status,vuln_type,cwe,cvss,impact_scope,reproduction,"
+            "remediation) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (fid, project_id, title, severity, target, detail, evidence, session_id,
-             time.time()),
+             time.time(), status, vuln_type, cwe, cvss, impact_scope, reproduction,
+             remediation),
         )
     return {"id": fid, "project_id": project_id, "title": title, "severity": severity,
             "target": target, "detail": detail, "evidence": evidence,
-            "session_id": session_id}
+            "session_id": session_id, "status": status, "vuln_type": vuln_type,
+            "cwe": cwe, "cvss": cvss, "impact_scope": impact_scope,
+            "reproduction": reproduction, "remediation": remediation}
+
+
+def review_finding(project_id: str, fid: str, action: str, note: str = "") -> dict | None:
+    """人工复核漏洞发现（v012 P1-1）：AI 只能产候选，确认/否决必须由人完成。
+
+    action：confirmed（确认，进正式报告）| needs_review（转待复核）|
+            closed（关闭/误报）| draft（退回候选）。
+    归属校验同 delete_finding：WHERE 双条件，跨项目返回 None。
+    """
+    if action not in ("confirmed", "needs_review", "closed", "draft"):
+        return None
+    with _db() as c:
+        cur = c.execute(
+            "UPDATE findings SET status=?, review_note=? WHERE id=? AND project_id=?",
+            (action, note, fid, project_id),
+        )
+        if cur.rowcount <= 0:
+            return None
+        row = c.execute("SELECT * FROM findings WHERE id=?", (fid,)).fetchone()
+    return dict(row) if row else None
 
 
 def list_findings(project_id: str) -> list[dict]:
@@ -713,26 +763,53 @@ def delete_finding(project_id: str, fid: str) -> bool:
 
 # ---------- 已证客观事实（facts） ----------
 def add_fact(project_id: str, content: str, source: str = "manual",
-             session_id: str = "", step_id: str = "") -> dict:
+             session_id: str = "", step_id: str = "", status: str = "") -> dict:
     """记录一条「已证实的客观事实」（凭据/漏洞/敏感路径等）。source: manual | agent。
 
     session_id / step_id 是**因果图的连边依据**，不是可选装饰：
     带 step_id 才能连出 Evidence --REVEALS--> KeyFact，带 session_id 才能把
     同一条线索下的 KeyFact 与 Vulnerability 关联起来。丢了它们图不会报错，
     只会静默退化成一堆孤点，所以调用方必须尽量传。
+
+    v012 P1-1 状态模型：status ∈ verified | candidate | rejected。
+    空串时自动判定：人工登记（source=manual）或带溯源步骤（step_id，即有
+    工具输出背书）→ verified；AI 记录且无溯源 → candidate（不能只因模型
+    声称就当「已证」——这正是路线图 P1-1 要堵的口子）。
     """
     content = content.strip()
     if not content:
         return {}
+    if not status:
+        status = "verified" if (source == "manual" or step_id) else "candidate"
+    if status not in ("verified", "candidate", "rejected"):
+        status = "candidate"
     fid = uuid.uuid4().hex[:12]
     with _db() as c:
         c.execute(
-            "INSERT INTO facts (id,project_id,content,source,session_id,step_id,created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (fid, project_id, content, source, session_id, step_id, time.time()),
+            "INSERT INTO facts (id,project_id,content,source,session_id,step_id,"
+            "created_at,status) VALUES (?,?,?,?,?,?,?,?)",
+            (fid, project_id, content, source, session_id, step_id, time.time(),
+             status),
         )
     return {"id": fid, "project_id": project_id, "content": content, "source": source,
-            "session_id": session_id, "step_id": step_id, "created_at": time.time()}
+            "session_id": session_id, "step_id": step_id, "created_at": time.time(),
+            "status": status}
+
+
+def review_fact(project_id: str, fid: str, action: str) -> dict | None:
+    """人工复核事实（v012 P1-1）：verified / rejected / candidate。
+
+    归属校验同 delete_fact：WHERE 双条件，跨项目返回 None。
+    """
+    if action not in ("verified", "rejected", "candidate"):
+        return None
+    with _db() as c:
+        cur = c.execute("UPDATE facts SET status=? WHERE id=? AND project_id=?",
+                        (action, fid, project_id))
+        if cur.rowcount <= 0:
+            return None
+        row = c.execute("SELECT * FROM facts WHERE id=?", (fid,)).fetchone()
+    return dict(row) if row else None
 
 
 def list_facts(project_id: str) -> list[dict]:

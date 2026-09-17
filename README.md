@@ -447,6 +447,19 @@ src-agent/
 5. **时间预算熔断**：`AGENT_RUN_TIME_BUDGET`（默认 1800s）——token 预算管钱、步数管轮次，此项管墙钟时间，超时按中断处理。
 6. **因果图收紧**：未知边标签归一为 `UNKNOWN`（不再默认当作 SUPPORTS 人为推高置信度）；置信度传播按边幂等（重复提交同一条支撑边不重复加分）；单批写入上限（节点 200/边 500）。
 
+## 证据与授权（v012）
+
+1. **事实状态模型**：`verified / candidate / rejected`——人工登记或带工具输出溯源（step_id）的事实为 verified；AI 记录且无溯源的自动降为 **candidate**，不会注入「已证事实库」冒充已证结论。人工复核走 `POST /api/projects/{pid}/facts/{fid}/review`。
+2. **漏洞状态模型**：`draft / needs_review / confirmed / closed`——**AI 与首次登记一律 draft（候选）**，只有人工确认（`POST .../findings/{fid}/review`，action=confirmed）后才进入正式报告的「已确认漏洞」章节。
+3. **漏洞结构化字段**：登记时可填 `vuln_type / cwe / cvss / impact_scope / reproduction / remediation`；修复建议留空时按 vuln_type 套内置模板（SQL 注入/XSS/弱口令/未授权/信息泄露/上传/SSRF/RCE/CSRF/反序列化），不再「待补充」。
+4. **报告增强**：已确认与待验证候选分章（候选在附录、明确标注不作为结论提交）；Markdown 表格单元格统一转义（标题/目标含 `|` 不再毁表）；导出前完整性检查——已确认漏洞缺证据或缺复现步骤时在报告头部给出告警清单。
+5. **端口/协议授权**：scope.json 新增结构化写法（与旧 domains 混用、完全向后兼容）：
+   ```json
+   {"targets": [{"host": "example.com", "ports": [80, 443], "schemes": ["https"]}]}
+   ```
+   host 命中但端口/协议不在授权列表时拒绝执行；未声明 ports/schemes 则不限制。结构化 host 自动纳入 argv 复核与目标列表校验的白名单视图。
+6. **FOFA 范围约束**：fofa_search 的查询语句必须包含至少一个授权白名单内的主机，否则拒绝执行（防在授权范围外收集资产）。
+
 ## 测试
 
 `test_*.py` 是自带的回归脚本（非 pytest 收集式，直接 `python test_xxx.py` 运行，退出码 0 表示全过）。

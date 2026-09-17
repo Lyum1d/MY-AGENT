@@ -114,6 +114,22 @@ class FindingRequest(BaseModel):
     detail: str = ""
     evidence: str = ""
     session_id: str = ""     # 登记时的线索，用于因果图里和该线索的关键事实连边
+    # ---- v012 P1-1 状态模型与结构化字段 ----
+    # AI 只能产候选：无论谁调用，不显式传 confirmed 都按 draft 落库，
+    # 走 /review 接口人工确认后才进正式报告的「已确认」章节。
+    status: str = "draft"
+    vuln_type: str = ""      # 漏洞类型（SQL 注入/弱口令/未授权…），驱动修复建议模板
+    cwe: str = ""            # 如 CWE-89
+    cvss: str = ""           # 如 8.6 或 CVSS:3.1/AV:N/AC:L/...
+    impact_scope: str = ""   # 影响范围
+    reproduction: str = ""   # 复现步骤（逐条）
+    remediation: str = ""    # 修复建议（留空则按 vuln_type 套模板）
+
+
+class ReviewRequest(BaseModel):
+    """人工复核请求（事实/漏洞通用）：action 取值见 store.review_*。"""
+    action: str              # facts: verified|rejected|candidate；findings: confirmed|needs_review|closed|draft
+    note: str = ""           # 复核备注（findings 专用，落 review_note）
 
 
 class FactRequest(BaseModel):
@@ -508,9 +524,38 @@ async def remove_fact(pid: str, fid: str):
 
 @app.post("/api/projects/{pid}/findings")
 async def add_finding(pid: str, req: FindingRequest):
+    # v012 P1-1：status 只接受合法值；remediation 留空时按 vuln_type 套修复建议模板
+    if req.status not in ("draft", "needs_review", "confirmed", "closed"):
+        raise HTTPException(400, "status 仅支持 draft/needs_review/confirmed/closed")
+    remediation = req.remediation or report.remediation_for(req.vuln_type)
     rec = store.add_finding(pid, req.title, req.severity, req.target,
-                            req.detail, req.evidence, session_id=req.session_id)
+                            req.detail, req.evidence, session_id=req.session_id,
+                            status=req.status, vuln_type=req.vuln_type, cwe=req.cwe,
+                            cvss=req.cvss, impact_scope=req.impact_scope,
+                            reproduction=req.reproduction, remediation=remediation)
     graph.on_finding_added(pid, rec)
+    return rec
+
+
+@app.post("/api/projects/{pid}/findings/{fid}/review")
+async def review_finding(pid: str, fid: str, req: ReviewRequest):
+    """人工复核漏洞（v012 P1-1）：确认后方可进正式报告的「已确认漏洞」章节。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    rec = store.review_finding(pid, fid, req.action, req.note)
+    if rec is None:
+        raise HTTPException(404, "漏洞发现不存在或不属于该项目")
+    return rec
+
+
+@app.post("/api/projects/{pid}/facts/{fid}/review")
+async def review_fact(pid: str, fid: str, req: ReviewRequest):
+    """人工复核事实（v012 P1-1）：candidate 可转 verified/rejected。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    rec = store.review_fact(pid, fid, req.action)
+    if rec is None:
+        raise HTTPException(404, "事实不存在或不属于该项目")
     return rec
 
 
