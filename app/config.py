@@ -198,3 +198,16 @@ PY_EXEC_TMP_ROOT = DATA_DIR / "scripts" / "tmp"   # 一次性工作目录的父�
 # 注意：脱敏作用于**发往云端的那份副本**，session.messages 原文不受影响，
 #   本地供应商（local=True）不经过脱敏（数据不出本机）。
 CLOUD_EGRESS_MODE = os.getenv("AGENT_CLOUD_EGRESS", "redact").strip().lower()
+
+# ---------- LLM 重试与故障转移（v011 P1-6） ----------
+# 背景：本机 DNS 抖动 / 云端限流（429）/ 网关临时故障（502/503/504）会让
+#   一整轮任务直接报废——实际只是几十秒的网络问题。对可重试错误做指数退避，
+#   重试耗尽后自动切到下一个可用供应商（切换原因记录到步骤流与日志）。
+# LLM_RETRY_MAX：额外重试次数（0=不重试）；退避 = LLM_RETRY_BASE_DELAY * 2^attempt。
+# LLM_FAILOVER_MAX：单次任务内最多自动切换几次供应商（防雪崩式连环切换）。
+# RUN_TIME_BUDGET：单次任务墙钟时间上限（秒，0=不限）。token 预算管钱、
+#   步数管轮次，都不管时间——超时按中断处理，半程成果照常沉淀。
+LLM_RETRY_MAX = int(os.getenv("AGENT_LLM_RETRY_MAX", "3"))
+LLM_RETRY_BASE_DELAY = float(os.getenv("AGENT_LLM_RETRY_BASE_DELAY", "1.0"))
+LLM_FAILOVER_MAX = int(os.getenv("AGENT_LLM_FAILOVER_MAX", "2"))
+RUN_TIME_BUDGET = int(os.getenv("AGENT_RUN_TIME_BUDGET", "1800"))

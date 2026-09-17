@@ -23,7 +23,8 @@ from . import pyexec
 from . import replayer
 from .executor import executor
 from .intel import format_intel, update_intel_from_steps
-from .llm import auto_route_candidate, get_backend, parse_tool_arguments
+from .llm import (auto_route_candidate, failover_backend, get_backend,
+                  is_retryable_error, parse_tool_arguments)
 from .registry import registry
 # 主机形态识别（域名/IP/URL 判定）与「假 TLD」清单统一收敛在 app/scope.py：
 # 与 py_exec 的 target 校验共用同一套口径，避免「一边认、一边不认」的静默缺口。
@@ -352,9 +353,35 @@ class Session:
     # 当前正在等待用户确认的步骤 id。确认通道是「一次一步」的交互式，
     # 必须有归属才能拒绝「陈旧/伪造/重复」的确认指令（详见 _await_confirm）。
     pending_step_id: str = ""
+    # ---- 取消（v011 P1-5）----
+    # 软取消：在步骤边界与确认等待处响应。正在执行的工具步骤让它跑完
+    # （单步本就有总时长上限），不中途硬杀——硬终止需要把取消信号穿透
+    # 执行器进程管理，另行迭代。
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # 事件落库游标：emit 时由 store.save_event 返回并回填到事件里（_seq），
+    # 供 SSE 断线重放去重（Last-Event-ID 之后只发增量）。
+    last_seq: int = 0
 
     async def emit(self, event: dict) -> None:
+        # 事件同步落库（v011 P1-5）：断线/刷新后可按 Last-Event-ID 重放。
+        # 落库失败不阻断实时流（数据库异常时退化为旧行为，只丢重放能力）。
+        try:
+            seq = store.save_event(self.id, event)
+            if seq:
+                self.last_seq = max(self.last_seq, seq)
+                event = {**event, "_seq": seq}
+        except Exception:
+            pass
         await self.events.put(event)
+
+
+def _exc_brief(e: Exception) -> str:
+    """把模型调用异常压缩成一行可读摘要（事件流/日志用，别把堆栈甩给用户）。"""
+    s = str(e or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    if len(s) > 120:
+        s = s[:117] + "…"
+    return s or type(e).__name__
 
 
 def attribute_source_step(session: "Session", content: str) -> str:
@@ -590,12 +617,39 @@ class Agent:
                 logger.exception("线索树上下文注入失败")
         consecutive_failures = 0
         tokens_used = 0        # 本次任务累计 token（成本熔断用）
+        run_started = time.time()   # 时间预算熔断起点（v011 P1-6）
+        failover_count = 0     # 本次任务已自动切换供应商次数（防雪崩上限）
+        tried_backends: list[str] = []   # 已失败过的供应商（故障转移排除名单）
         switch_nudged = False  # 「换策略」提醒是否已发过（成功一次后重新武装）
         tools_used = False     # 本次任务是否已实际执行过工具（收尾免催促的依据）
         session.nudges = 0     # 催促计数按轮重置：催促防护对每轮任务独立生效
         step_budget = max_steps or config.MAX_STEPS
 
         for step_no in range(1, step_budget + 1):
+            # ---- 取消检查（v011 P1-5 软取消）----
+            # 步骤边界处响应：正在跑的那一步让它跑完（单步有总时长上限），
+            # 取消后走 persist_interrupted 留半程摘要，成果不归零。
+            if session.cancel_event.is_set():
+                await session.emit({"type": "reasoning", "data": "（已收到取消请求，正在收尾…）"})
+                self._persist_intel(session)
+                self.persist_interrupted(session, reason="用户取消")
+                session.state = "done"
+                await session.emit({"type": "cancelled", "data": "任务已被用户取消"})
+                await session.emit({"type": "done", "state": "done"})
+                return
+            # ---- 时间预算熔断（v011 P1-6）----
+            # token 预算管钱、步数管轮次，都不管墙钟时间：一个死循环式的
+            # 「工具失败→重试→再失败」任务能无限烧下去。超时按中断处理。
+            if getattr(config, "RUN_TIME_BUDGET", 0) and \
+                    time.time() - run_started > config.RUN_TIME_BUDGET:
+                self._persist_intel(session)
+                self.persist_interrupted(session, reason=f"时间预算耗尽（>{config.RUN_TIME_BUDGET}s）")
+                session.state = "done"
+                await session.emit({"type": "reasoning",
+                                    "data": f"任务运行超过时间预算（{config.RUN_TIME_BUDGET}s），已停止。"
+                                            "半程成果已沉淀，可开新线索继续。"})
+                await session.emit({"type": "done", "state": "done"})
+                return
             # 先做上下文压缩：长任务里 session.messages 会一路膨胀，把较早的工具输出
             # 压成一行摘要，避免小模型被早期细节淹没（详见 docs/LuaN1ao对比分析.md §2）。
             self._compress_history(session)
@@ -607,13 +661,63 @@ class Agent:
             await session.emit({"type": "thinking", "step": step_no,
                                 "data": f"第 {step_no} 步：正在决策…"})
             _t0 = time.time()
+            # ---- 调用模型：指数退避重试 + 供应商故障转移（v011 P1-6）----
+            # 可重试错误（连接失败/超时/429/5xx）按指数退避重试；重试耗尽且
+            # 还有备用供应商时自动切换（切换原因进事件流，模型决策不中断）。
+            # 不可重试错误（Key 无效/请求错误）原样上抛，重试只是原样再错。
+            result = None
             try:
-                result = await backend.chat(messages, tools=registry.build_schemas())
+                for attempt in range(config.LLM_RETRY_MAX + 1):
+                    try:
+                        result = await backend.chat(messages, tools=registry.build_schemas())
+                        break
+                    except Exception as e:
+                        if session.cancel_event.is_set():
+                            raise
+                        if attempt >= config.LLM_RETRY_MAX or not is_retryable_error(e):
+                            raise
+                        delay = config.LLM_RETRY_BASE_DELAY * (2 ** attempt)
+                        await session.emit({
+                            "type": "reasoning",
+                            "data": f"（模型调用失败：{_exc_brief(e)}；{delay:.0f}s 后重试"
+                                    f" {attempt + 1}/{config.LLM_RETRY_MAX}）"})
+                        await asyncio.sleep(delay)
             except Exception as e:
-                await session.emit({"type": "error", "data": f"模型调用失败：{e}"})
-                session.state = "error"
-                await session.emit({"type": "done", "state": "error"})
-                return
+                # 重试耗尽：尝试故障转移到其他可用供应商
+                failover = None
+                if is_retryable_error(e) and failover_count < config.LLM_FAILOVER_MAX:
+                    failover = failover_backend([backend.name] + tried_backends)
+                if failover is None:
+                    await session.emit({"type": "error", "data": f"模型调用失败：{e}"})
+                    session.state = "error"
+                    await session.emit({"type": "done", "state": "error"})
+                    return
+                tried_backends.append(backend.name)
+                failover_count += 1
+                await session.emit({
+                    "type": "reasoning",
+                    "data": f"供应商「{backend.label}」重试 {config.LLM_RETRY_MAX} 次后仍不可用"
+                            f"（{_exc_brief(e)}），已自动切换到「{failover.label}」继续任务。",
+                })
+                logger.warning("供应商故障转移：%s -> %s（session=%s）",
+                               backend.name, failover.name, session.id)
+                backend = failover
+                await session.emit({
+                    "type": "model",
+                    "data": {"backend": backend.name,
+                             "model": getattr(backend, "model", ""),
+                             "label": getattr(backend, "label", backend.name),
+                             "local": bool(getattr(backend, "local", False)),
+                             "failover": True},
+                })
+                # 换了供应商后本步重试一次（不再嵌套重试循环：失败走原异常路径）
+                try:
+                    result = await backend.chat(messages, tools=registry.build_schemas())
+                except Exception as e2:
+                    await session.emit({"type": "error", "data": f"模型调用失败：{e2}"})
+                    session.state = "error"
+                    await session.emit({"type": "done", "state": "error"})
+                    return
             # token 用量落库（仅成功且端点返回 usage 的调用；额度耗尽等失败不计）
             try:
                 _u = result.get("usage") or {}
@@ -1366,7 +1470,27 @@ class Agent:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise asyncio.TimeoutError
-                resp = await asyncio.wait_for(session.control.get(), timeout=remaining)
+                # v011 P1-5：等待确认的同时竞争监听取消请求——用户点了取消
+                # 就不必再干等确认倒计时。取消按拒绝处理（fail-closed 路径）。
+                wait_confirm = asyncio.ensure_future(session.control.get())
+                wait_cancel = asyncio.ensure_future(session.cancel_event.wait())
+                try:
+                    done, _pending = await asyncio.wait(
+                        {wait_confirm, wait_cancel},
+                        timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for t in (wait_confirm, wait_cancel):
+                        if not t.done():
+                            t.cancel()
+                if wait_cancel in done and wait_confirm not in done:
+                    logger.info("确认等待期间收到取消请求（session=%s）", session.id)
+                    approved = False
+                    break
+                if wait_confirm in done:
+                    resp = wait_confirm.result()
+                else:
+                    # 超时（两个 future 都没完成）
+                    raise asyncio.TimeoutError
                 # 严格模式：step_id 必须存在且与本步一致才认，否则丢弃并继续等。
                 # 缺 step_id 的回应一律不放行——宁可等到超时按「拒绝」处理（fail-closed，
                 # 现象可见且可排查），也不接受一条来源不明的放行（fail-open，危险且无声）。

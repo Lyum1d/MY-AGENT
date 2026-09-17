@@ -62,7 +62,9 @@ for raw, want in [("FALSIFIES", "CONTRADICTS"), ("disproves", "CONTRADICTS"),
                   ("CONFIRMS", "SUPPORTS"), ("weak_support", "SUPPORTS"),
                   ("leads_to", "REVEALS"), ("INFORMS", "REVEALS"),
                   ("exploit", "EXPLOITS"), ("MITIGATES", "MITIGATES"),
-                  ("", "SUPPORTS"), ("完全看不懂", "SUPPORTS")]:
+                  # v011 P1-4 语义收紧：空标签与认不出来的标签一律 UNKNOWN，
+                  # 不再硬归成 SUPPORTS（模型编造标签不能推高置信度）。
+                  ("", "UNKNOWN"), ("完全看不懂", "UNKNOWN"), ("MADE_UP", "UNKNOWN")]:
     check(f"边 label {raw!r} -> {want}", graph.normalize_edge_label(raw) == want,
           graph.normalize_edge_label(raw))
 
