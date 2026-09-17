@@ -131,11 +131,30 @@
     <div class="panel-body" id="factList"><div class="empty">暂无已证事实</div></div>
 
     <div class="report-bar">
+      <button class="ghost" onclick="openGraphView()">🗺 线索图</button>
       <button class="ghost" onclick="viewReport()">查看报告</button>
       <button class="primary" onclick="exportReport()">导出报告</button>
     </div>
   </aside>
 
+</div>
+
+<!-- ============ 线索图（攻击图 / 因果图） · v012 P2-1 恢复 ============ -->
+<div id="graphModal" class="modal-mask" style="display:none;">
+  <div class="modal" style="width:min(1100px, 94vw); height:min(760px, 92vh); display:flex; flex-direction:column;">
+    <div class="modal-head">
+      <b>线索图</b>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="sm" id="graphTabAttack" onclick="switchGraphView('attack')">攻击图</button>
+        <button class="sm" id="graphTabCausal" onclick="switchGraphView('causal')">因果图</button>
+        <button class="sm" onclick="GraphView &amp;&amp; GraphView.fit()">适应窗口</button>
+        <button class="sm" onclick="closeGraphView()">关闭</button>
+      </div>
+    </div>
+    <div class="modal-tip" id="graphLegend"></div>
+    <!-- graph.js mount 宿主：GraphView 会在此创建 canvas / 空态 / 详情面板 -->
+    <div id="graphHost" style="flex:1; position:relative; min-height:0; border:1px solid var(--border,#e3e3e3); border-radius:8px; overflow:hidden;"></div>
+  </div>
 </div>
 
 <!-- ============ 设置 · 通用 LLM 供应商管理 ============ -->
@@ -297,6 +316,7 @@
   </div>
 </div>
 
+<script src="/static/graph.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

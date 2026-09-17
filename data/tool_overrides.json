@@ -1,5 +1,5 @@
 {
-  "_说明": "实测不可用或行为异常的工具。disabled=true 的工具不会进入 Agent 的工具清单，但仍可在工具箱面板手动启动。确认可用后把 disabled 改为 false 即可。timeout=单工具总时长覆写（秒），caveat=写进给模型的注意事项。",
+  "_说明": "实测不可用或行为异常的工具。disabled=true 的工具不会进入 Agent 的工具清单，但仍可在工具箱面板手动启动。确认可用后把 disabled 改为 false 即可。timeout=单工具总时长覆写（秒），caveat=写进给模型的注意事项。 target_type=target 形态声明（url=完整URL / domain=裸域名 / host=域名或IP），形态不符会被执行器拒绝并提示模型；disallowed_flags=明确禁止的旗标黑名单（执行时连同取值一起剔除，无论 allowed_flags 是否启用）。",
   "enscan": {
     "disabled": true,
     "timeout": 90,
@@ -9,7 +9,8 @@
     "disabled": false,
     "ignore_exit_code": true,
     "timeout": 120,
-    "caveat": "必须传完整 URL（带 https://），传裸域名会静默返回空。注意：退出码 1 不代表失败，只是没命中 OA/VPN 等『重点资产』，指纹仍会正常打印——只要有输出就按成功解读。"
+    "caveat": "必须传完整 URL（带 https://），传裸域名会静默返回空。注意：退出码 1 不代表失败，只是没命中 OA/VPN 等『重点资产』，指纹仍会正常打印——只要有输出就按成功解读。",
+    "target_type": "url"
   },
   "dirsearch": {
     "caveat": "target 由系统自动以 -u 注入，不要在 args 里重复写 -u（重复会导致崩溃）。不要臆造本工具不支持的旗标（如 --depth 会触发 'no such option' 报错退出）；如需限定扩展名请用 -e（例如 -e php,html）。",
@@ -183,7 +184,8 @@
       "-d",
       "-H",
       "-o"
-    ]
+    ],
+    "target_type": "url"
   },
   "tidefinger": {
     "disabled": true,
@@ -215,6 +217,15 @@
     "timeout": 300
   },
   "httpx": {
-    "caveat": "-timeout 只用纯数字秒数（如 -timeout 5），不要带 s 后缀（-timeout 3s 会被拒绝报 invalid）。target 由系统自动以 -u 注入，不要在 args 里重复写 -u。"
+    "caveat": "-timeout 只用纯数字秒数（如 -timeout 5），不要带 s 后缀（-timeout 3s 会被拒绝报 invalid）。target 由系统自动以 -u 注入，不要在 args 里重复写 -u。",
+    "target_type": "host",
+    "disallowed_flags": [
+      "-l",
+      "--list"
+    ]
+  },
+  "oneforall": {
+    "target_type": "domain",
+    "caveat": "target 只接受裸域名（执行器强制校验 target_type=domain，带协议/路径会被拒绝）。子域收集结果仅授权域名可直接测试。"
   }
 }

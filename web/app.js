@@ -1669,4 +1669,47 @@ $('usageModal').addEventListener('click', e => {
   if (e.target.id === 'usageModal') closeUsage();
 });
 
+/* ---------- 线索图（攻击图 / 因果图） · v012 P2-1 恢复 ----------
+   graph.js（GraphView）一直都在，只是上游覆盖 index.html 时把入口连同
+   数据加载一起挤掉了。这里以模态层方式接回：点「🗺 线索图」打开，
+   支持攻击图 / 因果图切换，节点点击看详情（graph.js 自带面板）。 */
+let graphMounted = false;
+let graphCurrentView = 'attack';
+
+function openGraphView() {
+  if (!state.currentProject) { log('请先选择项目', 'c-warn'); return; }
+  $('graphModal').style.display = 'flex';
+  if (!graphMounted) {
+    GraphView.mount($('graphHost'), { legendEl: $('graphLegend') });
+    graphMounted = true;
+  }
+  switchGraphView(graphCurrentView);
+}
+
+function closeGraphView() {
+  $('graphModal').style.display = 'none';
+}
+
+async function switchGraphView(view) {
+  graphCurrentView = view;
+  $('graphTabAttack').style.fontWeight = view === 'attack' ? '700' : '400';
+  $('graphTabCausal').style.fontWeight = view === 'causal' ? '700' : '400';
+  if (!state.currentProject) return;
+  try {
+    const data = await api(`/api/projects/${state.currentProject}/graph/${view}`);
+    GraphView.render(data, {
+      view,
+      emptyText: view === 'attack'
+        ? '该项目还没有线索——先在对话里发起任务，线索树会自动长成攻击图'
+        : '暂无因果链——执行工具并记录事实（note_fact）后这里会自动生长',
+    });
+  } catch (e) {
+    log(`线索图加载失败：${e.message || e}`, 'c-err');
+  }
+}
+
+$('graphModal').addEventListener('click', e => {
+  if (e.target.id === 'graphModal') closeGraphView();
+});
+
 init();

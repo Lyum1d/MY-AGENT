@@ -124,6 +124,61 @@ check("旧写法域名不受端口限制（jiaoyu.cn 任意端口）",
 check("未授权主机照旧拒绝",
       isinstance(scope.check_scope("http://evil.com:80/"), str))
 
+print("== E. 工具 manifest 渐进版（v012 后半 P2-2）==")
+from app.executor import _check_target_type, _strip_disallowed_flags   # noqa: E402
+
+check("url 型：完整 URL 通过", _check_target_type("url", "https://example.com/") is None)
+check("url 型：裸域名拒绝", isinstance(_check_target_type("url", "example.com"), str))
+check("domain 型：裸域名通过", _check_target_type("domain", "example.com") is None)
+check("domain 型：带协议拒绝", isinstance(_check_target_type("domain", "http://example.com/"), str))
+check("host 型：域名通过", _check_target_type("host", "example.com") is None)
+check("host 型：带路径拒绝", isinstance(_check_target_type("host", "example.com/admin"), str))
+check("未声明 target_type → 不校验", _check_target_type("", "任意内容") is None)
+
+check("黑名单旗标连同取值剔除",
+      _strip_disallowed_flags("-silent -l targets.txt -nc", ["-l", "--list"]) == "-silent -nc")
+check("黑名单 `=` 取值形式剔除",
+      _strip_disallowed_flags("-o=out.txt -ok", ["-o"]) == "-ok")
+check("无黑名单 → 原样返回", _strip_disallowed_flags("-a -b", []) == "-a -b")
+
+print("== F. overrides 声明落盘（v012 后半）==")
+# registry 消费逻辑已由 E 组纯函数覆盖；这里断言 JSON 声明本身
+# （不依赖 TOOLBOX_ROOT 是否能扫到工具箱）
+import json as _json                                     # noqa: E402
+_ov = _json.loads((ROOT / "data" / "tool_overrides.json").read_text(encoding="utf-8"))
+check("ehole 声明 target_type=url",
+      _ov.get("ehole", {}).get("target_type") == "url")
+check("dirsearch 声明 target_type=url",
+      _ov.get("dirsearch", {}).get("target_type") == "url")
+check("httpx 黑名单声明",
+      _ov.get("httpx", {}).get("disallowed_flags") == ["-l", "--list"])
+check("oneforall 声明 target_type=domain",
+      _ov.get("oneforall", {}).get("target_type") == "domain")
+check("_说明 已更新使用文档", "target_type" in _ov.get("_说明", ""))
+
+print("== G. 取消硬终止：py_exec 全链路（v012 后半）==")
+import asyncio                                           # noqa: E402
+from app import pyexec                                   # noqa: E402
+
+async def _cancel_pyexec():
+    ev = asyncio.Event()
+    ev.set()   # 预置：spawn 后第一次循环检查即触发
+    evs = []
+    async for e in pyexec.run_py_exec("import time; time.sleep(30)",
+                                      "example.com", cancel_event=ev):
+        evs.append(e)
+    return evs
+
+_pe = asyncio.run(_cancel_pyexec())
+_types = [e.get("type") for e in _pe]
+check("py_exec 取消事件发出", "cancelled" in _types, _types)
+check("py_exec 取消退出码 130",
+      any(e.get("type") == "exit" and e.get("code") == 130 for e in _pe), _types[-2:])
+_ci = _types.index("cancelled") if "cancelled" in _types else -1
+_after = [t for t in _types[_ci + 1:]] if _ci >= 0 else []
+check("取消后不再产生 output（只余 exit 收尾）",
+      _ci >= 0 and "output" not in _after, _after)
+
 print(f"\n{'=' * 56}")
 print(f"  通过 {len(ok)} 项，失败 {len(fail)} 项")
 for name in fail:

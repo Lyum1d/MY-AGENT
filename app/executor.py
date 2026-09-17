@@ -37,6 +37,50 @@ from .scope import target_host as _target_host      # noqa: F401
 _EXE_TOKEN = "__SRC_AGENT_EXE__"
 
 
+def _check_target_type(target_type: str, target: str) -> str | None:
+    """校验 target 是否符合声明的形态（v012 P2-2）。
+
+    返回 None=通过；否则返回给用户/模型看的错误说明。
+    声明为空或不认识的值一律放行（渐进采用：只有显式声明的工具才受校验）。
+    """
+    t = (target or "").strip()
+    tt = (target_type or "").strip().lower()
+    if not tt or not t:
+        return None
+    if tt == "url":
+        if not re.match(r"^https?://", t, re.IGNORECASE):
+            return "target 必须是完整 URL（以 http:// 或 https:// 开头，如 https://example.com/）"
+        return None
+    if tt == "domain":
+        if "://" in t or "/" in t or ":" in t:
+            return "target 必须是裸域名（不带协议 http://、不带路径、不带端口）"
+        return None
+    if tt == "host":
+        if "://" in t or "/" in t:
+            return "target 必须是域名或 IP（不带协议与路径）"
+        return None
+    return None
+
+
+def _kill_tree(proc) -> None:
+    """终止工具进程树（v012 后半，取消硬终止用）。
+
+    proc.kill 只杀直接子进程；工具箱脚本（python/bat）常会再起子进程，
+    taskkill /T /F 才能把整棵树带走。兜底失败时至少直接子进程已被 kill。
+    """
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        import subprocess as _sp
+        _sp.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+
+
 # ---------- 授权范围（白名单）校验 ----------
 # 实现已收敛到 app/scope.py（唯一实现），本模块只负责在执行前调用 check_scope。
 # 背景：此前 executor 与 replayer 各写了一份 _load_scope，语义还分叉——
@@ -202,6 +246,38 @@ def _filter_unknown_flags(args: str, allowed: list[str], value_flags: list[str])
     return shlex.join(out) if out else ""
 
 
+def _strip_disallowed_flags(args: str, disallowed: list[str]) -> str:
+    """按黑名单精确剔除旗标（v012 P2-2）。
+
+    与 _filter_unknown_flags（白名单，为空=不校验）方向相反：disallowed_flags
+    里列出的旗标**无论白名单是否启用都剔除**（含其取值）——用于表达
+    「这工具支持这个参数，但在这个部署里不许用」（如 nuclei 的 -lmi 上传
+    中间报告、naabu 的 -Pn 组合行为）。未配置黑名单时原样返回。
+    """
+    if not args or not disallowed:
+        return args
+    banned = set(disallowed)
+    try:
+        toks = shlex.split(args, posix=False)
+    except ValueError:
+        return args
+    out: list[str] = []
+    i, n = 0, len(toks)
+    while i < n:
+        tok = _strip_one_layer_quotes(toks[i])
+        if tok.startswith("-"):
+            flag = tok.split("=", 1)[0]
+            if flag in banned:
+                # 命中黑名单：`=` 形式整段丢弃；空格取值形式连同下一个值丢弃
+                if "=" not in tok and i + 1 < n and not _strip_one_layer_quotes(toks[i + 1]).startswith("-"):
+                    i += 1
+                i += 1
+                continue
+        out.append(tok)
+        i += 1
+    return shlex.join(out) if out else ""
+
+
 def _decode(raw: bytes) -> str:
     """Windows 中文环境下工具输出可能是 GBK，逐个尝试常见编码。"""
     for enc in ("utf-8", "gbk", "cp936", "latin-1"):
@@ -216,8 +292,13 @@ class Executor(ABC):
     """执行器抽象：子类需实现 run（取回输出）与 launch（仅启动）。"""
 
     @abstractmethod
-    async def run(self, tool: Tool, target: str, args: str = "") -> AsyncIterator[dict]:
-        """执行工具并流式产出输出行。"""
+    async def run(self, tool: Tool, target: str, args: str = "",
+                  cancel_event=None) -> AsyncIterator[dict]:
+        """执行工具并流式产出输出行。
+
+        cancel_event（v012 后半）：取消硬终止——调用方传入 asyncio.Event，
+        输出循环每块检查，置位即终止整棵进程树并停止执行。
+        """
         ...
 
     @abstractmethod
@@ -281,6 +362,8 @@ class LocalExecutor(Executor):
             clean_args = _strip_target_arg(args, flag)
             # 按工具白名单剥掉模型臆造的非法旗标（如 dirsearch 的 --depth）
             clean_args = _filter_unknown_flags(clean_args, tool.allowed_flags, tool.value_flags)
+            # v012 P2-2：黑名单旗标精确剔除（allowed_flags 为空时也能用）
+            clean_args = _strip_disallowed_flags(clean_args, tool.disallowed_flags)
             rendered = tmpl.format(exe=_EXE_TOKEN, target=norm, args=clean_args or "")
             # 模板里的 {args} 可能为空，需清理多余空白
             parts = [p for p in shlex.split(rendered, posix=False) if p]
@@ -291,13 +374,15 @@ class LocalExecutor(Executor):
             if args:
                 args = _strip_args_quotes(args)
                 args = _filter_unknown_flags(args, tool.allowed_flags, tool.value_flags)
+                args = _strip_disallowed_flags(args, tool.disallowed_flags)
                 cmd.extend(shlex.split(args, posix=False))
             if target:
                 cmd.append(target)
         return cmd
 
     # ---------- 执行 ----------
-    async def run(self, tool: Tool, target: str, args: str = "") -> AsyncIterator[dict]:
+    async def run(self, tool: Tool, target: str, args: str = "",
+                  cancel_event=None) -> AsyncIterator[dict]:
         # ---- 授权范围校验（执行前最后一道闸门）----
         # 命令行工具此前只校验 target 格式、不校验是否授权，
         # 配合「项目 target 自动注入」后目标来源变多，越权路径更短，故在此兜底。
@@ -314,6 +399,18 @@ class LocalExecutor(Executor):
             return
 
         cmd = self.build_command(tool, target, args)
+
+        # ---- target 形态校验（v012 P2-2 manifest 渐进版）----
+        # 工具在 overrides 里声明 target_type 后，形态不符直接拒绝并说明
+        # 正确形态（fail-closed、报错可读），而不是让工具拿错形态静默失败。
+        tt_bad = _check_target_type(tool.target_type, target)
+        if tt_bad:
+            yield {"type": "error", "data": (
+                f"target 形态不符合「{tool.name}」的要求：{tt_bad}"
+                f"（该工具要求 target_type={tool.target_type}）。"
+                "请按说明调整后重试。")}
+            yield {"type": "exit", "code": 1}
+            return
 
         # ---- 最终 argv 主机级复核（审计 P0-2/P0-3 的根治层）----
         # 白名单此前只覆盖 target：args 可走私 --url evil.com（dirsearch 里与 -u 同义，
@@ -403,6 +500,13 @@ class LocalExecutor(Executor):
         try:
             buf = ""
             while True:
+                # ---- 取消硬终止（v012 后半）----
+                # 用户点了取消：立刻终止整棵进程树（含工具自己起的子进程），
+                # 不再等本步跑完。检查间隔 = 输出块间隔（≤ idle 超时，秒级响应）。
+                if cancel_event is not None and cancel_event.is_set():
+                    _kill_tree(proc)
+                    yield {"type": "cancelled", "data": "已收到取消请求，工具进程已终止"}
+                    break
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     proc.kill()

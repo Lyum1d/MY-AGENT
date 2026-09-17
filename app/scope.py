@@ -235,7 +235,12 @@ def check_scope(target: str) -> str | None:
 
 
 def _parse_port_scheme(target: str) -> tuple[int | None, str | None]:
-    """从 target 提取 (端口, 协议)。解析不出返回 (None, None)。"""
+    """从 target 提取 (端口, 协议)。解析不出返回 (None, None)。
+
+    ⚠️ 只认**显式声明**：协议仅在 target 显式含 "://" 时返回（裸域名不做
+    默认 http 推断——域名型工具可能走任意协议/只做 DNS，凭推断去拒绝
+    会误杀大量正常请求）；端口仅在显式写出（URL 带端口或裸 host:port）时返回。
+    """
     t = (target or "").strip().lower()
     if not t:
         return None, None
@@ -245,7 +250,6 @@ def _parse_port_scheme(target: str) -> tuple[int | None, str | None]:
         scheme = t.split("://", 1)[0] or None
     try:
         u = urlparse(t if "://" in t else "http://" + t)
-        scheme = scheme or (u.scheme or None)
         if u.port:
             port = int(u.port)
     except ValueError:
