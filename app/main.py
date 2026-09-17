@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import AsyncIterator
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -804,13 +804,47 @@ async def _run_agent(session, message: str, project_id: str):
 
 
 @app.get("/api/sessions/{sid}/stream")
-async def stream_session(sid: str):
-    """SSE：实时推送思考、命令、输出、确认请求与结论。"""
+async def stream_session(sid: str, request: Request, last_event_id: int = 0):
+    """SSE：实时推送思考、命令、输出、确认请求与结论。
+
+    v011 断线重放：客户端带上 `?last_event_id=<已收到的最大 seq>`
+    （或标准 EventSource 的 Last-Event-ID 请求头），服务端先把该序号之后的
+    历史事件按序回放（id: 行带 seq），再接入实时流——页面刷新/断网重连
+    不再丢失中间过程。会话已结束（服务重启后内存无此会话）则只回放历史。
+    """
     s = sessions.get(sid)
     if not s:
-        raise HTTPException(404, "会话不存在")
+        # 会话不在内存（服务重启）：只要事件表里还有历史，仍可回放
+        stored = store.get_session(sid)
+        if not stored:
+            raise HTTPException(404, "会话不存在")
+        s = None
+    else:
+        stored = None
+
+    # EventSource 重连自动带 Last-Event-ID 头；query 参数作为显式入口（取更大者）
+    header_leid = request.headers.get("Last-Event-ID") or ""
+    try:
+        last_event_id = max(int(last_event_id or 0), int(header_leid))
+    except ValueError:
+        pass
 
     async def gen() -> AsyncIterator[str]:
+        replay_upto = int(last_event_id or 0)
+        # 1) 历史回放：仅当客户端带了游标（重连）才补发增量；
+        #    全新连接（游标 0）保持旧行为——从当前实时事件开始，不倒腾历史。
+        if replay_upto > 0:
+            for ev in store.list_events(sid, since_seq=replay_upto):
+                seq = ev.pop("_seq", 0)
+                replay_upto = max(replay_upto, seq)
+                yield f"id: {seq}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                if ev.get("type") == "done":
+                    return
+        if s is None:
+            # 纯历史会话（服务重启后内存无此会话）：回放完历史即结束
+            yield f"data: {json.dumps({'type': 'done', 'state': 'stored'}, ensure_ascii=False)}\n\n"
+            return
+        # 2) 实时流：跳过回放期间已补发的 seq，避免重复
         try:
             while True:
                 try:
@@ -818,7 +852,14 @@ async def stream_session(sid: str):
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
                     continue
-                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                seq = ev.get("_seq") or 0
+                if seq and seq <= replay_upto:
+                    continue
+                payload = {k: v for k, v in ev.items() if k != "_seq"}
+                if seq:
+                    yield f"id: {seq}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                else:
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 if ev.get("type") == "done":
                     break
         except asyncio.CancelledError:
@@ -829,6 +870,24 @@ async def stream_session(sid: str):
         "Connection": "keep-alive",
         "X-Accel-Buffering": "no",
     })
+
+
+@app.post("/api/sessions/{sid}/cancel")
+async def cancel_session(sid: str):
+    """取消正在执行的任务（v011 P1-5，软取消）。
+
+    在步骤边界与确认等待处生效：正在执行的工具步骤会跑完（单步本有总时长
+    上限），随后的循环立即收尾——半程成果照常沉淀（persist_interrupted）。
+    对空闲/已结束的会话返回 409。
+    """
+    s = sessions.get(sid)
+    if not s:
+        raise HTTPException(404, "会话不存在")
+    if s.state not in ("running", "awaiting_confirm"):
+        raise HTTPException(409, f"当前状态为 {s.state}，无需取消")
+    s.cancel_event.set()
+    await s.emit({"type": "reasoning", "data": "（用户已请求取消，将在当前步骤完成后停止…）"})
+    return {"ok": True, "session_id": sid, "state": "cancelling"}
 
 
 @app.post("/api/sessions/{sid}/confirm")

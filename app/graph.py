@@ -57,6 +57,10 @@ EDGE_LABEL = {
     "EXPLOITS": "利用",
     "MITIGATES": "缓解",
     "BRANCH": "分支",
+    # v010 P1-4：认不出来的标签不再硬归成 SUPPORTS——「未知关系」单独标注，
+    # 不参与置信度传播。旧行为会把任何垃圾标签都当成一票支撑（+0.4），
+    # 模型写错标签名就能人为推高节点置信度。
+    "UNKNOWN": "未知关系",
 }
 
 # 模型输出里五花八门的写法都折叠到上面 5 个（照搬 LuaN1ao graph_manager 的映射表再补几条）
@@ -86,6 +90,11 @@ THREAD_STATE_TO_STATUS = {
 
 EVIDENCE_STRENGTHS = ("necessary", "contingent")
 
+# v010 P1-4：单批写入上限（apply_updates）。防一次异常调用把图撑爆；
+# derive 的 max_steps 已限制派生规模，这里补上 Agent/人工批量写入通道。
+CAUSAL_MAX_NODES_PER_BATCH = 200
+CAUSAL_MAX_EDGES_PER_BATCH = 500
+
 
 def normalize_node_type(raw: str) -> str:
     """把任意写法归一化到标准节点类型；不认识的保留原样（不丢数据）。"""
@@ -96,9 +105,14 @@ def normalize_node_type(raw: str) -> str:
 
 
 def normalize_edge_label(raw: str) -> str:
-    """边 label 归一化：认不出来的一律当作 SUPPORTS（最宽松的语义）。"""
+    """边 label 归一化（v010 P1-4 收紧）。
+
+    已知别名折叠到标准标签；**认不出来的一律返回 UNKNOWN**——不再像旧行为
+    那样默认当作 SUPPORTS（最宽松语义）。UNKNOWN 会在 score() 里被跳过，
+    不动置信度：模型编造的标签名不再能人为推高节点置信度。
+    """
     t = (raw or "").strip().upper()
-    return LABEL_ALIAS.get(t, "SUPPORTS")
+    return LABEL_ALIAS.get(t, "UNKNOWN")
 
 
 def node_type_label(node_type: str) -> str:
@@ -234,10 +248,15 @@ def build_causal_graph(project_id: str) -> dict:
 def apply_updates(project_id: str, payload: dict) -> dict:
     """批量写入节点与边（供 Agent 或人工补充线索）。
 
-    先建点后建边；边端点不存在就丢弃；SUPPORTS/CONTRADICTS 会触发目标的置信度传播。
+    先建点后建边；边端点不存在就丢弃；SUPPORTS/CONTRADICTS 触发目标置信度传播。
+    v010 P1-4 修正两点：
+      ① 置信度传播**只在边真正新增时发生**——同一条边重复提交不再重复加分
+        （旧实现 add_causal_edge 内部去重更新，但传播无条件执行，把同一条
+        支撑边喂 N 次就 +0.4×N，节点置信度被人为灌满）；
+      ② 单批写入上限（节点/边），防止一次异常调用把图撑爆。
     """
-    created_nodes, dropped = [], 0
-    for node in payload.get("nodes") or []:
+    created_nodes, dropped, skipped_limits = [], 0, 0
+    for node in (payload.get("nodes") or [])[:CAUSAL_MAX_NODES_PER_BATCH]:
         if not isinstance(node, dict):
             continue
         node_id = str(node.get("id") or "").strip()
@@ -250,9 +269,12 @@ def apply_updates(project_id: str, payload: dict) -> dict:
             node["status"] = str(node["status"]).strip().upper()
         store.upsert_causal_node(project_id, node)
         created_nodes.append(node_id)
+    skipped_limits += max(0, len(payload.get("nodes") or []) - CAUSAL_MAX_NODES_PER_BATCH)
 
     added_edges, propagated = [], []
-    for edge in payload.get("edges") or []:
+    edges_in = payload.get("edges") or []
+    skipped_limits += max(0, len(edges_in) - CAUSAL_MAX_EDGES_PER_BATCH)
+    for edge in edges_in[:CAUSAL_MAX_EDGES_PER_BATCH]:
         if not isinstance(edge, dict):
             continue
         src = str(edge.get("source_id") or "").strip()
@@ -264,11 +286,12 @@ def apply_updates(project_id: str, payload: dict) -> dict:
             continue
         label = normalize_edge_label(edge.get("label", ""))
         strength = edge.get("strength") if edge.get("strength") in EVIDENCE_STRENGTHS else "contingent"
-        store.add_causal_edge(project_id, src, dst, label, strength,
-                              str(edge.get("description") or ""))
+        rec = store.add_causal_edge(project_id, src, dst, label, strength,
+                                    str(edge.get("description") or ""))
         added_edges.append({"source_id": src, "target_id": dst, "label": label})
 
-        if label in ("SUPPORTS", "CONTRADICTS"):
+        # 只有「新边」才传播（幂等）：重复提交同一条 SUPPORTS 边，不再重复加分
+        if label in ("SUPPORTS", "CONTRADICTS") and rec.get("created"):
             target = store.get_causal_node(project_id, dst)
             new_conf, new_status = score(target.get("confidence", 0.5), label, strength)
             patch = {"confidence": new_conf}
@@ -279,7 +302,8 @@ def apply_updates(project_id: str, payload: dict) -> dict:
                                "status": new_status or target.get("status")})
 
     return {"nodes": created_nodes, "edges": added_edges,
-            "dropped_edges": dropped, "propagated": propagated,
+            "dropped_edges": dropped, "skipped_over_limit": skipped_limits,
+            "propagated": propagated,
             "graph": build_causal_graph(project_id)}
 
 

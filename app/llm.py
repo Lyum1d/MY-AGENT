@@ -595,6 +595,61 @@ def auto_route_candidate(current: str) -> LLMBackend | None:
     return b if b.available() else None
 
 
+# ---------- 可重试判定与故障转移（v011 P1-6） ----------
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def is_retryable_error(e: Exception) -> bool:
+    """判断一次模型调用失败是否值得重试。
+
+    可重试：连接失败（DNS 抖动/服务没起）、超时、限流 429、临时网关故障 5xx——
+        这些通常是几十秒级别的环境问题，重试/换家就能救回来。
+    不可重试：401/403（Key 无效）、400（请求本身错）、404（端点/模型名错）、
+        配置缺失（RuntimeError）——重试只会原样再错一遍，直接上抛。
+    """
+    if isinstance(e, httpx.HTTPStatusError):
+        return int(e.response.status_code) in _RETRYABLE_STATUS
+    # httpx 的传输层异常族：ConnectError / ConnectTimeout / ReadTimeout /
+    # ReadError / RemoteProtocolError 等
+    if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+                      httpx.WriteTimeout, httpx.PoolTimeout, httpx.ReadError,
+                      httpx.WriteError, httpx.RemoteProtocolError)):
+        return True
+    if isinstance(e, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    return False
+
+
+def failover_backend(exclude: list[str]) -> LLMBackend | None:
+    """挑一个「不是已失败供应商」的可用后端做故障转移（P1-6）。
+
+    顺序沿用 _pick_default 的语义（云端优先、本地兜底），只是排除掉
+    刚刚失败的那几个。找不到就返回 None（由调用方决定上抛）。
+    """
+    try:
+        all_providers = providers.cfg().get("providers", [])
+    except Exception:
+        return None
+    for p in all_providers:
+        pid = p.get("id") or ""
+        if pid in exclude:
+            continue
+        try:
+            usable = providers._usable(p)      # noqa: SLF001 —— 同包内复用判定
+        except Exception:
+            usable = bool(p.get("enabled") and p.get("base_url") and p.get("model")
+                          and (p.get("local") or p.get("api_key")))
+        if not usable:
+            continue
+        try:
+            b = get_backend(pid)
+            if b.available():
+                return b
+        except Exception:
+            continue
+    return None
+
+
 def parse_tool_arguments(raw: str) -> dict:
     """容错解析模型返回的参数（小模型偶尔吐出不合法 JSON）。"""
     if isinstance(raw, dict):

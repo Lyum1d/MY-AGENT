@@ -91,6 +91,17 @@ CREATE TABLE IF NOT EXISTS usage_log (
     completion_tokens INTEGER DEFAULT 0,
     duration_ms     INTEGER DEFAULT 0
 );
+-- SSE 事件持久化（v011 P1-5）：每条事件带自增 seq，供断线重放。
+-- 此前事件只走内存队列，页面断线/刷新后中间过程永远丢失——
+-- 「跑了几十步、只看到最后一屏」重演。写入在 Session.emit 里同步完成。
+CREATE TABLE IF NOT EXISTS events (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT NOT NULL,
+    type         TEXT,
+    payload      TEXT,
+    created_at   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, seq);
 -- 因果图（线索树的「因果图」视图）：节点与边按项目隔离。
 -- node_type / label 的取值与归一化在 app/graph.py 里。
 -- 注意：这两张表曾被一次更新整段漏掉（app/store.py 被替换成不含因果图持久化的版本），
@@ -554,6 +565,48 @@ def get_session(sid: str) -> dict | None:
     return {"session": dict(s), "steps": steps}
 
 
+# ---------- SSE 事件持久化（v011 P1-5） ----------
+def save_event(session_id: str, event: dict) -> int:
+    """落库一条 SSE 事件，返回自增 seq（断线重放的游标）。失败返回 0（不阻断流）。"""
+    try:
+        with _db() as c:
+            cur = c.execute(
+                "INSERT INTO events (session_id,type,payload,created_at) VALUES (?,?,?,?)",
+                (session_id, str(event.get("type") or ""),
+                 json.dumps(event, ensure_ascii=False), time.time()),
+            )
+            return int(cur.lastrowid or 0)
+    except Exception:
+        return 0
+
+
+def list_events(session_id: str, since_seq: int = 0, limit: int = 1000) -> list[dict]:
+    """按 seq 升序取某会话的事件（seq > since_seq），供 SSE 断线重放。"""
+    with _db() as c:
+        rows = c.execute(
+            "SELECT seq,type,payload,created_at FROM events"
+            " WHERE session_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
+            (session_id, int(since_seq), max(1, min(int(limit), 5000))),
+        ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            ev = json.loads(r["payload"] or "{}")
+        except Exception:
+            ev = {"type": r["type"]}
+        ev["_seq"] = int(r["seq"])
+        out.append(ev)
+    return out
+
+
+def last_event_seq(session_id: str) -> int:
+    """某会话当前最大事件 seq（无记录返回 0）。"""
+    with _db() as c:
+        r = c.execute("SELECT MAX(seq) AS m FROM events WHERE session_id=?",
+                      (session_id,)).fetchone()
+    return int(r["m"] or 0) if r else 0
+
+
 # ---------- 对话历史（线索回放用） ----------
 def save_chat_message(sid: str, role: str, content: str, kind: str = "") -> None:
     """持久化一条对话消息：role=user/assistant；kind=reasoning/answer（assistant 侧细分）。
@@ -807,7 +860,11 @@ def update_causal_confidence(project_id: str, node_id: str,
 
 def add_causal_edge(project_id: str, source_id: str, target_id: str, label: str,
                     strength: str = "contingent", description: str = "") -> dict:
-    """加一条因果边。同一 (source,target,label) 已存在则更新，不重复插入。"""
+    """加一条因果边。同一 (source,target,label) 已存在则更新，不重复插入。
+
+    v010 P1-4：返回值增加 "created" 标志——True=新建（调用方可据此触发
+    置信度传播），False=已有边更新（重复提交不重复加分，幂等）。
+    """
     with _db() as c:
         row = c.execute(
             "SELECT id FROM causal_edges WHERE project_id=? AND source_id=?"
@@ -818,6 +875,7 @@ def add_causal_edge(project_id: str, source_id: str, target_id: str, label: str,
             c.execute("UPDATE causal_edges SET strength=?, description=? WHERE id=?",
                       (strength, description, row["id"]))
             eid = row["id"]
+            created = False
         else:
             eid = uuid.uuid4().hex[:12]
             c.execute(
@@ -827,9 +885,10 @@ def add_causal_edge(project_id: str, source_id: str, target_id: str, label: str,
                 (eid, project_id, source_id, target_id, label, strength,
                  description, time.time()),
             )
+            created = True
     return {"id": eid, "project_id": project_id, "source_id": source_id,
             "target_id": target_id, "label": label, "strength": strength,
-            "description": description}
+            "description": description, "created": created}
 
 
 def delete_causal_node(project_id: str, node_id: str) -> bool:
