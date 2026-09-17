@@ -93,23 +93,37 @@ def _browser_url(host: str, port: int) -> str:
 
 
 def _warn_if_exposed(host: str) -> None:
-    """非回环绑定时给出显式警告。
+    """非回环绑定时默认拒绝启动（v010 从「告警」升级为「拒绝」）。
 
-    为什么要警告：本服务**没有任何鉴权层**（没有 token、没有会话校验、没有 CORS 限制），
+    为什么要拦：本服务**没有任何鉴权层**（没有 token、没有会话校验、没有 CORS 限制），
     默认只绑 127.0.0.1，安全性依赖「只有本机能访问」这一条。一旦改绑 0.0.0.0 / 具体网卡地址，
     同网段任何人都能直接调用：启动工具箱内任意可执行文件、执行任意 Python 代码、
     对白名单内目标发起扫描——等价于把本机控制权交出去。
+    确需局域网访问（如手机/另一台机看面板）时：设置环境变量 ALLOW_NON_LOOPBACK=1
+    显式自担风险后才会放行，且放行时仍打印完整风险提示。
     """
     if host in ("127.0.0.1", "localhost", "::1"):
         return
+    import os as _os
+    if _os.getenv("ALLOW_NON_LOOPBACK", "") != "1":
+        print("!" * 60)
+        print("  ✋ 已拒绝在非回环地址启动：{}".format(host))
+        print("  本服务没有鉴权层，任何能访问该地址的人都能：")
+        print("    · 启动工具箱内任意可执行文件")
+        print("    · 提交并执行任意 Python 代码（L3 通道，仅需一次点击确认）")
+        print("    · 对授权白名单内的目标发起扫描与请求")
+        print("  默认拒绝启动（v010 起）。如你确定该网段可信、必须开放局域网访问，")
+        print("  请设置环境变量 ALLOW_NON_LOOPBACK=1 后重新启动（风险自担）。")
+        print("! " * 30)
+        raise SystemExit(2)
     print("!" * 60)
-    print("  ⚠ 正在监听非回环地址：{}".format(host))
+    print("  ⚠ ALLOW_NON_LOOPBACK=1 已设置：正在监听非回环地址 {}".format(host))
     print("  本服务没有鉴权层，任何能访问该地址的人都能：")
     print("    · 启动工具箱内任意可执行文件")
     print("    · 提交并执行任意 Python 代码（L3 通道，仅需一次点击确认）")
     print("    · 对授权白名单内的目标发起扫描与请求")
-    print("  仅在你能确定该网段可信时使用；否则请去掉 --host 参数走默认的 127.0.0.1。")
-    print("!" * 60)
+    print("  风险自担；完成后请尽快改回默认的 127.0.0.1。")
+    print("! " * 30)
 
 
 def _open_browser_when_ready(url: str, timeout: float = 30.0) -> None:

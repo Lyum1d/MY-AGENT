@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from urllib.parse import urlparse
 
 from . import config
@@ -188,4 +189,67 @@ def first_unauthorized_host_in_argv(tokens: list[str]) -> tuple[int, str] | None
         for h in find_hosts(t):
             if h in _DENY_HOSTS or not host_in_scope(h, scope_list):
                 return i, h
+    return None
+
+
+# ---------- 目标列表文件校验（v010，P0-2 收窄后的剩余真空） ----------
+# argv 逐 token 复核（上方）只能看到命令行上写出的主机；nuclei/httpx/naabu 等
+# 工具的 -l/--list/--urls/--input 参数指向的目标列表文件，其**文件内容**完全不
+# 经过 argv —— 文件里写 evil.com 即可绕过全部校验。这里把「列表文件内容」
+# 纳入同一套白名单口径。
+TARGET_LIST_FLAGS = {"-l", "--list", "--list-", "--urls", "--input", "-l/", "-L"}
+
+# 列表文件读取上限：防止把超大文件当目标清单喂进来拖垮校验（正常目标列表
+# 远小于此；超过上限按「拒绝」处理而不是硬读，方向仍是 fail-closed）。
+TARGET_LIST_MAX_BYTES = 1 * 1024 * 1024
+
+
+def _first_unauthorized_host_in_text(text: str, scope_list: list[str]) -> str:
+    """逐行抽主机过白名单，返回第一个未授权主机；全部授权返回空串。
+
+    列表文件常见形态：裸域名、URL、host:port、注释行（# 开头）与空行。
+    抽取复用 find_hosts（与 argv 复核同一套口径，避免规则分叉）。
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for h in find_hosts(line):
+            if h in _DENY_HOSTS or not host_in_scope(h, scope_list):
+                return h
+    return ""
+
+
+def first_unauthorized_target_list_in_argv(tokens: list[str]) -> tuple[str, str] | None:
+    """扫描 argv 中「目标列表旗标 + 文件路径」，校验文件内容是否含未授权主机。
+
+    返回 (旗标, 未授权主机) 或 None（无列表参数 / 文件不可读 / 内容全部授权）。
+    - 旗标后无值（下一个 token 以 - 开头或不存在）→ 交由工具自行报错，放行；
+    - 文件不存在 / 无法读取 → 放行（执行时工具会因文件缺失而失败，不是授权问题）；
+    - 文件超过 TARGET_LIST_MAX_BYTES → 返回 (旗标, "<oversized>")，按拒绝处理。
+    白名单为空时返回 ('', '')，由调用方按 fail-closed 处理。
+    """
+    scope_list = load_scope()
+    if not scope_list:
+        return "", ""
+    for i, tok in enumerate(tokens):
+        if i == 0 or tok not in TARGET_LIST_FLAGS:
+            continue
+        if i + 1 >= len(tokens):
+            continue
+        path = (tokens[i + 1] or "").strip()
+        if not path or path.startswith("-"):
+            continue
+        p = Path(path)
+        try:
+            if not p.is_file():
+                continue
+            if p.stat().st_size > TARGET_LIST_MAX_BYTES:
+                return tok, "<oversized>"
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        bad = _first_unauthorized_host_in_text(text, scope_list)
+        if bad:
+            return tok, bad
     return None

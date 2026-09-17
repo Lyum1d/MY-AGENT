@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import socket
 import sys
@@ -97,6 +98,83 @@ def remote_version(proxy: str) -> str:
     return http_get(RAW_VERSION_URL, proxy).decode("utf-8").strip()
 
 
+# ---------- 包完整性校验（v010 P2-4）----------
+# 背景：更新器此前对下载包零校验（纯靠 HTTPS），GitHub 账号失守或传输被篡改时
+#   恶意代码会被静默铺到所有成员机器——更新器是整条供应链的入口。
+# 方案：仓库根的 SHA256SUMS.txt（发布入口在 bump 版本的同一 commit 内生成），
+#   每行「<sha256>  <仓库相对路径>」。为什么校验**解压后的逐文件**而不是下载包
+#   整体哈希：codeload 的 zipball 内容含目录时间戳等，字节不具确定性，整体哈希
+#   任何一次下载都可能不同；逐文件哈希同样能捕获「任何一个文件被篡改」，
+#   且对 .bat/.cmd/.ps1（更新器会做 CRLF 归一，落盘后内容必然与仓库不同）
+#   跳过校验。远端暂无清单（010 之前的版本）时警告并跳过——不做硬失败，
+#   避免升级链路被自己掐断。
+RAW_SHA_URL = "https://raw.githubusercontent.com/Lyum1d/MY-AGENT/main/SHA256SUMS.txt"
+
+
+def _load_sums(proxy: str) -> dict[str, str]:
+    """拉取远端 SHA256SUMS.txt → {相对路径: sha256}。失败/不存在返回空 dict。"""
+    try:
+        sums = http_get(RAW_SHA_URL, proxy, timeout=15).decode("utf-8")
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for line in sums.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2:
+            out[parts[1].strip().replace("\\", "/")] = parts[0].strip().lower()
+    return out
+
+
+def verify_extracted(tmp_root: Path, extracted: list[str], proxy: str, log) -> bool:
+    """对照 SHA256SUMS.txt 逐文件校验解压结果。返回 False = 必须中止安装。"""
+    import hashlib
+    sums = _load_sums(proxy)
+    if not sums:
+        log("[警告] 远端未提供 SHA256SUMS.txt，本次跳过完整性校验（建议尽快升级到带清单的版本）。")
+        return True
+    bad: list[str] = []
+    checked = 0
+    for rel in extracted:
+        if rel.lower().endswith((".bat", ".cmd", ".ps1")):
+            continue    # CRLF 归一已改写内容，哈希必然不同（见 normalize_crlf）
+        expected = sums.get(rel)
+        if not expected:
+            log(f"[警告] 清单中没有 {rel} 的条目，跳过该文件校验。")
+            continue
+        p = tmp_root / rel
+        try:
+            actual = hashlib.sha256(p.read_bytes()).hexdigest()
+        except OSError as e:
+            bad.append(f"{rel}（读取失败：{e}）")
+            continue
+        checked += 1
+        if actual != expected:
+            bad.append(rel)
+    log(f"完整性校验：{checked} 个文件与发布清单比对。")
+    if bad:
+        log("[严重] 以下文件与发布清单不匹配：")
+        for r in bad[:20]:
+            log(f"    ✗ {r}")
+        log("下载内容可能被篡改，已中止安装。请勿重试覆盖校验，先核实网络环境。")
+        return False
+    log("完整性校验通过。")
+    return True
+
+
+def _safe_zip_rel(rel: str) -> bool:
+    """Zip Slip 防护：相对路径不得含 .. 段、盘符、绝对路径前缀。
+
+    CPython 的 zipfile 对绝对路径有一定净化，但这里是逐成员自写落盘，
+    必须自己把关——`..\\evil.py` 拼出来就是 tmp_root 之外的任意写。
+    """
+    if not rel or rel.strip() != rel:
+        return False
+    if re.match(r"^[A-Za-z]:", rel) or rel.startswith(("/", "\\")):
+        return False
+    parts = re.split(r"[\\/]+", rel)
+    return ".." not in parts and "" not in parts
+
+
 # ---------- data 合并策略 ----------
 def zip_data_plan(zf: zipfile.ZipFile, root: Path) -> tuple[list[str], list[str]]:
     """返回 (新版要覆盖的 data 相对路径, 本机已有则跳过的 data 相对路径)。"""
@@ -166,7 +244,8 @@ def do_update(root: Path, proxy: str, log, progress) -> None:
 
     tmp_root = root / f"_update_tmp_{int(time.time())}"
     tmp_root.mkdir(exist_ok=True)
-    # 解压（去掉 zip 顶层目录）
+    # 解压（去掉 zip 顶层目录；v010：Zip Slip 防护，含 .. / 盘符 / 绝对路径的
+    # 成员一律跳过并告警——绝不写到 tmp_root 之外）
     extracted = []
     for name in zf.namelist():
         if name.endswith("/"):
@@ -175,7 +254,17 @@ def do_update(root: Path, proxy: str, log, progress) -> None:
         if len(parts) < 2 or parts[1] == "":
             continue
         rel = parts[1]
+        if not _safe_zip_rel(rel):
+            log(f"[警告] 跳过可疑压缩成员（路径不安全）：{name}")
+            continue
         target = tmp_root / rel
+        # resolve 后仍在 tmp_root 内，双保险
+        try:
+            if not str(target.resolve()).startswith(str(tmp_root.resolve())):
+                log(f"[警告] 跳过越界压缩成员：{name}")
+                continue
+        except OSError:
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = zf.read(name)
         if rel.lower().endswith(CRLF_REQUIRED_EXT):
@@ -183,6 +272,11 @@ def do_update(root: Path, proxy: str, log, progress) -> None:
         target.write_bytes(payload)
         extracted.append(rel)
     log(f"解压完成：{len(extracted)} 个文件")
+    progress(0.60)
+    # v010：对照发布清单逐文件校验（在替换任何本机文件之前）
+    if not verify_extracted(tmp_root, extracted, proxy, log):
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        raise RuntimeError("完整性校验失败，已中止安装（本机文件未被改动）。")
     progress(0.68)
 
     # 备份目录：记录被替换的旧文件（支持回滚）

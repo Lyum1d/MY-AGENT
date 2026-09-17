@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from abc import ABC, abstractmethod
 from typing import Any
@@ -18,7 +19,33 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import config, providers
+from . import config, providers, redact
+
+
+def _egress_prepare(self_label: str, local: bool, messages: list[dict]) -> list[dict]:
+    """云端外发闸门（v010 P0-4）：按 config.CLOUD_EGRESS_MODE 处理待发送消息。
+
+    - local_only：选中云端供应商时不允许发请求——直接抛错，调用方（Agent）
+      会把错误呈现给用户并提示切换到本地模型；
+    - redact：返回脱敏后的**副本**（session.messages 原文不受影响），命中摘要写日志；
+    - allow：原样放行。
+    本地供应商（local=True）数据不出本机，不经过本函数。
+    """
+    if local:
+        return messages
+    mode = redact.egress_mode()
+    if mode == redact.MODE_ALLOW:
+        return messages
+    if mode == redact.MODE_LOCAL_ONLY:
+        raise RuntimeError(
+            "当前外发策略为 local_only（AGENT_CLOUD_EGRESS=local_only），"
+            f"供应商「{self_label}」是云端端点，已拒绝发送。"
+            "请在前端切换到本地模型，或调整 AGENT_CLOUD_EGRESS。")
+    msgs, hits = redact.egress_messages(messages)
+    if hits:
+        logging.getLogger("src_agent").info(
+            "云端外发脱敏（%s）：本请求命中并打码 %d 处疑似凭据/隐私内容", self_label, hits)
+    return msgs
 
 
 class LLMBackend(ABC):
@@ -107,7 +134,7 @@ class OpenAICompatBackend(LLMBackend):
 
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": _egress_prepare(self.label, self.local, messages),
             "stream": False,
         }
         if tools:
@@ -342,7 +369,8 @@ class AnthropicBackend(LLMBackend):
                 "请在「设置 → 模型供应商」中补齐"
             )
 
-        system, msgs = self._to_anthropic_messages(messages)
+        system, msgs = self._to_anthropic_messages(
+            _egress_prepare(self.label, self.local, messages))
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": 4096,

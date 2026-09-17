@@ -26,6 +26,7 @@ _ORIG = {
     "PY_EXEC_DIR": config.PY_EXEC_DIR,
     "PY_EXEC_TIMEOUT": config.PY_EXEC_TIMEOUT,
     "PY_EXEC_MAX_CHARS": config.PY_EXEC_MAX_CHARS,
+    "PY_EXEC_TMP_ROOT": config.PY_EXEC_TMP_ROOT,
 }
 (config.SCOPE_FILE).parent  # 保持导入顺序清晰
 config.SCOPE_FILE = _TMP / "scope.json"
@@ -33,6 +34,7 @@ config.SCOPE_FILE.write_text(
     json.dumps({"domains": ["example.com", "10.0.0.5"]}, ensure_ascii=False),
     encoding="utf-8")
 config.PY_EXEC_DIR = _TMP / "exec"
+config.PY_EXEC_TMP_ROOT = _TMP / "tmp"   # v010 沙箱临时工作目录同样改道测试目录
 
 from app.pyexec import _sanitize, _scope_check_target, run_py_exec   # noqa: E402
 

@@ -152,21 +152,39 @@ check("_browser_url 把通配监听地址换成回环",
       and run_mod._browser_url("127.0.0.1", 8770) == "http://127.0.0.1:8770",
       run_mod._browser_url("0.0.0.0", 8770))
 
-# 非回环绑定必须告警：本服务没有鉴权层，改绑 0.0.0.0 等于把本机控制权交出去。
+# 非回环绑定：v010 起默认**拒绝启动**（本服务没有鉴权层，改绑 0.0.0.0
+# 等于把本机控制权交出去）；只有显式 ALLOW_NON_LOOPBACK=1 才放行并警告。
 _buf = io.StringIO()
 with redirect_stdout(_buf):
     run_mod._warn_if_exposed("127.0.0.1")
     run_mod._warn_if_exposed("localhost")
 check("回环绑定时不打扰（不打印警告）", _buf.getvalue() == "", repr(_buf.getvalue()[:60]))
 
-_buf = io.StringIO()
-with redirect_stdout(_buf):
-    run_mod._warn_if_exposed("0.0.0.0")
-warn = _buf.getvalue()
-check("非回环绑定时给出显式警告", "非回环" in warn, warn.strip().splitlines()[:1])
-check("警告里说明后果（无鉴权 / 可被任意调用）",
-      "鉴权" in warn and "任意" in warn)
-check("警告里给出可操作建议（去掉 --host）", "--host" in warn)
+# 默认（未设置 ALLOW_NON_LOOPBACK）：非回环 → SystemExit(2)，拒绝启动
+_saved_env = os.environ.pop("ALLOW_NON_LOOPBACK", None)
+try:
+    _code = None
+    try:
+        with redirect_stdout(io.StringIO()):
+            run_mod._warn_if_exposed("0.0.0.0")
+    except SystemExit as _e:
+        _code = _e.code
+    check("v010 非回环默认拒绝启动（SystemExit 2）", _code == 2, f"exit={_code}")
+
+    _buf = io.StringIO()
+    os.environ["ALLOW_NON_LOOPBACK"] = "1"
+    with redirect_stdout(_buf):
+        run_mod._warn_if_exposed("0.0.0.0")
+    warn = _buf.getvalue()
+    check("显式放行后给出完整风险警告", "非回环" in warn, warn.strip().splitlines()[:1])
+    check("警告里说明后果（无鉴权 / 可被任意调用）",
+          "鉴权" in warn and "任意" in warn)
+    check("警告提示风险自担并建议改回默认", "127.0.0.1" in warn)
+finally:
+    if _saved_env is None:
+        os.environ.pop("ALLOW_NON_LOOPBACK", None)
+    else:
+        os.environ["ALLOW_NON_LOOPBACK"] = _saved_env
 
 # ---------- 四、health 载荷（供前端状态栏与启动器判断） ----------
 print("\n=== 四、/api/health 载荷 ===")

@@ -495,9 +495,15 @@ async def add_fact(pid: str, req: FactRequest):
 
 @app.delete("/api/projects/{pid}/facts/{fid}")
 async def remove_fact(pid: str, fid: str):
-    ok = store.delete_fact(fid)
+    # v010 P1-3：删除前校验项目存在 + 记录归属（store 层 WHERE 双条件兜底），
+    # 跨项目的 fid 一律 404，不再「拿着别人的 ID 就能删别人的数据」。
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    ok = store.delete_fact(pid, fid)
+    if not ok:
+        raise HTTPException(404, "事实不存在或不属于该项目")
     graph.on_fact_deleted(pid, fid)
-    return {"ok": ok}
+    return {"ok": True}
 
 
 @app.post("/api/projects/{pid}/findings")
@@ -510,9 +516,14 @@ async def add_finding(pid: str, req: FindingRequest):
 
 @app.delete("/api/projects/{pid}/findings/{fid}")
 async def remove_finding(pid: str, fid: str):
-    ok = store.delete_finding(fid)
+    # v010 P1-3：同 remove_fact——项目存在性 + 记录归属双重校验
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    ok = store.delete_finding(pid, fid)
+    if not ok:
+        raise HTTPException(404, "漏洞发现不存在或不属于该项目")
     graph.on_finding_deleted(pid, fid)
-    return {"ok": ok}
+    return {"ok": True}
 
 
 # ---------- 线索图（攻击图 / 因果图） ----------

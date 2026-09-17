@@ -650,10 +650,12 @@ def list_findings(project_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def delete_finding(fid: str) -> bool:
+def delete_finding(project_id: str, fid: str) -> bool:
+    """删除一条漏洞发现（同 delete_fact：v010 P1-3 补归属校验，跨项目拒绝）。"""
     with _db() as c:
-        c.execute("DELETE FROM findings WHERE id=?", (fid,))
-    return True
+        cur = c.execute("DELETE FROM findings WHERE id=? AND project_id=?",
+                        (fid, project_id))
+    return cur.rowcount > 0
 
 
 # ---------- 已证客观事实（facts） ----------
@@ -688,10 +690,17 @@ def list_facts(project_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def delete_fact(fid: str) -> bool:
+def delete_fact(project_id: str, fid: str) -> bool:
+    """删除一条事实。**必须带 project_id 并校验归属**（v010 P1-3）：
+
+    此前只按 id 删——任何项目的接口拿着别人的 fid 都能把别项目的事实删掉
+    （跨项目 ID 猜测/串号即误删）。现在 WHERE 同时匹配 id 与 project_id，
+    归属不符 = 未删（返回 False，调用方按 404 处理）。
+    """
     with _db() as c:
-        c.execute("DELETE FROM facts WHERE id=?", (fid,))
-    return True
+        cur = c.execute("DELETE FROM facts WHERE id=? AND project_id=?",
+                        (fid, project_id))
+    return cur.rowcount > 0
 
 
 # ---------- 因果图（线索树的「因果图」视图：证据推理链） ----------

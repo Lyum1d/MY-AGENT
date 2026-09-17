@@ -422,9 +422,21 @@ src-agent/
 | `RECORD_INJECT_MAX` | 最多注入多少条开局打包记录 | 20 | `AGENT_RECORD_INJECT_MAX` |
 | `BRANCH_INJECT_MAX` | 最多注入多少条其他线索摘要 | 8 | `AGENT_BRANCH_INJECT_MAX` |
 | `ENFORCE_SCOPE` | 执行前强制授权白名单 | 开 | `ENFORCE_SCOPE` |
-| `PORT` / `HOST` | 监听端口 / 地址 | 8770 / 127.0.0.1 | `PORT` / `HOST` |
+| `CLOUD_EGRESS_MODE` | 云端外发策略：`local_only` 禁发云端 / `redact` 脱敏后上云 / `allow` 原样 | redact | `AGENT_CLOUD_EGRESS` |
+| `PY_EXEC_TMP_ROOT` | py_exec 沙箱一次性工作目录的父目录 | data/scripts/tmp | — |
+| `PY_EXEC_ENV_ALLOW_JSON` | py_exec 允许额外继承的环境变量清单 | data/pyexec_env_allow.json | — |
+| `PORT` / `HOST` | 监听端口 / 地址（非回环默认拒绝启动，`ALLOW_NON_LOOPBACK=1` 显式放行） | 8770 / 127.0.0.1 | `PORT` / `HOST` |
 
 团队协作时，工具箱路径通过环境变量 `TOOLBOX_ROOT` 指定（各成员机器路径不同）；未设置时回退到 `config.py` 里的本机默认路径。详见 `团队协作指南.md`。
+
+## 安全基线（v010）
+
+1. **py_exec 进程级沙箱**：子进程不再继承宿主环境变量（凭据/代理 Key 被白名单挡住，确需某个变量写入 `data/pyexec_env_allow.json`）；执行 cwd 与 TEMP/TMP 指向一次性临时目录，结束即清理；Windows Job Object 保证超时/取消时**整棵进程树**终止（嵌套 `subprocess` 也不会残留）。Job 不可用时退回 `taskkill /T /F` 兜底。
+2. **目标列表文件校验**：argv 逐 token 授权复核之外，`-l/--list/--urls/--input` 指向的目标列表文件内容也逐行过白名单（此前列表里写未授权主机可绕过全部校验）。超大文件（>1MB）按拒绝处理。
+3. **云端外发控制**（`AGENT_CLOUD_EGRESS`，默认 `redact`）：工具输出进云端 LLM 前，Cookie/Bearer/JWT/password=/api_key= 等键值对、邮箱、手机号会被打码为占位符（`app/redact.py`），命中摘要记日志；`local_only` 模式下默认路由与手动切换都只允许本地供应商；脱敏只作用于发往云端的那份副本，落库原文不变。
+4. **数据归属校验**：删除事实/漏洞发现必须匹配 `project_id`，跨项目 ID 一律 404。
+5. **非回环监听默认拒绝**：`--host` 指向非 127.0.0.1/localhost/::1 时启动即失败；确需局域网访问设 `ALLOW_NON_LOOPBACK=1`（风险自担，启动时仍打印完整提示）。
+6. **更新器完整性校验**：update.exe 下载后对照仓库根 `SHA256SUMS.txt`（发布 commit 内生成）校验 sha256，不匹配即中止；解压启用 Zip Slip 防护（`..`/盘符/绝对路径成员一律跳过）。远端暂无清单时告警跳过（兼容旧版本）。
 
 ## 测试
 
@@ -433,6 +445,10 @@ src-agent/
 
 | 脚本 | 覆盖内容 | 外部依赖 |
 |---|---|---|
+| `test_scope.py` | 授权白名单 / argv 复核 / 目标列表文件校验（安全红线） | 无 |
+| `test_sandbox.py` | py_exec 沙箱：env 白名单 / 临时目录 / Job 杀树 | 无（杀树起真实子进程） |
+| `test_redact.py` | 云端外发脱敏规则 / 模式语义 / 深拷贝契约 | 无 |
+| `test_ownership.py` | 事实与漏洞的跨项目删除拒绝 | 无 |
 | `test_tree.py` | 对话树 / 会话恢复 / 内置工具 / 结论回流 | 无 |
 | `test_usage.py` | Token 用量采集 / 聚合 / 单价表 / CSV 导出 | 无 |
 | `test_kb_fofa.py` | 知识库检索 / 内置工具注册 / FOFA 未配置兜底 | 无 |
