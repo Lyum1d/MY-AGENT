@@ -223,12 +223,41 @@ const GraphView = (function () {
 
   /* ---------- 文字截断（用真实渲染宽度，避免中英混排估算失真） ---------- */
   function fitText(node, maxWidth) {
-    if (node.getComputedTextLength() <= maxWidth) return;
-    let s = node.textContent;
+    // 2026-09-18 修复文字溢出：三层保险。
+    // 根因：首次测量时中文/主题字体尚未就绪，getComputedTextLength() 用
+    // fallback 字体测出偏窄宽度 → 误判「不超限」不截断，字体就绪后实际
+    // 渲染变宽溢出节点卡片。因此：
+    //   ① 原文存 dataset.fullText——重截时从原文开始（截断是破坏性的，
+    //      直接在已截文本上再截会越截越短）；
+    //   ② maxWidth 存 dataset.maxw——fonts.ready 后可批量重截（refitTexts）；
+    //   ③ 测量异常（元素未布局）直接放弃本次截断，交给 refitTexts 兜底。
+    node.dataset.maxw = String(maxWidth);
+    const original = node.dataset.fullText ?? node.textContent;
+    node.dataset.fullText = original;
+    node.textContent = original;
+    let len;
+    try {
+      len = node.getComputedTextLength();
+    } catch (e) {
+      return;
+    }
+    if (!len || len <= maxWidth) return;
+    let s = original;
     while (s.length > 1 && node.getComputedTextLength() > maxWidth) {
       s = s.slice(0, -1);
       node.textContent = s + '…';
     }
+  }
+
+  function refitTexts() {
+    if (!lNode) return;
+    lNode.querySelectorAll('text[data-maxw]').forEach(t => {
+      fitText(t, parseFloat(t.dataset.maxw) || 0);
+    });
+  }
+  // 字体异步就绪后统一重截一次（首绘测宽失真的兜底）
+  if (typeof document !== 'undefined' && document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => refitTexts());
   }
 
   /* ---------- 绘制 ---------- */
@@ -330,6 +359,8 @@ const GraphView = (function () {
     applyTransform();
     renderLegend();
     bindNodeEvents();
+    // 字体就绪时序兜底：下一帧重截一次（首绘测量可能用了 fallback 字体宽度）
+    requestAnimationFrame(refitTexts);
   }
 
   function subtitleOf(n) {
