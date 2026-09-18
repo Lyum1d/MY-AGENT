@@ -73,7 +73,15 @@ async def remote_access_token_guard(request, call_next):
         if request.headers.get("authorization") != f"Bearer {config.ACCESS_TOKEN}":
             return JSONResponse(
                 {"detail": "未授权：缺少或错误的访问令牌。"}, status_code=401)
-    return await call_next(request)
+    response = await call_next(request)
+    # 前端静态资源禁用启发式强缓存（2026-09-18 线索图黑块事故）：
+    # Chromium 对无 Cache-Control 的静态资源会启发式缓存，服务端更新文件后
+    # 浏览器仍直接吃本地缓存（不发请求、不看 ETag）——表现为「新版页面 +
+    # 旧版 CSS」混合渲染：图节点全黑块、弹窗布局错乱。no-cache 保留 ETag
+    # 协商缓存（文件没变走 304，不吃流量），变了立即生效。
+    if request.url.path.startswith("/static"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 
