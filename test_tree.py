@@ -318,13 +318,22 @@ async def _drain(session):
 
 
 def test_confirm_gate(pid):
-    """高危确认闸门：确认必须「绑步骤 + 在正确状态下」才被接受。
+    """高危确认闸门（双闸门合并版）：一次性 token + 步骤归属 step_id + 状态校验。
 
     这一节守的是项目最硬的那条线——L2/L3 必须经用户确认。历史实现里
     session.control 是一条与步骤无绑定的 FIFO 队列，任何时刻投递的确认都会被
     **下一个**高危步骤消费掉，于是「用户没看确认框，L3 就被放行了」。
+    合并后的确认协议同时校验两件事（各取所长）：
+      · 一次性 token（006 血统）—— 挡「上一次的确认被这一次消费」；
+      · step_id 归属（009/013 血统）—— 挡「陈旧 / 重放 / 伪造」；
+    另加 L3 的 auth_ack（书面授权）由服务端强制。
+
+    注意：asyncio.Queue 一旦在某个事件循环里首次 await 空 get() 就与那个循环
+    绑定。因此「走 TestClient 的同步断言」与「走 asyncio.run 的异步断言」必须
+    分开成两段，且异步段**只开一个** asyncio.run（多次 run 会各自新建循环，
+    第二次必然踩 "bound to a different event loop"）。
     """
-    print("== D. 高危确认闸门（步骤绑定 + 状态校验）==")
+    print("== D. 高危确认闸门（一次性 token + 步骤绑定 + 状态校验）==")
     from fastapi.testclient import TestClient
     from app.main import app
     client = TestClient(app, base_url="http://127.0.0.1")
@@ -335,59 +344,163 @@ def test_confirm_gate(pid):
 
     # 1) 空闲态：不允许投递确认（不给「先囤一条，等下次高危步骤时自动放行」的机会）
     s.state = "idle"
-    r = client.post("/api/sessions/cf1/confirm", json={"approved": True, "step_id": "st_x"})
+    s.pending_step_id = ""
+    s.pending_confirm = None
+    r = client.post("/api/sessions/cf1/confirm",
+                    json={"approved": True, "step_id": "st_x", "token": "t"})
     check("空闲态提交确认被拒（409）", r.status_code == 409, r.status_code)
     check("被拒后队列里没有残留确认", s.control.empty())
 
-    # 2) 等待确认中，但 step_id 不匹配 → 拒绝（挡陈旧/重放/伪造）
+    # 2) 处于 awaiting_confirm，但会话未登记一次性令牌 → 拒绝（确认已过期/已处理）
     s.state = "awaiting_confirm"
     s.pending_step_id = "st_real"
-    r = client.post("/api/sessions/cf1/confirm", json={"approved": True, "step_id": "st_other"})
+    s.pending_confirm = None
+    r = client.post("/api/sessions/cf1/confirm",
+                    json={"approved": True, "step_id": "st_real", "token": "whatever"})
+    check("未登记令牌的确认被拒（409）", r.status_code == 409, r.status_code)
+
+    # 3) 令牌不匹配 → 拒绝（挡「上一次的确认」被这一步消费）
+    s.pending_confirm = {"step_id": "st_real", "token": "tok_real",
+                         "double_confirm": False}
+    r = client.post("/api/sessions/cf1/confirm",
+                    json={"approved": True, "step_id": "st_real", "token": "tok_bad"})
+    check("令牌不匹配的确认被拒（409）", r.status_code == 409, r.status_code)
+
+    # 4) step_id 不匹配 → 拒绝（挡陈旧/重放/伪造）
+    r = client.post("/api/sessions/cf1/confirm",
+                    json={"approved": True, "step_id": "st_other", "token": "tok_real"})
     check("step_id 不匹配的确认被拒（409）", r.status_code == 409, r.status_code)
 
-    # 3) 缺少 step_id → 拒绝（不给「不带身份也能放行」的后门）
-    r = client.post("/api/sessions/cf1/confirm", json={"approved": True})
+    # 5) 缺少 step_id → 拒绝（不给「不带身份也能放行」的后门）
+    r = client.post("/api/sessions/cf1/confirm",
+                    json={"approved": True, "token": "tok_real"})
     check("缺少 step_id 的确认被拒（409）", r.status_code == 409, r.status_code)
 
-    # 4) 正确匹配 → 放行，且队列里只此一条
-    r = client.post("/api/sessions/cf1/confirm", json={"approved": True, "step_id": "st_real"})
+    # 6) 令牌 + step_id 都正确 → 放行，且队列里只此一条
+    r = client.post("/api/sessions/cf1/confirm",
+                    json={"approved": True, "step_id": "st_real", "token": "tok_real"})
     check("匹配的确认被接受（200）", r.status_code == 200, r.status_code)
     check("队列里恰好一条确认", s.control.qsize() == 1, s.control.qsize())
+    check("一次性令牌用掉即作废（pending_confirm 已清）",
+          s.pending_confirm is None, s.pending_confirm)
 
-    # 5) 重复提交 → 拒绝（挡连点预支）
-    r = client.post("/api/sessions/cf1/confirm", json={"approved": True, "step_id": "st_real"})
-    check("重复提交被拒（409，挡连点预支）", r.status_code == 409, r.status_code)
+    # 7) 同一令牌重放 → 拒绝（挡连点预支 / 重放）
+    r = client.post("/api/sessions/cf1/confirm",
+                    json={"approved": True, "step_id": "st_real", "token": "tok_real"})
+    check("重放同一令牌被拒（409）", r.status_code == 409, r.status_code)
 
-    # 6) Agent 侧：不匹配的确认会被丢弃而不是被消费掉
+    # 8) L3：放行必须带 auth_ack（书面授权勾选），未勾选一律 400
+    while not s.control.empty():
+        s.control.get_nowait()
+    s.state = "awaiting_confirm"
+    s.pending_step_id = "st_l3"
+    s.pending_confirm = {"step_id": "st_l3", "token": "tok_l3", "double_confirm": True}
+    r = client.post("/api/sessions/cf1/confirm",
+                    json={"approved": True, "step_id": "st_l3", "token": "tok_l3"})
+    check("L3 未勾选书面授权 → 400", r.status_code == 400, r.status_code)
+    check("L3 未勾选时未入队", s.control.empty())
+    s.pending_confirm = {"step_id": "st_l3", "token": "tok_l3", "double_confirm": True}
+    r = client.post("/api/sessions/cf1/confirm",
+                    json={"approved": True, "step_id": "st_l3", "token": "tok_l3",
+                          "auth_ack": True})
+    check("L3 勾选书面授权 → 放行（200）", r.status_code == 200, r.status_code)
+
+    # 9) L3 拒绝不需要 auth_ack（用户必须能说「不」，否则闸门只能同意不能拒绝）
+    while not s.control.empty():
+        s.control.get_nowait()
+    s.state = "awaiting_confirm"
+    s.pending_step_id = "st_l3"
+    s.pending_confirm = {"step_id": "st_l3", "token": "tok_l3b", "double_confirm": True}
+    r = client.post("/api/sessions/cf1/confirm",
+                    json={"approved": False, "step_id": "st_l3", "token": "tok_l3b"})
+    check("L3 拒绝无需 auth_ack → 200", r.status_code == 200, r.status_code)
+
+    # ---- 以下为异步段：只开一个事件循环，且不再触碰 TestClient ----
     step = agent_mod.Step(id="st_real", tool_alias="py_exec", tool_name="Python代码执行",
                           target="demo.example.com", args="print(1)", risk={"level": "L3"})
-    while not s.control.empty():
-        s.control.get_nowait()
-    s.state = "awaiting_confirm"
-    s.pending_step_id = "st_real"
-    s.control.put_nowait({"approved": True, "step_id": "st_stale"})   # 陈旧指令
-    s.control.put_nowait({"approved": True, "step_id": "st_real"})    # 真正的放行
+    step3 = agent_mod.Step(id="st_l3x", tool_alias="py_exec", tool_name="Python代码执行",
+                           target="demo.example.com", args="print(1)",
+                           risk={"level": "L3", "double_confirm": True})
 
-    async def _confirm():
-        return await agent._await_confirm(s, step)
+    async def _drive(step_obj, edit: bool):
+        """并发驱动：先等 _confirm_round 下发令牌，再投递（令牌由 Agent 生成，测试回传）。"""
+        task = asyncio.create_task(agent._await_confirm(s, step_obj))
+        for _ in range(500):
+            if s.pending_confirm:
+                break
+            await asyncio.sleep(0.01)
+        tok = (s.pending_confirm or {}).get("token") or ""
+        # 陈旧指令：step_id 对但令牌错 → 必须被丢弃而不是被消费
+        s.control.put_nowait({"approved": True, "step_id": step_obj.id, "token": "bogus"})
+        resp = {"approved": True, "step_id": step_obj.id, "token": tok}
+        if edit:
+            resp["args"] = "print(2)"
+        s.control.put_nowait(resp)
+        return await task
 
-    approved = asyncio.run(_confirm())
-    check("_await_confirm 丢弃不匹配的确认、采纳匹配的那条", approved is True, approved)
+    results = {}
 
-    # 7) 超时后状态必须复位（历史实现只在成功路径复位，超时后永远卡在 awaiting_confirm）
-    while not s.control.empty():
-        s.control.get_nowait()
-    s.state = "awaiting_confirm"
+    async def _async_sections():
+        # 10) 参数可改后执行：确认里带 args 时 _await_confirm 把它回传出来
+        while not s.control.empty():
+            s.control.get_nowait()
+        results["no_edit"] = await _drive(step, False)
+        results["edit"] = await _drive(step, True)
+
+        # 11) L3 二次确认由后端强制：两轮都要放行，且第二轮下发新令牌
+        while not s.control.empty():
+            s.control.get_nowait()
+
+        async def _drive_l3():
+            task = asyncio.create_task(agent._await_confirm(s, step3))
+            for _ in range(500):
+                if s.pending_confirm:
+                    break
+                await asyncio.sleep(0.01)
+            tok1 = (s.pending_confirm or {}).get("token") or ""
+            s.control.put_nowait({"approved": True, "step_id": step3.id, "token": tok1})
+            for _ in range(500):
+                cur = (s.pending_confirm or {}).get("token")
+                if cur and cur != tok1:
+                    break
+                await asyncio.sleep(0.01)
+            tok2 = (s.pending_confirm or {}).get("token") or ""
+            s.control.put_nowait({"approved": True, "step_id": step3.id, "token": tok2})
+            res = await task          # (approved, edited)
+            return res[0], tok1, tok2
+
+        results["l3"] = await _drive_l3()
+
+        # 12) 超时后状态必须复位（历史实现只在成功路径复位，超时后永远卡在 awaiting_confirm）
+        while not s.control.empty():
+            s.control.get_nowait()
+        s.state = "awaiting_confirm"
+        results["timeout"] = await agent._await_confirm(s, step)
+
     old_timeout = config.CONFIRM_TIMEOUT
     config.CONFIRM_TIMEOUT = 1
     try:
-        denied = asyncio.run(_confirm())
+        asyncio.run(_async_sections())
     finally:
         config.CONFIRM_TIMEOUT = old_timeout
-    check("确认超时按「拒绝」处理", denied is False, denied)
+
+    approved, edited = results["no_edit"]
+    check("_await_confirm 丢弃令牌不符的确认、采纳匹配的那条", approved is True, approved)
+    check("未修改参数时 edited 为 None", edited is None, edited)
+
+    _, edited2 = results["edit"]
+    check("确认里改过的 args 被回传给调用方", edited2 == "print(2)", edited2)
+
+    approved3, t1, t2 = results["l3"]
+    check("L3 两轮放行才通过（后端强制，非前端 UX）", approved3 is True, approved3)
+    check("L3 第二轮下发了新的令牌", t1 != t2 and bool(t2), (t1, t2))
+
+    denied = results["timeout"]
+    check("确认超时按「拒绝」处理", denied[0] is False, denied)
     check("超时后 state 已复位（不再卡在 awaiting_confirm）",
           s.state == "running", s.state)
     check("超时后 pending_step_id 已清空", s.pending_step_id == "", s.pending_step_id)
+    check("超时后 pending_confirm 已清空", s.pending_confirm is None, s.pending_confirm)
     return "cf1"
 
 

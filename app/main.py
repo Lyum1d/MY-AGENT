@@ -57,6 +57,27 @@ def _loopback_bind() -> bool:
 
 
 @app.middleware("http")
+async def remote_access_token_guard(request, call_next):
+    """非回环绑定时，全站要求 Bearer 访问令牌（006 血统，与 run.py 的守卫成对）。
+
+    上面那道 local_request_guard 只在「绑回环」时生效；一旦 HOST=0.0.0.0 它整条失效，
+    而本服务能调度命令行扫描工具、还能执行任意 Python 代码，等于把一台扫描
+    跳板机交给整个网段。因此远程模式（ALLOW_REMOTE=1）下必须带 SRC_AGENT_TOKEN，
+    否则一律 401。回环绑定完全不受影响，本地前端 / CLI 无需任何改动。
+    """
+    if not _loopback_bind():
+        if not config.ACCESS_TOKEN:
+            return JSONResponse(
+                {"detail": "服务绑定了非回环地址但未设置 SRC_AGENT_TOKEN，已拒绝所有请求。"},
+                status_code=401)
+        if request.headers.get("authorization") != f"Bearer {config.ACCESS_TOKEN}":
+            return JSONResponse(
+                {"detail": "未授权：缺少或错误的访问令牌。"}, status_code=401)
+    return await call_next(request)
+
+
+
+@app.middleware("http")
 async def local_request_guard(request, call_next):
     host = request.headers.get("host", "")
     # 1) DNS 重绑定防护：仅本机绑定时才强制 Host 为回环名
@@ -84,14 +105,24 @@ class RunRequest(BaseModel):
 
 
 class ConfirmRequest(BaseModel):
-    """高危步骤的放行/拒绝。
+    """高危步骤的放行/拒绝（双闸门：一次性 token + 步骤归属 step_id）。
 
     step_id 必填：确认通道是「一次一步」的交互式队列，若不绑定步骤身份，
     任何时刻投递的确认（陈旧点击、重放、脚本伪造）都会躺在队列里被**下一个**
     高危步骤消费掉，等于绕过 L2/L3 授权闸门。
+    token：由 need_confirm 事件下发的一次性令牌，必须原样回传；缺失/不匹配 409。
+    args：用户在确认框里改过的参数。None = 未修改，按原参数执行。
+          只允许改 args（命令/参数串），不允许改工具与风险等级——闸门的判定依据
+          不能由被审对象提供，否则等于把红线交给被审查方自己填。
+    auth_ack：L3 二次确认（书面授权确认）。仅在该步骤 risk.double_confirm 为真时
+          要求为 True；此前这个勾选只存在于前端 JS 里、后端从不校验，直接 POST
+          {"approved": true} 即可绕过整道闸门，现在改由服务端强制。
     """
     approved: bool
     step_id: str = ""
+    args: str | None = None
+    token: str = ""
+    auth_ack: bool = False
 
 
 class ProjectRequest(BaseModel):
@@ -234,6 +265,22 @@ async def health():
         "anthropic_enabled": bool((providers.get("anthropic") or {}).get("api_key")),
         "provider_count": len(providers.list_providers()),
         "models": {p["id"]: p["model"] for p in providers.list_providers()},
+        # 编排参数也一并暴露：这些值以前只存在于 config.py，用户撞到「N 步就停」时
+        # 在界面上看不到生效值、也无从判断是被哪个闸门拦住的。放在 health 里，
+        # 前端设置页与排障都能直接读到（改值仍走环境变量，见 README）。
+        "orchestration": {
+            "execution_mode": config.EXECUTION_MODE,
+            "max_steps": config.MAX_STEPS,
+            "budget_remind_at": config.BUDGET_REMIND_AT,
+            "failure_switch_threshold": config.FAILURE_SWITCH_THRESHOLD,
+            "failure_stop_threshold": config.FAILURE_STOP_THRESHOLD,
+            "think_streak_max": config.THINK_STREAK_MAX,
+            "run_token_budget": config.RUN_TOKEN_BUDGET,
+            "history_compress_after_messages": config.HISTORY_COMPRESS_AFTER_MESSAGES,
+            "history_keep_recent": config.HISTORY_KEEP_RECENT,
+            "subtask_max_concurrency": config.SUBTASK_MAX_CONCURRENCY,
+            "subtask_max_steps": config.SUBTASK_MAX_STEPS,
+        },
         "enforce_scope": bool(config.ENFORCE_SCOPE),
         "scope_domains": scope_domains,
         "scope_warning": scope_warn,
@@ -848,6 +895,20 @@ async def _run_agent(session, message: str, project_id: str):
             store.save_step(session.id, agent._step_dict(st))
 
 
+@app.get("/api/sessions/{sid}/review")
+async def session_review(sid: str):
+    """会话复盘：token / 耗时 / 步骤成败 / 失败归因分布 / 情报增量。
+
+    纯读库统计，不调用模型，因此打开复盘不花一分钱 token。
+    """
+    r = store.session_review(sid)
+    if not r.get("title") and not r.get("steps") and not r.get("messages"):
+        # 完全没有记录的会话（既无标题也无步骤也无论述）按不存在处理
+        if not store.get_session_row(sid):
+            raise HTTPException(404, "会话不存在")
+    return r
+
+
 @app.get("/api/sessions/{sid}/stream")
 async def stream_session(sid: str, request: Request, last_event_id: int = 0):
     """SSE：实时推送思考、命令、输出、确认请求与结论。
@@ -937,24 +998,45 @@ async def cancel_session(sid: str):
 
 @app.post("/api/sessions/{sid}/confirm")
 async def confirm_step(sid: str, req: ConfirmRequest):
-    """回应「当前这一步」的高危确认。
+    """回应「当前这一步」的高危确认（双闸门合并版：一次性 token + 步骤归属 step_id）。
 
-    只应是「正在等待确认」的那个步骤的回应，因此三处都要对上：
-      · 会话确实处于 awaiting_confirm；
-      · 请求带 step_id，且与会话正在等待的步骤一致（拒绝陈旧/重放/伪造）；
+    只应是「正在等待确认」的那个步骤的回应，因此处处都要对上：
+      · 会话确实处于 awaiting_confirm 且登记了 pending_step_id；
+      · 一次性 token 与会话登记的一致（拒绝陈旧点击 / 重放 / 脚本伪造）；
+      · 请求 step_id 与会话正在等待的步骤一致（归属校验）；
       · 队列里没有积压的未消费确认（正常一轮只有一个待确认步骤）。
-    任一不符直接 409，绝不"先塞进队列等以后用"——那正是绕过闸门的方式。
+    L3 放行还必须带 auth_ack（书面授权确认）；拒绝（approved=False）任何等级都不拦。
+    任一不符直接 409/400，绝不"先塞进队列等以后用"——那正是绕过闸门的方式。
     """
     s = sessions.get(sid)
     if not s:
         raise HTTPException(404, "会话不存在")
     if s.state != "awaiting_confirm" or not s.pending_step_id:
         raise HTTPException(409, "当前没有等待确认的步骤")
+    pend = s.pending_confirm
+    if not pend:
+        raise HTTPException(409, "确认已过期或已处理，请重新发起")
+    if not req.token or req.token != pend["token"]:
+        raise HTTPException(409, "确认令牌无效（可能来自上一轮确认），已拒绝")
     if not req.step_id or req.step_id != s.pending_step_id:
         raise HTTPException(409, f"确认与当前等待的步骤不匹配（当前：{s.pending_step_id}）")
     if not s.control.empty():
         raise HTTPException(409, "已有待处理的确认，请勿重复提交")
-    await s.control.put({"approved": req.approved, "step_id": req.step_id})
+    # 只有「放行」才需要书面授权勾选。拒绝（approved=False）任何风险等级都不该被
+    # 授权确认拦住——原实现把校验放在放行判定之前，导致 L3 只能同意不能拒绝：
+    # 前端拒绝时 auth_ack=False，服务端直接 400，用户根本没有「不执行」这个选项。
+    if req.approved and pend.get("double_confirm") and not req.auth_ack:
+        raise HTTPException(400, "该步骤为 L3 高危，必须显式确认已获得书面授权后方可放行")
+    await s.control.put({
+        "approved": req.approved,
+        "args": req.args,
+        "token": req.token,
+        # 归属校验：_confirm_round 会比对 step_id（与一次性 token 双保险）
+        "step_id": s.pending_step_id,
+    })
+    # 一次性令牌：用掉即作废。不清掉的话，在「端点已入队」到「_await_confirm 被唤醒
+    # 并清理」之间有个窗口，同一令牌再 POST 一次会再入队一条。
+    s.pending_confirm = None
     return {"ok": True}
 
 

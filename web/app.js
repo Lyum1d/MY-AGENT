@@ -13,6 +13,7 @@ let state = {
   assistant: null,   // 当前 AI 气泡的 DOM 引用（streaming 时填充）
   branchParent: null, // 开分支弹窗的父会话 id
   confirmBusy: false, // 高危确认是否正在提交（挡连点，防「预支」掉下一次确认）
+  pendingConfirm: null,   // 当前待确认步骤的 {token, stepId, needDouble}：服务端要求原样回传
 };
 
 /* ---------- 工具函数 ---------- */
@@ -655,27 +656,37 @@ function renderSteps() {
 }
 
 /* ---------- 高危确认 ---------- */
+/* 参数改成可编辑：闸门原本只有「放行 / 拒绝」两个结果，但很多时候用户知道该怎么改
+   （换参数位置、去掉危险开关、把范围缩小），却只能整个否掉、让模型再猜一轮。
+   改完参数点放行即可；参数照样要过服务端的清洗管线与授权白名单校验，改参数不等于绕闸门。 */
 function showConfirm(ev) {
   const s = ev.step;
   const needDouble = ev.risk.double_confirm;
+  // 服务端在下发 need_confirm 时附带一次性令牌；提交确认必须原样回传，
+  // 否则会被判为「上一轮遗留的确认」而拒绝（409）。needDouble 用于 L3 的二次确认。
+  state.pendingConfirm = { token: ev.token || '', stepId: s.id, needDouble: !!needDouble };
   $('confirmBox').innerHTML = `
     <div class="confirm">
       <div class="title">⚠ 需要授权：${esc(s.tool_name)}（风险等级 ${ev.risk.level}）</div>
       <div class="desc">
-        目标：<code>${esc(s.target || '(无)')}</code>　参数：<code>${esc(s.args || '(无)')}</code><br>
-        判定依据：${esc(ev.risk.reason || ev.risk.name)}
+        目标：<code>${esc(s.target || '(无)')}</code><br>
+        判定依据：${esc(ev.risk.reason || ev.risk.name)}<br>
+        <span class="muted">参数可以直接改——改完点「放行」就按你改的执行（仍会过一遍参数清洗与授权白名单）。</span>
       </div>
+      <textarea id="cfmArgs" class="cfm-args" spellcheck="false" placeholder="（无参数）">${esc(s.args || '')}</textarea>
       <div class="actions">
         ${needDouble ? '<label><input type="checkbox" id="authChk"> 我确认已获得该目标的书面授权</label>' : ''}
-        <button class="primary" onclick="doConfirm('${esc(s.id)}', true)">放行</button>
-        <button class="danger" onclick="doConfirm('${esc(s.id)}', false)">拒绝</button>
+        <button class="primary" onclick="doConfirm(true)">放行</button>
+        <button class="danger" onclick="doConfirm(false)">拒绝</button>
       </div>
     </div>`;
 }
 
-async function doConfirm(stepId, approved) {
+async function doConfirm(approved) {
+  const p = state.pendingConfirm || {};
   const chk = $('authChk');
-  if (approved && chk && !chk.checked) {
+  // 只有 L3（needDouble）才要求勾选书面授权；服务端同样会校验，这里只是提前拦一下
+  if (approved && p.needDouble && chk && !chk.checked) {
     return alert('请先勾选授权确认');
   }
   // 防重复点击：连点会投递多条确认，多出来的那条会被**下一个**高危步骤直接消费掉，
@@ -683,13 +694,24 @@ async function doConfirm(stepId, approved) {
   // 后端也会以 409 兜底（队列非空即拒收），两侧都不依赖对方。
   if (state.confirmBusy) return;
   state.confirmBusy = true;
+  const box = $('cfmArgs');
+  const args = box ? box.value : '';
   $('confirmBox').innerHTML = '';
   appendLine(approved ? '→ 已放行' : '→ 已拒绝', approved ? '' : 'err');
   try {
-    // 必须带上 step_id：后端据此拒绝陈旧/重放/伪造的确认（详见 /confirm 接口注释）
+    // 双闸门：必须带上一次性 token 与 step_id，后端据此拒绝陈旧/重放/伪造的确认
+    // （详见 /confirm 接口注释）。
     await api(`/api/sessions/${state.sessionId}/confirm`, {
       method: 'POST',
-      body: JSON.stringify({ approved, step_id: stepId }),
+      // 未放行时不回传参数；放行时原样回传（服务端只在「与模型给的不同」时才替换）
+      body: JSON.stringify({
+        approved,
+        args: approved ? args : null,
+        token: p.token || '',
+        step_id: p.stepId || '',
+        // L3 必须显式确认已获书面授权；非 L3 一律回 true（服务端不看该字段）
+        auth_ack: approved ? !!(p.needDouble ? (chk && chk.checked) : true) : false,
+      }),
     });
   } catch (e) {
     appendLine(`确认提交失败：${e.message}`, 'err');
@@ -1669,47 +1691,78 @@ $('usageModal').addEventListener('click', e => {
   if (e.target.id === 'usageModal') closeUsage();
 });
 
-/* ---------- 线索图（攻击图 / 因果图） · v012 P2-1 恢复 ----------
-   graph.js（GraphView）一直都在，只是上游覆盖 index.html 时把入口连同
-   数据加载一起挤掉了。这里以模态层方式接回：点「🗺 线索图」打开，
-   支持攻击图 / 因果图切换，节点点击看详情（graph.js 自带面板）。 */
-let graphMounted = false;
-let graphCurrentView = 'attack';
+/* ---------- 线索图（攻击图 / 因果图） ----------
+   渲染本身在 web/graph.js（零依赖 SVG 分层 DAG）；这里只做取数与事件接线。
+   两个视图同源于 app/graph.py：
+     · 攻击图 = 项目为根、线索为节点的对话树画布（与上方小地图同数据）
+     · 因果图 = 证据 → 关键事实 → 漏洞 的推理链（必要/或然置信度传播）
+   注意：新增的类名用 .gtab 而不是 .tab，避免被上面「标签切换」那段全局 .tab 绑定吃掉。 */
+const graphState = { view: 'attack', mounted: false };
+const GRAPH_EMPTY = {
+  attack: '还没有线索节点：先在左侧选择项目并发送一个任务，线索会出现在这里',
+  causal: '暂无因果节点：Agent 记录已证事实 / 发现漏洞后会自动生成，也可点「从数据派生」重建',
+};
 
-function openGraphView() {
-  if (!state.currentProject) { log('请先选择项目', 'c-warn'); return; }
+async function openGraph(view) {
+  if (!state.currentProject) return log('先选择或创建一个项目', 'c-warn');
   $('graphModal').style.display = 'flex';
-  if (!graphMounted) {
-    GraphView.mount($('graphHost'), { legendEl: $('graphLegend') });
-    graphMounted = true;
-  }
-  switchGraphView(graphCurrentView);
+  const cvs = $('graphCanvas');
+  cvs.innerHTML = '';
+  graphState.mounted = false;
+  GraphView.mount(cvs, {
+    legendEl: $('graphLegend'),
+    // 攻击图上点「线索」节点 → 关掉图画布并切到那条对话（最直觉的期望）
+    onOpenThread: (sid) => { closeGraph(); openThread(sid); },
+    onBranch: (sid) => { closeGraph(); openBranchModal(sid); },
+    onSetStatus: (sid, action) => setGraphThreadStatus(sid, action),
+    // 因果图上「以此线索开分支」：仍挂到当前线索下（因果节点不是会话）
+    onBranchFromNode: () => { closeGraph(); openBranchModal(state.sessionId); },
+  });
+  graphState.mounted = true;
+  await switchGraph(view || graphState.view || 'attack');
 }
 
-function closeGraphView() {
-  $('graphModal').style.display = 'none';
-}
+function closeGraph() { $('graphModal').style.display = 'none'; }
 
-async function switchGraphView(view) {
-  graphCurrentView = view;
-  $('graphTabAttack').style.fontWeight = view === 'attack' ? '700' : '400';
-  $('graphTabCausal').style.fontWeight = view === 'causal' ? '700' : '400';
-  if (!state.currentProject) return;
+async function switchGraph(view) {
+  graphState.view = view;
+  $('gTabAttack').classList.toggle('active', view === 'attack');
+  $('gTabCausal').classList.toggle('active', view === 'causal');
+  // 因果图才需要「从数据派生」；攻击图直接读会话树，没有派生一说
+  $('gDeriveBtn').style.display = view === 'causal' ? '' : 'none';
+  if (!graphState.mounted) return;
   try {
-    const data = await api(`/api/projects/${state.currentProject}/graph/${view}`);
-    GraphView.render(data, {
+    const d = await api(`/api/projects/${state.currentProject}/graph/${view}`);
+    // currentId 用于高亮「当前线索 → 根」的活跃路径
+    GraphView.render(d, {
       view,
-      emptyText: view === 'attack'
-        ? '该项目还没有线索——先在对话里发起任务，线索树会自动长成攻击图'
-        : '暂无因果链——执行工具并记录事实（note_fact）后这里会自动生长',
+      currentId: state.sessionId || '',
+      emptyText: GRAPH_EMPTY[view] || '暂无节点',
     });
   } catch (e) {
-    log(`线索图加载失败：${e.message || e}`, 'c-err');
+    log('线索图加载失败：' + e.message, 'c-err');
   }
 }
 
-$('graphModal').addEventListener('click', e => {
-  if (e.target.id === 'graphModal') closeGraphView();
-});
+function graphFit() { GraphView.fit(); }
+
+async function deriveCausal() {
+  if (!state.currentProject) return;
+  if (!confirm('将按现有「工具执行 / 已证事实 / 漏洞发现」重建整张因果图（原有因果节点与边会被覆盖）。继续？')) return;
+  try {
+    await api(`/api/projects/${state.currentProject}/graph/causal/derive`, { method: 'POST' });
+    log('已从现有数据派生因果图', 'c-ok');
+    await switchGraph('causal');
+  } catch (e) { alert('派生失败：' + e.message); }
+}
+
+/* 图上的状态调整复用线索树同一套接口（PUT /api/sessions/{sid}/meta），动作名映射到后端状态值 */
+async function setGraphThreadStatus(sid, action) {
+  const map = { done: 'done', abandon: 'abandoned', active: 'active' };
+  await setThreadStatus(sid, map[action] || action);
+  if (graphState.mounted) await switchGraph(graphState.view);
+}
+
+$('graphModal').addEventListener('click', e => { if (e.target.id === 'graphModal') closeGraph(); });
 
 init();

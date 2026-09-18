@@ -21,7 +21,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import AsyncIterator
 
-from . import config
+from . import config, ratelimit
 from .registry import Tool
 from .scope import check_scope, first_unauthorized_host_in_argv
 from .scope import first_unauthorized_target_list_in_argv
@@ -455,6 +455,12 @@ class LocalExecutor(Executor):
         env.setdefault("LOCALAPPDATA", home + os.sep + "AppData" + os.sep + "Local")
         env.setdefault("TEMP", env.get("TEMP") or home + os.sep + "AppData" + os.sep + "Local" + os.sep + "Temp")
         env.setdefault("TMP", env["TEMP"])
+
+        # 出网限速：与 HTTP 重放器共用 app/ratelimit.py 的同一个计时器。
+        # 原先重放器自带一份节流、命令行扫描器没有任何限速，并发一开就是无上限。
+        await ratelimit.acquire(_target_host(target) or target or "default",
+                                config.TOOL_MIN_INTERVAL, config.GLOBAL_MIN_INTERVAL)
+
 
         try:
             # 需要喂入 stdin 绕开交互式 input() 提问时，才挂 PIPE；否则保持 None

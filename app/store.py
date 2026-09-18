@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS steps (
     risk_level  TEXT,
     status      TEXT,
     output      TEXT,
+    attribution TEXT DEFAULT '',
+    elapsed     REAL DEFAULT 0,
     created_at  REAL
 );
 CREATE TABLE IF NOT EXISTS findings (
@@ -199,6 +201,16 @@ def init_db() -> None:
         ):
             if col not in cols:
                 c.execute(f"ALTER TABLE sessions ADD COLUMN {col} {ddl}")
+
+        # 旧库升级：steps 新增列（失败归因 L1/L3/L4 与单步耗时，供会话复盘统计）。
+        # 注意：CREATE TABLE IF NOT EXISTS 对已存在的表不会加列，必须显式 ALTER。
+        scols = {r["name"] for r in c.execute("PRAGMA table_info(steps)").fetchall()}
+        for col, ddl in (
+            ("attribution", "TEXT DEFAULT ''"),  # 归因档位：SCOPE | L1 | L3 | L4，成功为空
+            ("elapsed", "REAL DEFAULT 0"),       # 单步耗时（秒）
+        ):
+            if col not in scols:
+                c.execute(f"ALTER TABLE steps ADD COLUMN {col} {ddl}")
         # facts / findings 的溯源列（旧库升级）：必须补齐，否则【静默退化】——
         # 因果图的 Evidence→KeyFact（靠 facts.step_id）与 KeyFact→Vulnerability
         # 的同线索关联（靠 facts/findings.session_id）会全部连不出边，
@@ -534,13 +546,28 @@ def search_history(project_id: str, keyword: str, limit: int = 8) -> list[dict]:
 
 
 def save_step(sid: str, step: dict) -> None:
+    """落库单步执行记录。
+
+    ⚠ 主键冲突防护：steps.id 是**全局**主键，而 step["id"] 来自模型的
+    tool_call_id —— 它只在**一次对话内**唯一；模型不给 id 时还会退化成
+    `call_{步数}_{序号}` 这种固定串。split_task 的并行子任务跑起来后，几条会话
+    同时落库极易撞上同一个 id，原来的 INSERT OR REPLACE 会让后写入的一方
+    **静默覆盖**另一方的步骤（库里少一条，界面与复盘也跟着少一条）。
+    这里发现「该 id 已属于别的会话」时改用 `会话id:原id` 另存，两边都留得住；
+    正常情况（同一会话内更新同一步）走原路径，id 语义不变。
+    """
+    step_id = step.get("id") or uuid.uuid4().hex[:12]
     with _db() as c:
+        row = c.execute("SELECT session_id FROM steps WHERE id=?", (step_id,)).fetchone()
+        if row is not None and row["session_id"] != sid:
+            step_id = f"{sid}:{step_id}"
         c.execute(
             "INSERT OR REPLACE INTO steps"
-            " (id,session_id,tool_alias,tool_name,target,args,risk_level,status,output,created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " (id,session_id,tool_alias,tool_name,target,args,risk_level,status,output,"
+            "  attribution,elapsed,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                step.get("id") or uuid.uuid4().hex[:12],
+                step_id,
                 sid,
                 step.get("tool_alias", ""),
                 step.get("tool_name", ""),
@@ -549,9 +576,79 @@ def save_step(sid: str, step: dict) -> None:
                 (step.get("risk") or {}).get("level", ""),
                 step.get("status", ""),
                 step.get("output", ""),
+                step.get("attribution", "") or "",
+                float(step.get("elapsed") or 0),
                 time.time(),
             ),
         )
+
+
+def session_review(sid: str) -> dict:
+    """会话复盘：这条线索花了多少 token/时间、步骤成败与失败归因的分布。
+
+    全部来自库里已有的记录（steps + usage_log + chat_messages），不做任何模型调用，
+    因此复盘本身零 token 成本。归因统计是这套归因机制的价值出口——不看分布就不知道
+    模型到底卡在「工具跑不起来(L1)」「被环境拦(L3)」还是「假设不成立(L4)」上。
+    """
+    with _db() as c:
+        srow = c.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+        srows = c.execute(
+            "SELECT status, attribution, elapsed FROM steps WHERE session_id=?", (sid,)
+        ).fetchall()
+        urow = c.execute(
+            "SELECT COUNT(*) AS calls,"
+            " COALESCE(SUM(prompt_tokens),0) AS prompt,"
+            " COALESCE(SUM(completion_tokens),0) AS completion,"
+            " COALESCE(SUM(duration_ms),0) AS llm_ms"
+            " FROM usage_log WHERE session_id=?", (sid,)
+        ).fetchone()
+        cnt = c.execute(
+            "SELECT COUNT(*) AS n FROM chat_messages WHERE session_id=?", (sid,)
+        ).fetchone()
+        pid = (srow["project_id"] if srow else "") or ""
+        frow = c.execute(
+            "SELECT COUNT(*) AS n FROM facts WHERE project_id=?", (pid,)
+        ).fetchone() if pid else None
+        # intel 是「每项目一行」的汇总表，有行即说明该项目已沉淀过情报
+        irow = c.execute(
+            "SELECT COUNT(*) AS n FROM intel WHERE project_id=?", (pid,)
+        ).fetchone() if pid else None
+
+    by_status: dict[str, int] = {}
+    by_attr: dict[str, int] = {}
+    tool_seconds = 0.0
+    for r in srows:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+        a = (r["attribution"] or "").strip()
+        if a:
+            by_attr[a] = by_attr.get(a, 0) + 1
+        tool_seconds += float(r["elapsed"] or 0)
+
+    n = len(srows)
+    done = by_status.get("done", 0)
+    prompt = int(urow["prompt"] or 0)
+    completion = int(urow["completion"] or 0)
+    return {
+        "session_id": sid,
+        "project_id": pid,
+        "title": ((srow["title"] if srow else "") or ""),
+        "state": ((srow["state"] if srow else "") or ""),
+        "steps": n,
+        "by_status": by_status,
+        "by_attribution": by_attr,
+        "success_rate": round(done / n, 3) if n else 0.0,
+        "tool_seconds": round(tool_seconds, 1),
+        "llm": {
+            "calls": int(urow["calls"] or 0),
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+            "llm_seconds": round(float(urow["llm_ms"] or 0) / 1000, 1),
+        },
+        "messages": int(cnt["n"] or 0),
+        "facts": int((frow["n"] if frow else 0) or 0),
+        "intel": int((irow["n"] if irow else 0) or 0),
+    }
 
 
 def list_sessions(project_id: str | None = None) -> list[dict]:
