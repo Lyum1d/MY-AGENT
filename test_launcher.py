@@ -152,27 +152,49 @@ check("_browser_url 把通配监听地址换成回环",
       and run_mod._browser_url("127.0.0.1", 8770) == "http://127.0.0.1:8770",
       run_mod._browser_url("0.0.0.0", 8770))
 
-# 非回环绑定：v010 起默认**拒绝启动**（本服务没有鉴权层，改绑 0.0.0.0
-# 等于把本机控制权交出去）；只有显式 ALLOW_NON_LOOPBACK=1 才放行并警告。
+# 非回环绑定：默认**拒绝启动**（本服务能调度扫描工具、还能执行任意代码，
+# 改绑 0.0.0.0 等于把本机控制权交出去）。合并后的闸门是**两道，缺一即拒**：
+#   ① 显式声明远程模式：ALLOW_REMOTE=1（兼容 013 的 ALLOW_NON_LOOPBACK=1）；
+#   ② 必须提供访问令牌 SRC_AGENT_TOKEN。
+# 两道挡的是不同误用：① 挡「改绑后忘了自己改过」，② 挡「开了远程却忘了设令牌」。
 _buf = io.StringIO()
 with redirect_stdout(_buf):
     run_mod._warn_if_exposed("127.0.0.1")
     run_mod._warn_if_exposed("localhost")
 check("回环绑定时不打扰（不打印警告）", _buf.getvalue() == "", repr(_buf.getvalue()[:60]))
 
-# 默认（未设置 ALLOW_NON_LOOPBACK）：非回环 → SystemExit(2)，拒绝启动
 _saved_env = os.environ.pop("ALLOW_NON_LOOPBACK", None)
-try:
-    _code = None
+_saved_allow = config.ALLOW_REMOTE
+_saved_token = config.ACCESS_TOKEN
+
+
+def _try_exposed() -> object:
+    """调用 _warn_if_exposed 并返回 SystemExit 的退出码（未抛则返回 None）。"""
     try:
         with redirect_stdout(io.StringIO()):
             run_mod._warn_if_exposed("0.0.0.0")
     except SystemExit as _e:
-        _code = _e.code
-    check("v010 非回环默认拒绝启动（SystemExit 2）", _code == 2, f"exit={_code}")
+        return _e.code
+    return None
 
-    _buf = io.StringIO()
+
+try:
+    # ① 默认：既没声明远程，也没令牌 → 拒绝启动
+    config.ALLOW_REMOTE = False
+    config.ACCESS_TOKEN = ""
+    check("非回环默认拒绝启动（SystemExit 2）", _try_exposed() == 2, _try_exposed())
+
+    # ② 只声明远程、忘了设令牌 → 仍然拒绝（这正是本地闸门 ② 要挡的误用）
+    config.ALLOW_REMOTE = False
+    config.ACCESS_TOKEN = ""
     os.environ["ALLOW_NON_LOOPBACK"] = "1"
+    _code = _try_exposed()
+    check("只声明远程但未设 SRC_AGENT_TOKEN → 仍拒绝启动（SystemExit 2）",
+          _code == 2, f"exit={_code}")
+
+    # ③ 两道闸门都满足 → 放行，并给出完整的风险说明
+    config.ACCESS_TOKEN = "test-token-not-a-real-secret"
+    _buf = io.StringIO()
     with redirect_stdout(_buf):
         run_mod._warn_if_exposed("0.0.0.0")
     warn = _buf.getvalue()
@@ -180,7 +202,16 @@ try:
     check("警告里说明后果（无鉴权 / 可被任意调用）",
           "鉴权" in warn and "任意" in warn)
     check("警告提示风险自担并建议改回默认", "127.0.0.1" in warn)
+
+    # ④ 回环绑定不需要令牌，也永远不打扰
+    config.ACCESS_TOKEN = ""
+    _buf = io.StringIO()
+    with redirect_stdout(_buf):
+        run_mod._warn_if_exposed("127.0.0.1")
+    check("回环绑定即使没有令牌也不拒、不警告", _buf.getvalue() == "", repr(_buf.getvalue()[:60]))
 finally:
+    config.ALLOW_REMOTE = _saved_allow
+    config.ACCESS_TOKEN = _saved_token
     if _saved_env is None:
         os.environ.pop("ALLOW_NON_LOOPBACK", None)
     else:

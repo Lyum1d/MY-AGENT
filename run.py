@@ -93,37 +93,46 @@ def _browser_url(host: str, port: int) -> str:
 
 
 def _warn_if_exposed(host: str) -> None:
-    """非回环绑定时默认拒绝启动（v010 从「告警」升级为「拒绝」）。
+    """非回环绑定的双闸门守卫（006 远程访问闸门 + 013 v010 默认拒绝 合并）。
 
-    为什么要拦：本服务**没有任何鉴权层**（没有 token、没有会话校验、没有 CORS 限制），
-    默认只绑 127.0.0.1，安全性依赖「只有本机能访问」这一条。一旦改绑 0.0.0.0 / 具体网卡地址，
-    同网段任何人都能直接调用：启动工具箱内任意可执行文件、执行任意 Python 代码、
-    对白名单内目标发起扫描——等价于把本机控制权交出去。
-    确需局域网访问（如手机/另一台机看面板）时：设置环境变量 ALLOW_NON_LOOPBACK=1
-    显式自担风险后才会放行，且放行时仍打印完整风险提示。
+    本服务能调度工具箱内任意可执行文件、执行任意 Python 代码、对白名单内目标发起扫描，
+    默认只绑 127.0.0.1，安全性完全依赖「只有本机能访问」。一旦改绑 0.0.0.0 / 具体网卡地址，
+    同网段任何人都能直接调用，等于把本机控制权交出去。
+
+    合并后的闸门（两道，缺一即拒绝启动）：
+      ① 显式声明远程模式：ALLOW_REMOTE=1（006 血统；兼容 013 的 ALLOW_NON_LOOPBACK=1）；
+      ② 必须提供访问令牌 SRC_AGENT_TOKEN（006 血统）—— 否则非回环绑定等于无鉴权裸奔，
+         app/main.py 的令牌中间件也会因令牌为空而拒绝所有请求。
+    两道闸门挡的是不同误用：① 挡「改绑后忘了自己改过」，② 挡「开了远程却忘了设令牌」。
     """
-    if host in ("127.0.0.1", "localhost", "::1"):
+    if host in ("127.0.0.1", "localhost", "::1", "[::1]", ""):
         return
     import os as _os
-    if _os.getenv("ALLOW_NON_LOOPBACK", "") != "1":
-        print("!" * 60)
-        print("  ✋ 已拒绝在非回环地址启动：{}".format(host))
-        print("  本服务没有鉴权层，任何能访问该地址的人都能：")
-        print("    · 启动工具箱内任意可执行文件")
-        print("    · 提交并执行任意 Python 代码（L3 通道，仅需一次点击确认）")
-        print("    · 对授权白名单内的目标发起扫描与请求")
-        print("  默认拒绝启动（v010 起）。如你确定该网段可信、必须开放局域网访问，")
-        print("  请设置环境变量 ALLOW_NON_LOOPBACK=1 后重新启动（风险自担）。")
-        print("! " * 30)
+    from app import config as _config
+    declared = bool(_config.ALLOW_REMOTE) or _os.getenv("ALLOW_NON_LOOPBACK", "") == "1"
+    if not declared:
+        print("=" * 60)
+        print("  拒绝启动：--host {} 会把无鉴权的本地控制台暴露到网络上。".format(host))
+        print("  本平台可调度工具箱内扫描工具并执行任意代码，暴露后可被他人借道扫描内网。")
+        print("  如确需远程访问，请同时设置环境变量：")
+        print("     set ALLOW_REMOTE=1")
+        print("     set SRC_AGENT_TOKEN=<足够长的随机串>")
+        print("  并建议在前面套一层反向代理并启用 TLS。")
+        print("=" * 60)
+        raise SystemExit(2)
+    if not _config.ACCESS_TOKEN:
+        print("=" * 60)
+        print("  拒绝启动：已声明远程模式，但未设置 SRC_AGENT_TOKEN。")
+        print("  非回环绑定必须配置访问令牌，否则等于无鉴权开放。")
+        print("=" * 60)
         raise SystemExit(2)
     print("!" * 60)
-    print("  ⚠ ALLOW_NON_LOOPBACK=1 已设置：正在监听非回环地址 {}".format(host))
-    print("  本服务没有鉴权层，任何能访问该地址的人都能：")
-    print("    · 启动工具箱内任意可执行文件")
-    print("    · 提交并执行任意 Python 代码（L3 通道，仅需一次点击确认）")
-    print("    · 对授权白名单内的目标发起扫描与请求")
-    print("  风险自担；完成后请尽快改回默认的 127.0.0.1。")
-    print("! " * 30)
+    print("  [远程模式] 正在监听非回环地址 {}，所有请求必须带".format(host))
+    print("    Authorization: Bearer <SRC_AGENT_TOKEN>。")
+    print("  注意：令牌只挡未授权访问；一旦令牌泄漏，对方即可无鉴权地任意调用")
+    print("        （调度扫描工具、执行任意代码），风险自担。")
+    print("  完成后请尽快改回默认的 127.0.0.1。")
+    print("!" * 60)
 
 
 def _open_browser_when_ready(url: str, timeout: float = 30.0) -> None:

@@ -20,12 +20,10 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import httpx
 
-from . import config, scope
+from . import config, ratelimit, scope
 
 _UA = "SRC-Agent-Replay/1.0 (authorized bug-bounty test)"
 _ALLOWED_METHODS = {"GET", "HEAD", "OPTIONS"}
-_LAST_REQ = 0.0
-_RATE_LOCK = asyncio.Lock()
 
 
 # ---------- 域名白名单 ----------
@@ -41,13 +39,9 @@ _host_allowed = scope.host_in_scope
 _load_scope = scope.load_scope
 
 # ---------- 限速 ----------
-async def _rate_limit() -> None:
-    global _LAST_REQ
-    async with _RATE_LOCK:
-        wait = config.REPLAY_MIN_INTERVAL - (time.time() - _LAST_REQ)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _LAST_REQ = time.time()
+async def _rate_limit(url: str = "") -> None:
+    key = scope.target_host(url) or url or "default"
+    await ratelimit.acquire(key, config.REPLAY_MIN_INTERVAL, config.GLOBAL_MIN_INTERVAL)
 
 
 # ---------- 参数解析 ----------
@@ -152,7 +146,7 @@ async def run_replay(url: str, args: str = "", cancel_event=None):
     yield {"type": "command", "data": shown}
 
     # 3. 发请求（限速 + 信任环境关闭，防系统代理劫持）
-    await _rate_limit()
+    await _rate_limit(url)
     try:
         async with httpx.AsyncClient(trust_env=False, follow_redirects=False,
                                      timeout=float(timeout)) as client:

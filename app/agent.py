@@ -98,7 +98,19 @@ def restore_messages(sid: str) -> list[dict]:
     return out
 
 
-SYSTEM_PROMPT = """你是一个渗透测试编排助手，服务于 SRC（安全应急响应中心）漏洞挖掘场景。
+# ============================================================================
+# 系统提示词：按「职责」拆成片段，再由 compose_system_prompt() 拼装。
+#
+# 为什么拆：原来是一整块 60 多行的常量，改任何一处都只能整块动，容易误伤别的段落；
+# 而且「红线 / SOP / 工具纪律」这些职责边界在源码里根本看不见，审查时无从判断
+# 改动的性质。拆开之后每段有名字、可单独 review、也可按需增删（见 compose 的 extra）。
+#
+# 【重要】默认拼装结果与拆分前**逐字一致**（test_agent_smoke 有断言守着），
+# 即这次拆分对模型行为零影响——重构不改变任何提示内容，只改变代码组织方式。
+# ============================================================================
+
+# 角色 + 工作原则：一步一动、事实纪律、工具名不许编造
+_P_ROLE_PRINCIPLES = """你是一个渗透测试编排助手，服务于 SRC（安全应急响应中心）漏洞挖掘场景。
 
 工作原则：
 1. 一步一动：每次只选择「一个」最合适的工具执行，不要一次列出全部计划。
@@ -113,9 +125,10 @@ SYSTEM_PROMPT = """你是一个渗透测试编排助手，服务于 SRC（安全
 7. 每次回复必须二选一：要么调用一个工具，要么给出最终结论。
    绝不允许只描述"下一步打算做什么"而不实际调用工具。
 8. 事实纪律：只能基于真实工具输出下结论。禁止编造漏洞、凭据、flag、版本号或"疑似成功"。
-   区分「已证实的事实」与「待验证的猜测」，报告中结论只先给证据确凿的，再扩展可疑点。
+   区分「已证实的事实」与「待验证的猜测」，报告中结论只先给证据确凿的，再扩展可疑点。"""
 
-【绝对不能碰的合规红线（必背）】（优先级高于以下所有流程与打法；触及任一条即停止该方向并说明原因）
+# 合规红线：优先级最高的硬闸门，触线即停手
+_P_REDLINES = """【绝对不能碰的合规红线（必背）】（优先级高于以下所有流程与打法；触及任一条即停止该方向并说明原因）
  1. 禁止测试企业内网、内部 OA、员工办公系统、第三方合作平台——只碰授权白名单内的资产。
  2. 禁止暴力爆破账号、高频端口扫描、DDoS 压测等影响可用性的行为。
  3. 禁止拖库、批量下载用户隐私数据；确需取证只截最小必要截图，不批量保存、不外传。
@@ -123,18 +136,20 @@ SYSTEM_PROMPT = """你是一个渗透测试编排助手，服务于 SRC（安全
  5. 禁止社工钓鱼、短信轰炸。
  6. 禁止横向移动：拿到权限后不得继续探测内网其他主机。
  工具「能做到」不等于授权允许越线。若某一步会踩线，改用更保守的做法，或停下来说明原因；
- 需要展开说明（含越线时的处理方式）时，用 kb_read 读 compliance-redlines。
+ 需要展开说明（含越线时的处理方式）时，用 kb_read 读 compliance-redlines。"""
 
-对话树工作流（多条线索并行推进）：
+# 对话树：开分支 / 检索历史 / 任务分片并行
+_P_BRANCH = """对话树工作流（多条线索并行推进）：
 9. 发现值得单独深挖的可疑点（注入点/弱口令/未授权接口/可疑目录等）时，调用 propose_branch
    向用户建议开辟新线索，由用户确认；新线索会带上相关记录独立推进，避免当前对话信息过载。
 10. 需要其他线索里已查到的信息时，调用 search_history 按关键词检索（子域名、路径、端口、
     工具结果等），检索到的内容是已证实的工具输出，可直接引用；检索不到就继续用工具查证。
     另：任务面较宽、子任务之间互不依赖时（例如「同时做子域收集 / 指纹识别 / 目录探测」），
     调用 split_task 把它们拆成 2~4 份并发执行，全部跑完会自动汇总回本线索，你再基于汇总推进。
-    子任务内只允许 L0/L1 自动执行的工具，L2/L3 会被拒绝——需要人工确认的动作留在主线索做。
+    子任务内只允许 L0/L1 自动执行的工具，L2/L3 会被拒绝——需要人工确认的动作留在主线索做。"""
 
-知识库与测绘（kb / fofa）：
+# 知识库与测绘：打法索引、安全红线、FOFA 种子闭环、报告闸门
+_P_KB_FOFA = """知识库与测绘（kb / fofa）：
 11. 进站先调用 kb_read 读「打穿短表」（手法索引，当开场几枪），再按目标特征用 kb_search 找
     对应打法篇目并用 kb_read 读全文后动手——禁止凭空编测试手法，禁止每站通读全部篇目。
     特征对照速查：有用户体系→idor-test+authbypass-test；有搜索/筛选→injection-test；有上传→
@@ -153,24 +168,93 @@ SYSTEM_PROMPT = """你是一个渗透测试编排助手，服务于 SRC（安全
     去重去废存活确认 → 剩余活面挖完 → 才查下一个种子；禁止多种子一次搜完再挖、禁止拿
     测绘充数代替实际挖掘。查到的每个活面都要真实探测。
 14. 写正式漏洞报告前先 kb_read 读 vuln-report-format（报告取舍闸门：认钥闸/匿名闸/不写清单，
-    低危信息类默认不单独成篇；最终落库仍按本项目补天格式）。
+    低危信息类默认不单独成篇；最终落库仍按本项目补天格式）。"""
 
-Web 站点渗透 SOP（不可跳步，先手工后工具）：
+# Web 站点渗透 SOP：先手工后工具，不可跳步
+_P_WEB_SOP = """Web 站点渗透 SOP（不可跳步，先手工后工具）：
 ① 打开页面看结构 → ② 查源码/JS/注释/接口，收集泄露信息（凭据、API、内网路径）→
 ③ 逐个测正常功能（登录/搜索/上传）并留意每步请求 → ④ 确认无隐藏逻辑后才跑自动化
 工具（目录/漏洞扫描）→ ⑤ 工具无果时从「功能与逻辑」视角推断漏洞：IDOR/越权/认证绕过/
-SSTI/文件上传/命令注入/SSRF/XXE/竞态/路径穿越等。发现任何凭据或漏洞先记录存证，再继续。
+SSTI/文件上传/命令注入/SSRF/XXE/竞态/路径穿越等。发现任何凭据或漏洞先记录存证，再继续。"""
 
-可用工具（别名 = 工具名 | 分类 | 风险等级 | 说明）：
+# 工具清单占位符 + 风险等级说明（tool_list 由 registry 注入）
+_P_TOOLS = """可用工具（别名 = 工具名 | 分类 | 风险等级 | 说明）：
 {tool_list}
 
 风险等级含义：L0 只读、L1 主动扫描、L2 漏洞利用、L3 权限与横向移动。
-L2/L3 工具需要用户授权确认才会执行，你可以正常选择它们。
-"""
+L2/L3 工具需要用户授权确认才会执行，你可以正常选择它们。"""
+
+
+# 片段的排列顺序 = 提示词里的出现顺序，改动顺序等于改动提示语义，不要随手调
+_SYSTEM_FRAGMENTS = (
+    _P_ROLE_PRINCIPLES,
+    _P_REDLINES,
+    _P_BRANCH,
+    _P_KB_FOFA,
+    _P_WEB_SOP,
+    _P_TOOLS,
+)
+
+
+def compose_system_prompt(*extra: str) -> str:
+    """按顺序拼装系统提示词；可在末尾追加可选片段（按模式或场景启用）。
+
+    片段之间用空行分隔；结尾保留一个换行（与拆分前的字面量逐字一致）。
+    追加的 extra 请自带开头换行，例如 "\n\n【X】..."。
+    """
+    return "\n\n".join(_SYSTEM_FRAGMENTS) + "\n" + "".join(extra)
+
+
+SYSTEM_PROMPT = compose_system_prompt()
 
 
 # 目标参数中出现这些特征，说明模型把说明文字当成了目标
 _BAD_TARGET_PATTERNS = ("请提供", "请用户", "请确认", "请输入", "未知", "待定", "？", "?", "示例")
+
+
+def _budget_note(budget: dict) -> str:
+    # 预算感知（2026-09-16）：把「已用/剩余步数 + 已跑时长」明确写进上下文。
+    # 不写这段时，模型不知道自己还剩几步，常把预算耗在重复试探上，最后在上限处被硬截断——
+    # 结论没拿到，工具调用也白花。剩余步数不多时切换成「强制收敛」口径。
+    total = int(budget.get("total") or 0)
+    step_no = int(budget.get("step_no") or 0)
+    done = max(step_no - 1, 0)
+    left = max(total - done, 0)
+    mins, secs = divmod(int(budget.get("elapsed") or 0), 60)
+    elapsed = f"{mins} 分 {secs} 秒" if mins else f"{secs} 秒"
+    head = (f"\n\n【执行预算】第 {step_no}/{total} 步（已完成 {done} 步，含本步尚余 {left} 步），"
+            f"本轮已运行 {elapsed}。")
+    tok = int(budget.get("tokens") or 0)
+    tok_cap = int(budget.get("token_budget") or 0)
+    if tok and tok_cap:
+        head += f"累计 token {tok:,}/{tok_cap:,}。"
+    if total and left <= config.BUDGET_REMIND_AT:
+        return head + (
+            "预算即将耗尽，必须立刻收敛：优先把手上已有证据整理成结论并调用 halt_task 收尾；"
+            "不要再开启新的扫描面，也不要再发起长耗时的工具调用。"
+            "若确有未完成的关键动作，只保留最重要的一个，做完立即给结论。"
+        )
+    return head + "预算充足，按最优顺序推进即可。"
+
+
+def _budget_exhausted_note(session, total: int) -> str:
+    # 步数耗尽时的收尾：给出「跑到哪了」的归因，而不是一句干巴巴的「已达最大步数」。
+    ok = sum(1 for st in session.steps if st.status == "done")
+    bad = sum(1 for st in session.steps if st.status == "error")
+    attr: dict = {}
+    for st in session.steps:
+        if st.attribution:
+            attr[st.attribution] = attr.get(st.attribution, 0) + 1
+    dist = "、".join(f"{k} {v} 次" for k, v in sorted(attr.items())) or "未归类"
+    if attr.get("SCOPE"):
+        tail = ("注意：本轮出现过 SCOPE 拒绝（授权白名单拦截），属授权边界问题，"
+                "不要靠把该目标加进白名单来重试，除非已取得新的书面授权。")
+    else:
+        tail = ("未完成的部分建议开新线索继续，或调大环境变量 AGENT_MAX_STEPS 后重跑；"
+                "调大只放宽步数上限，不改动风险闸门与限速。")
+    return (f"已达到最大步数 {total}，停止执行。本次共执行 {len(session.steps)} 个步骤"
+            f"（成功 {ok} / 失败 {bad}），失败归因分布：{dist}。\n{tail}")
+
 
 
 def extract_target(text: str) -> str:
@@ -327,8 +411,9 @@ class Step:
     target: str
     args: str
     risk: dict
-    status: str = "pending"  # pending | running | done | denied | error
+    status: str = "pending"  # pending | running | done | denied | error | cancelled
     output: str = ""
+    attribution: str = ""    # 失败归因档位（SCOPE | L1 | L3 | L4），成功时为空
     started_at: float | None = None
     finished_at: float | None = None
 
@@ -341,9 +426,14 @@ class Session:
     steps: list[Step] = field(default_factory=list)
     events: asyncio.Queue = field(default_factory=asyncio.Queue)
     control: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # 当前正在等待人工确认的步骤登记项：{"step_id","token","double_confirm"}。
+    # /confirm 必须先比对它——否则超时未被取走的、或用户连点产生的确认会落到
+    # 「下一次」确认上，等于用户没看过的高危步骤被静默放行。
+    pending_confirm: dict | None = None
     state: str = "idle"  # idle | running | awaiting_confirm | done | error
     target: str = ""     # 从任务描述中提取的目标，每轮重申防止模型遗忘
     nudges: int = 0      # 已催促次数，防止无限追问
+    think_streak: int = 0  # 连续「只想不做」（think）的轮数，防止用思考代替动手
     created_at: float = field(default_factory=time.time)
     # ---- 对话树（线索分支）----
     parent_id: str = ""              # 父会话 id，根线索为 ''
@@ -351,6 +441,7 @@ class Session:
     records: list[str] = field(default_factory=list)  # 开分支时打包带来的记录
     summary: str = ""                # 最近一轮结论摘要（写回父对话/供其他线索引用）
     subtask: bool = False            # 是否由 split_task 派生的并行子任务（子任务内禁 L2/L3）
+    builtin_calls: list[str] = field(default_factory=list)  # 用过的内置工具（不产生 Step 的也要留痕）
     # 当前正在等待用户确认的步骤 id。确认通道是「一次一步」的交互式，
     # 必须有归属才能拒绝「陈旧/伪造/重复」的确认指令（详见 _await_confirm）。
     pending_step_id: str = ""
@@ -470,7 +561,9 @@ class SessionManager:
         s.messages = restore_messages(sid)
         for st in rec["steps"]:
             s.steps.append(Step(
-                id=st.get("id") or uuid.uuid4().hex[:12],
+                # 剥掉 store.save_step 为防主键撞号加过的「会话id:」前缀，
+                # 还原成原始 tool_call_id —— 上下文压缩要靠它与 role=tool 消息配对。
+                id=(st.get("id") or uuid.uuid4().hex[:12]).removeprefix(f"{sid}:"),
                 tool_alias=st.get("tool_alias") or "",
                 tool_name=st.get("tool_name") or "",
                 target=st.get("target") or "",
@@ -478,7 +571,10 @@ class SessionManager:
                 risk={"level": st.get("risk_level") or ""},
                 status=st.get("status") or "done",
                 output=st.get("output") or "",
-                started_at=st.get("created_at"),
+                attribution=st.get("attribution") or "",
+                # 库里存的是 finished_at(=created_at) 与 elapsed，用差值反推 started_at，
+                # 这样 _step_dict 还原出来的耗时与原次一致。
+                started_at=(st.get("created_at") or 0) - float(st.get("elapsed") or 0),
                 finished_at=st.get("created_at"),
             ))
         self.sessions[sid] = s
@@ -577,6 +673,7 @@ class Agent:
         # 注入项目情报库：历史会话沉淀的子域/API/技术栈，避免重复收集
         if session.project:
             system += format_intel(store.get_intel(session.project))
+
             # 注入已证事实库（note_fact / 人工登记），已证实内容无需重复验证。
             # v012 P1-1：只注入 verified——candidate（AI 记录且无溯源背书）不能
             # 冒充「已证」喂回给模型自我强化；数量附在提示里供 review。
@@ -607,7 +704,7 @@ class Agent:
         if session.records:
             rec_lines = "\n".join(f"- {r}" for r in session.records[:RECORD_INJECT_MAX])
             if len(session.records) > RECORD_INJECT_MAX:
-                rec_lines += (f"\n（另有 {len(session.records) - RECORD_INJECT_MAX} 条未展示）")
+                rec_lines += f"\n（另有 {len(session.records) - RECORD_INJECT_MAX} 条未展示）"
             system += (
                 "\n\n【本线索开局背景（从上级对话打包带来的已查记录，可直接引用，"
                 "不要重复验证，也不要质疑其真实性）】\n" + rec_lines
@@ -632,15 +729,17 @@ class Agent:
                 logger.exception("线索树上下文注入失败")
         consecutive_failures = 0
         tokens_used = 0        # 本次任务累计 token（成本熔断用）
-        run_started = time.time()   # 时间预算熔断起点（v011 P1-6）
         failover_count = 0     # 本次任务已自动切换供应商次数（防雪崩上限）
         tried_backends: list[str] = []   # 已失败过的供应商（故障转移排除名单）
         switch_nudged = False  # 「换策略」提醒是否已发过（成功一次后重新武装）
         tools_used = False     # 本次任务是否已实际执行过工具（收尾免催促的依据）
+        halted_answer: str | None = None  # halt_task 的结论；非 None 表示模型主动收尾
         session.nudges = 0     # 催促计数按轮重置：催促防护对每轮任务独立生效
         step_budget = max_steps or config.MAX_STEPS
+        run_started = time.time()  # 本轮墙钟起点：只用于预算提示，不作为闸门
 
         for step_no in range(1, step_budget + 1):
+
             # ---- 取消检查（v011 P1-5 软取消）----
             # 步骤边界处响应：正在跑的那一步让它跑完（单步有总时长上限），
             # 取消后走 persist_interrupted 留半程摘要，成果不归零。
@@ -670,7 +769,13 @@ class Agent:
             self._compress_history(session)
             # 每轮重建提醒：小模型在工具失败后容易「忘记」目标并反问用户，
             # 而且会反复调用同一个刚失败的工具，必须显式告诉它试过了什么。
-            reminder = self._build_reminder(session)
+            reminder = self._build_reminder(session, budget={
+                "step_no": step_no,
+                "total": step_budget,
+                "elapsed": time.time() - run_started,
+                "tokens": tokens_used,
+                "token_budget": config.RUN_TOKEN_BUDGET,
+            })
             messages = [{"role": "system", "content": system + reminder}] + session.messages
 
             await session.emit({"type": "thinking", "step": step_no,
@@ -823,6 +928,22 @@ class Agent:
                 await session.emit({"type": "done", "state": "done"})
                 return
 
+            # ---- 有工具调用：执行模式的消融开关 ----
+            # react（默认）：只执行本轮第一个 tool_call，执行完立刻回到模型重新决策。
+            #   必须同时把 assistant 消息里的 tool_calls 裁到只剩这一个——否则落进历史后，
+            #   会出现「assistant 声明了 N 个调用、却只有 1 个 role=tool 回应」的失配，
+            #   OpenAI 兼容接口会直接报 400。
+            # plan：保留全部调用，一轮批量跑完（适合云端强模型）。
+            if config.EXECUTION_MODE == "react" and len(tool_calls) > 1:
+                dropped = [tc.get("function", {}).get("name", "?") for tc in tool_calls[1:]]
+                tool_calls = tool_calls[:1]
+                await session.emit({
+                    "type": "reasoning",
+                    "data": f"（react 单步模式：本轮只执行第一个调用，已略过 "
+                            f"{len(dropped)} 个后续调用 {'、'.join(dropped)}；"
+                            f"想批量执行可设 AGENT_EXECUTION_MODE=plan）",
+                })
+
             # ---- 有工具调用：逐步执行 ----
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": result.get("content") or ""}
             assistant_msg["tool_calls"] = [
@@ -845,8 +966,12 @@ class Agent:
                 target = str(params.get("target", "")).strip()
                 args = str(params.get("args", "") or "").strip()
                 # 本轮发生过任何工具调用交互（含内置工具/被拒调用）即视为「模型在动手」，
-                # 后续给出结论时直接收尾、不再催促（收尾免催促的判定依据）
-                tools_used = True
+                # 后续给出结论时直接收尾、不再催促（收尾免催促的判定依据）。
+                # 例外：think / halt_task 是元认知工具，不是「干活」——think 只是整理思路，
+                # halt_task 本身就是收尾，二者都不该把本轮标成「已产出」。
+                if alias not in ("think", "halt_task"):
+                    tools_used = True
+                    session.think_streak = 0   # 真动手了，思考计数归零
 
                 # ---- 校验工具名（模型会拼错甚至编造） ----
                 tool, fuzzy = registry.resolve(alias)
@@ -900,11 +1025,28 @@ class Agent:
                         "data": f"工具名 `{alias}` 不存在，已自动纠正为 `{tool.alias}`（{tool.name}）",
                     })
 
-                # ---- 内置「记忆类」工具：不走风险闸门，但**要留下步骤记录** ----
+                # ---- 元认知工具 think / halt_task（L0，纯本地，不走风险闸门）----
+                # think：给模型一个显式的「只想不做」出口，避免它为了整理线索而被迫
+                #        产出一个没用的工具调用；halt_task：给模型一个显式的收尾出口，
+                #        比「不调用工具」语义明确（借鉴 LuaN1ao 的元认知工具设计）。
+                if tool.alias == "think":
+                    # 返回非空字符串 = 空转熔断：由系统收尾，理由随结论一起给出
+                    think_abort = await self._think(session, tc, args)
+                    if think_abort:
+                        halted_answer = think_abort
+                        break
+                    continue
+                if tool.alias == "halt_task":
+                    halted_answer = await self._halt_task(session, tc, args)
+                    break
+
+                # 内置工具留痕：它们不产生 Step（见 _BUILTIN_ALIASES 说明），
+                # 但汇总/提醒需要知道「这条线索用过哪些内置能力」。
+                # ---- 内置「记忆类」工具：不走风险闸门，但要留下步骤记录 ----
                 # 原先这几条直接 continue，于是「读过哪篇知识库 / 记了哪条事实 / 搜了什么词」
                 # 在 steps 表里完全不可见：不在「本轮已尝试过的工具」提醒里（会重复读），
                 # search_history 也搜不到，审计上更是无痕。
-                # 注意顺序：**先执行、后补记**。执行时 steps[-1] 仍是上一条真实工具步骤，
+                # 注意顺序：先执行、后补记。执行时 steps[-1] 仍是上一条真实工具步骤，
                 # 事实溯源要用它；反过来先入列会让 note_fact 把事实挂到自己头上。
                 if tool.alias in BUILTIN_STEP_TOOLS:
                     if tool.alias == "note_fact":
@@ -917,6 +1059,7 @@ class Agent:
                         note = await self._split_task(session, tc, args, allow_split)
                     else:  # kb_search / kb_read / fofa_search
                         note = await self._kb_fofa_tool(session, tool.alias, tc, args)
+                    session.builtin_calls.append(tool.alias)
                     self._record_builtin_step(session, tc, tool, target, args, note)
                     continue
 
@@ -960,7 +1103,7 @@ class Agent:
 
                 # ---- 风险闸门 ----
                 if not risk.get("auto", False):
-                    approved = await self._await_confirm(session, step)
+                    approved, edited_args = await self._await_confirm(session, step)
                     if not approved:
                         step.status = "denied"
                         session.messages.append({
@@ -974,6 +1117,15 @@ class Agent:
                         except Exception:
                             pass
                         continue
+                    # 用户在确认框里改过参数：以改后的为准执行。
+                    # 注意这里只替换 args——真正拼命令仍旧走 executor 的清洗管线
+                    # （剥非法 flag、剥引号、白名单校验），改参数不等于绕过闸门。
+                    if edited_args is not None and edited_args.strip() != step.args.strip():
+                        step.args = edited_args.strip()
+                        await session.emit({
+                            "type": "reasoning",
+                            "data": f"（用户修改了 {tool.name} 的参数，按修改后的参数执行）",
+                        })
 
                 # ---- 执行 ----
                 await self._execute(session, step, tc["id"])
@@ -984,13 +1136,37 @@ class Agent:
                 elif step.status == "error":
                     consecutive_failures += 1
 
+            # ---- 提前收尾（优先于止损判定）----
+            # 两种来源：① 模型调用 halt_task 主动结束；② think 空转熔断，由系统结束。
+            # 变量名沿用 halted_answer，因为两者走的是同一条收尾通路（写回+推送+落库）。
+            if halted_answer is not None:
+                session.messages.append({"role": "assistant", "content": halted_answer})
+                await self._write_back(session, halted_answer)
+                await session.emit({"type": "answer", "data": halted_answer})
+                self._persist_intel(session)
+                session.state = "done"
+                await session.emit({"type": "done", "state": "done"})
+                return
+
             # 失败止损分两档（借鉴 LuaN1ao EXECUTOR_FAILURE_THRESHOLD 的语义）：
             # 连续失败先「要求换策略」再继续，只有在更高阈值上仍连续失败才停止。
             # 原实现连续 3 次即停，但连续三次失败常常只是「同一思路被环境挡住」——
             # 换策略还有得挖，这也是「没到最大步数就停」的主要原因。
             if consecutive_failures >= config.FAILURE_STOP_THRESHOLD:
-                stop_msg = (f"连续 {consecutive_failures} 次执行失败，已停止。"
-                            f"请检查目标可达性、工具参数或授权范围。")
+                # 停止时把归因分布一并说清：是工具跑不起来(L1)、被环境拦(L3)，
+                # 还是假设本身不成立(L4)。含糊的「执行失败」帮不了用户判断下一步。
+                attr = {}
+                for st in session.steps:
+                    if st.attribution:
+                        attr[st.attribution] = attr.get(st.attribution, 0) + 1
+                dist = "、".join(f"{k} {v} 次" for k, v in sorted(attr.items())) or "未归类"
+                stop_msg = (
+                    f"连续 {consecutive_failures} 次执行失败，已停止（已先尝试要求换策略，仍失败）。"
+                    f"失败归因分布：{dist}。\n"
+                    f"L1=工具没跑起来（换参数/放大超时）、L3=被环境或权限拦下（换编码或换手法）、"
+                    f"L4=假设可能不成立（换测试思路）、SCOPE=授权白名单拒绝（属授权边界，必须停手）。\n"
+                    f"请检查目标可达性、工具参数或授权范围。"
+                )
                 await self._write_back(session, stop_msg)
                 await session.emit({
                     "type": "answer",
@@ -1019,12 +1195,76 @@ class Agent:
                     "data": f"（连续 {consecutive_failures} 次失败：已要求模型换策略而非继续重试）",
                 })
 
-        max_steps_msg = f"已达到最大步数 {step_budget}，停止执行。"
+        max_steps_msg = _budget_exhausted_note(session, step_budget)
         await self._write_back(session, max_steps_msg)
         await session.emit({"type": "answer", "data": max_steps_msg})
         self._persist_intel(session)
         session.state = "done"
         await session.emit({"type": "done", "state": "done"})
+
+    # ---------- 元认知工具（L0，纯本地，无任何网络行为） ----------
+    async def _think(self, session: Session, tc: dict, args: str) -> str | None:
+        """think：给模型一个显式的「只想不做」出口。
+
+        为什么需要它：小模型一旦不调工具，就会被催促逻辑当成「忘了动手」，
+        于是它为了显得在干活会随手挑一个工具调用——这正是「瞎猜工具」的主要来源。
+        开一个合法的纯推理出口，比逼它产出垃圾调用更好。
+        因此 think 不算「干过活」（不置 tools_used），不占用执行步数。
+
+        防滥用分两级：到第 THINK_STREAK_MAX 轮时把「必须动手」推进上下文；
+        若它下一轮仍然只推理，就判定为空转并返回一段说明，由 run() 收尾结束本轮——
+        不这么做的话，一个「只想不做」的模型会把整个步数预算全烧在思考上，
+        而每一轮思考都是一次真实的 LLM 调用。
+        """
+        session.think_streak += 1
+        body = (args or "").strip()
+        if body:
+            await session.emit({"type": "reasoning", "data": f"（模型思考一轮）{body[:600]}"})
+            try:
+                store.save_chat_message(session.id, "assistant", f"（思考）{body}", kind="reasoning")
+            except Exception:
+                logger.exception("think 记录落库失败")
+        if session.think_streak > config.THINK_STREAK_MAX:
+            session.messages.append({
+                "role": "tool", "tool_call_id": tc["id"],
+                "content": "已记录。连续推理已达上限，本轮到此结束。",
+            })
+            await session.emit({"type": "reasoning",
+                                "data": f"（连续 {session.think_streak} 轮只推理不动手：判定空转，结束本轮）"})
+            return ("模型连续多轮只推理、没有执行任何工具，本轮已停止。\n"
+                    "最后一条推理没有推进任务；请把任务描述得更具体"
+                    "（指明目标、想用哪个工具、要拿到什么结果）后重试。")
+        if session.think_streak == config.THINK_STREAK_MAX:
+            session.messages.append({
+                "role": "tool", "tool_call_id": tc["id"],
+                "content": "已记录。但你已经连续多轮只推理不动手了——现在必须从可用清单里"
+                           "挑一个真实工具执行，或者调用 halt_task 给出结论。不要再继续思考。",
+            })
+            await session.emit({"type": "reasoning",
+                                "data": f"（连续 {session.think_streak} 轮只思考不动手：已要求立即执行）"})
+            return None
+        session.messages.append({
+            "role": "tool", "tool_call_id": tc["id"],
+            "content": "推理已记录。请基于它立即调用一个真实工具推进；"
+                       "若判断已无可推进方向，调用 halt_task 给出结论。",
+        })
+        return None
+
+    async def _halt_task(self, session: Session, tc: dict, args: str) -> str:
+        """halt_task：模型显式收尾，返回结论文本（由 run() 统一落库、写回与推送）。
+
+        为什么需要它：原来模型想结束只能「不调用工具」，而这个信号与「模型退化、
+        忘了调工具」长得一模一样，只能靠催促次数去猜。给一个显式的结束动作之后，
+        「该不该收尾」就从猜测变成了读取。
+        """
+        answer = (args or "").strip() or "（模型主动结束，但未给出结论）"
+        session.messages.append({
+            "role": "tool", "tool_call_id": tc["id"],
+            "content": "已收到结束指令，本轮到此结束。",
+        })
+        await session.emit({"type": "reasoning", "data": "（模型主动结束本轮并给出结论）"})
+        return answer
+
 
     # ---------- 情报沉淀 ----------
     def _persist_intel(self, session: Session) -> None:
@@ -1107,6 +1347,25 @@ class Agent:
             started_at=now,
             finished_at=now,
         ))
+
+        # 与「真实工具步骤」同口径落库：否则「内存里 N 步 / 库中 0 步」会对不上，
+        # 线索树（list_tree 的 step_count）与 subtask_merged 的 steps 显示会不一致；
+        # 而「可检索、可审计」本就是这套机制的目的（此前 kb_read/note_fact 完全无痕）。
+        try:
+            store.save_step(session.id, {
+                "id": tc["id"],
+                "tool_alias": tool.alias,
+                "tool_name": tool.name,
+                "target": target or "",
+                "args": args or "",
+                "risk": risk,
+                "status": "done",
+                "output": clip_output(note or ""),
+                "attribution": "",
+                "elapsed": None,
+            })
+        except Exception:
+            logger.exception("内置工具步骤落库失败")
 
     async def _note_fact(self, session: Session, tc: dict, target: str, args: str) -> str:
         """note_fact 内置工具执行：写入项目事实库并回馈模型。"""
@@ -1264,8 +1523,10 @@ class Agent:
         # ---- 合并：结论摘要 + 用过的工具 + 期间新增的已证事实 ----
         blocks: list[str] = []
         for c in children:
+            # 成功的外部工具 + 用过的内置工具（内置工具不产生 Step，单独记在 builtin_calls）
             done_tools = list(dict.fromkeys(
-                st.tool_alias for st in c.steps if st.status == "done")) or ["（无）"]
+                [st.tool_alias for st in c.steps if st.status == "done"]
+                + list(c.builtin_calls))) or ["（无）"]
             blocks.append(
                 f"【子任务《{c.title}》· {len(c.steps)} 步 · 用过的工具：{'、'.join(done_tools)}】\n"
                 f"{(c.summary or '（未给出结论）').strip()[:1200]}"
@@ -1289,6 +1550,9 @@ class Agent:
         await session.emit({"type": "subtask_merged", "data": {
             "count": len(children),
             "children": [{"id": c.id, "title": c.title, "steps": len(c.steps),
+                          # 内置工具不产生 Step，单独给一份：否则「只记了事实」的子任务
+                          # 会被界面显示成「0 步」，看起来什么都没干。
+                          "builtins": list(c.builtin_calls),
                           "summary": (c.summary or "")[:300]} for c in children],
         }})
         await session.emit({"type": "reasoning",
@@ -1384,42 +1648,82 @@ class Agent:
                     },
                 })
 
-    # ---------- 上下文压缩（机械式，不调用模型） ----------
-    def _compress_history(self, session: Session) -> None:
-        """把较早的工具输出压成一行摘要，控制上下文膨胀。
+    # ---------- 上下文压缩（机械式，零 token 成本） ----------
+    _STATUS_CN = {"done": "成功", "error": "失败", "denied": "被拒",
+                  "running": "执行中", "pending": "待执行"}
 
-        借鉴 LuaN1ao 的「摘要压缩」思路，但**刻意不做 LLM 摘要**：本地小模型写摘要本身
-        就会产生幻觉，等于用一个不可靠环节去修另一个不可靠环节。这里只做确定性裁剪，
-        而且只改 role=tool 消息的 content、绝不删除消息——删消息会破坏
-        assistant.tool_calls 与 role=tool 的 tool_call_id 配对，导致协议直接报错。
+    def _compress_history(self, session: Session) -> None:
+        """把较早的工具输出压成一行「工具｜目标｜结果」，控制上下文膨胀。
+
+        三个刻意的设计决定：
+        1. **不做 LLM 摘要**。借鉴 LuaN1ao 的「摘要压缩」思路，但只借思路不借实现：
+           本地小模型写摘要本身就会幻觉，等于用一个不可靠环节去修另一个不可靠环节；
+           而这里要压的恰恰是「已证实的工具输出」，被幻觉污染后比不压更糟。
+        2. **零 token 成本**。摘要信息全部来自 `_step_dict()` 已经算好的字段
+           （工具名 / 目标 / 状态 / 归因）加上输出首行的纯裁剪，一行就是一次字符串拼接，
+           不产生任何模型调用。
+        3. **绝不删消息**。只改 role=tool 消息的 content。删消息会破坏
+           assistant.tool_calls 与 role=tool 的 tool_call_id 配对，协议会直接报错。
+
+        归因档位一并写进压缩行：模型回看到的是「某工具在某目标上因被拦(L3)失败」，
+        而不是一句模糊的「执行失败」——否则它会换个工具在同一堵墙上再撞一次。
         """
         msgs = session.messages
         if len(msgs) <= config.HISTORY_COMPRESS_AFTER_MESSAGES:
             return
         keep_from = max(0, len(msgs) - config.HISTORY_KEEP_RECENT)
-        limit = config.HISTORY_SUMMARY_CHARS
+        by_call = {st.id: st for st in session.steps if st.id}
+        excerpt_cap = config.HISTORY_EXCERPT_CHARS
         changed = 0
         for m in msgs[:keep_from]:
             if m.get("role") != "tool":
                 continue
             text = m.get("content") or ""
-            if len(text) <= limit or text.startswith(_COMPRESSED_PREFIX):
+            if text.startswith(_COMPRESSED_PREFIX):
+                continue                    # 幂等：压过的绝不重复压
+            st = by_call.get(m.get("tool_call_id") or "")
+            if st is None:
+                # 没有对应步骤记录（工具名被拦截、子任务内被拒等）：只做长度裁剪
+                if len(text) <= config.HISTORY_SUMMARY_CHARS:
+                    continue
+                m["content"] = (f"{_COMPRESSED_PREFIX}（无执行记录）"
+                                f"{self._first_line(text, config.HISTORY_SUMMARY_CHARS)}")
+                changed += 1
                 continue
-            m["content"] = (
-                f"{_COMPRESSED_PREFIX}{text[:limit]}"
-                f"…（原文 {len(text)} 字符已在本轮上下文中压缩；"
-                f"留档保留了首尾，可用 search_history 按关键词检索）"
-            )
+            d = self._step_dict(st)
+            mark = self._STATUS_CN.get(d["status"], d["status"] or "未知")
+            if d.get("attribution"):
+                mark += f"/{d['attribution']}"
+            parts = [f"{_COMPRESSED_PREFIX}{d['tool_name'] or d['tool_alias']}"]
+            if d.get("target"):
+                parts.append(f"目标 {d['target']}")
+            parts.append(mark)
+            brief = self._first_line(st.output or "", excerpt_cap)
+            if brief:
+                parts.append(brief)
+            m["content"] = "｜".join(parts)
             changed += 1
         if changed:
-            logger.info("上下文压缩：%d 条历史工具输出已摘要化（保留最近 %d 条原文）",
+            logger.info("上下文压缩：%d 条历史工具输出已压成一行（保留最近 %d 条原文）",
                         changed, config.HISTORY_KEEP_RECENT)
 
     # ---------- 防呆提醒 ----------
+    # 压缩辅助：取首个非空行（确定性裁剪，零 token）
     @staticmethod
-    def _build_reminder(session: Session) -> str:
+    def _first_line(text: str, cap: int) -> str:
+        """取首个非空行并截断——纯裁剪，不做任何概括，因此不会引入幻觉。"""
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if line:
+                return line[:cap] + ("…" if len(line) > cap else "")
+        return ""
+
+    @staticmethod
+    def _build_reminder(session: Session, budget: dict | None = None) -> str:
         """每轮注入目标 + 已尝试工具，抑制「遗忘目标」与「重复调同一失败工具」。"""
         parts: list[str] = []
+        if budget:
+            parts.append(_budget_note(budget))
         if session.target:
             if _is_host_like(session.target):
                 note = (f"所有工具的 target 参数都必须填 `{session.target}`，"
@@ -1450,58 +1754,80 @@ class Agent:
         return "".join(parts)
 
     # ---------- 确认流程 ----------
-    async def _await_confirm(self, session: Session, step: Step) -> bool:
-        """等待用户对「这一步」放行/拒绝。L3（double_confirm）强制两轮确认。
+    async def _await_confirm(self, session: Session, step: Step) -> tuple[bool, str | None]:
+        """等待用户确认，返回 (是否放行, 用户改过的 args)。
 
-        session.control 是一条 FIFO 队列，历史实现只取队首、不校验归属，于是：
-          · 会话空闲时往 /confirm 发一条 approved=true（接口当时不校验 state），
-            这条会一直躺在队列里，被**下一个**高危步骤直接消费并自动放行——
-            用户根本没看到确认框，L3 的授权闸门等于不存在；
-          · 前端确认按钮没有防重复点击，双击即预支掉下一次的确认。
-        因此这里做三件事：
-          ① 进入等待前把本步 id 挂到 session.pending_step_id，供接口比对；
-          ② 取到回应后校验 step_id 是否就是本步，不是则丢弃并继续等（拒绝重放）；
-          ③ 无论成功/超时/异常，都在 finally 里复位 state 并**排空队列残留**，
-             避免陈旧指令跨步骤累积。
-        审计 P1-1 追加：risk.double_confirm 的步骤（L3）此前「二次确认」只是前端
-        勾选框 UX，服务端一次 approved 即放行。现改为后端强制两轮：第一轮 approved
-        后发出第二个确认框（second=True），第二轮再 approved 才真正放行；
-        任何一轮拒绝/超时都按拒绝处理。
+        两套闸门机制合流（各取所长）：
+          · 一次性令牌（本机 A 组方案）：need_confirm 下发 token，/confirm 必须原样回传，
+            令牌不符一律丢弃 —— 彻底堵住「上一次的确认」被这一步消费。
+          · step_id 归属校验 + L3 后端强制两轮（009 审计修复）：L3（risk.double_confirm）
+            必须连续两轮 approved 才真正放行，任一轮拒绝/超时即视为拒绝；此前服务端
+            一次 approved 即放行，「二次确认」只是前端勾选框 UX。
+        第二个返回值是「可改参数后执行」的落点：闸门不该只有「放行 / 拒绝」二选一，
+        用户常知道该怎么改（换参数位置、去掉危险开关、缩小范围）却只能整个否掉。
+        返回 None 表示用户没改参数。
         """
-        if not await self._confirm_round(session, step, second=False):
-            return False
+        approved, edited = await self._confirm_round(session, step, second=False)
+        if not approved:
+            return False, None
+        # L3 二次确认：第一轮放行后**由后端强制**再确认一轮（前端只是渲染弹窗）。
         if step.risk.get("double_confirm"):
-            if not await self._confirm_round(session, step, second=True):
-                return False
-        return True
+            again, _ = await self._confirm_round(session, step, second=True)
+            if not again:
+                return False, None
+        return True, edited
 
-    async def _confirm_round(self, session: Session, step: Step, second: bool) -> bool:
-        """单轮确认等待（step_id 严格校验 + 超时 fail-closed + 排空队列）。"""
+    async def _confirm_round(self, session: Session, step: Step,
+                             second: bool) -> tuple[bool, str | None]:
+        """单轮确认等待（双闸门合并版）。
+
+        融合两侧各修了一遍的确认协议：
+          · 一次性令牌（006 血统）：need_confirm 下发 token，/confirm 必须原样回传；
+          · step_id 归属校验（009/013 血统）：必须与本步一致，缺 step_id 一律不放行；
+          · 取消感知（013 v011/v012）：等待期间轮询 cancel_event，收到取消按拒绝处理；
+          · 超时 fail-closed：超时按「拒绝」处理（现象可见且可排查），绝不接受来源不明的放行。
+        返回 (是否放行, 用户改过的 args)；args 为 None 表示未修改。
+        """
+        # 1) 排空上一轮遗留：超时未被取走、或用户连点留下的确认，若不清掉会被本步立刻消费。
+        while not session.control.empty():
+            try:
+                session.control.get_nowait()
+            except Exception:
+                break
+
+        # 2) 本轮一次性令牌 + 归属登记：/confirm 必须先比对 pending_confirm 才允许入队。
+        token = uuid.uuid4().hex[:12]
+        session.pending_confirm = {
+            "step_id": step.id,
+            "token": token,
+            "double_confirm": bool(step.risk.get("double_confirm")),
+        }
         session.pending_step_id = step.id
         session.state = "awaiting_confirm"
         await session.emit({
             "type": "need_confirm",
             "step": self._step_dict(step),
             "risk": step.risk,
-            "second": second,
+            "token": token,          # 前端必须原样回传
+            "second": second,        # 供前端区分「首次 / 二次确认」文案
         })
         if second:
             await session.emit({
                 "type": "reasoning",
-                "data": f"（{step.tool_name} 为 L3 高危操作，已收到第一次确认，"
+                "data": f"（{step.tool_name} 为 L3 高危操作：已收到第一次确认，"
                         "请再次确认以完成二次授权）",
             })
         approved = False
+        edited: str | None = None
         try:
             deadline = time.monotonic() + config.CONFIRM_TIMEOUT
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise asyncio.TimeoutError
-                # v011/v012：等待确认的同时响应取消请求。cancel_event 是
-                # threading.Event（无循环绑定），不能进 asyncio.wait——用
-                # 0.1s 分片轮询：每片等确认队列，片间查取消标志。
-                # 取消按拒绝处理（fail-closed 路径）。
+                # 等待确认的同时响应取消请求：cancel_event 是 threading.Event
+                # （无循环绑定），不能进 asyncio.wait——用 0.1s 分片轮询：
+                # 每片等确认队列，片间查取消标志。取消按拒绝处理（fail-closed）。
                 try:
                     resp = await asyncio.wait_for(session.control.get(),
                                                   timeout=min(remaining, 0.1))
@@ -1516,27 +1842,31 @@ class Agent:
                 # 现象可见且可排查），也不接受一条来源不明的放行（fail-open，危险且无声）。
                 rid = str(resp.get("step_id") or "")
                 if rid != step.id:
-                    logger.warning("忽略与当前步骤不匹配的确认指令：step_id=%r 当前=%r",
-                                   rid, step.id)
+                    logger.warning("忽略与当前步骤不匹配的确认：step_id=%r 当前=%r", rid, step.id)
+                    continue
+                if resp.get("token") != token:
+                    logger.warning("忽略令牌不匹配的确认（可能来自上一轮或伪造）")
                     continue
                 approved = bool(resp.get("approved"))
+                raw = resp.get("args")
+                edited = raw if isinstance(raw, str) else None
                 break
         except asyncio.TimeoutError:
-            await session.emit({"type": "error", "data": "确认超时，已取消该步骤"})
+            logger.warning("确认超时（session=%s step=%s）：按拒绝处理", session.id, step.id)
             approved = False
         finally:
+            session.pending_confirm = None
             session.pending_step_id = ""
             # 复位状态机：历史实现只在成功路径复位，超时后 state 会永远停在
-            # awaiting_confirm（前端据此一直显示「执行中」，落库也是脏状态）。
+            # awaiting_confirm（前端一直显示「执行中」，落库也是脏状态）。
             session.state = "running"
-            # 排空残留：超时/异常后队列里可能还压着用户此前的点击，
-            # 留着就会被下一步白白消费掉。
+            # 排空残留：超时/异常后队列里可能还压着用户此前的点击，留着会被下一步白白消费掉。
             while not session.control.empty():
                 try:
                     session.control.get_nowait()
                 except Exception:
                     break
-        return approved
+        return approved, (edited if approved else None)
 
     # ---------- 失败归因分层 ----------
     @staticmethod
@@ -1655,11 +1985,13 @@ class Agent:
         content = step.output or "（工具无输出）"
         if not ok:
             level, guidance = self._attribute_failure(step, exit_code)
+            step.attribution = level
             content = (
                 f"【{step.tool_name} 执行失败｜归因 {level}】退出码 {exit_code}。输出如下：\n{content}\n"
                 f"禁止用同样参数再次调用 {step.tool_name}。{guidance}"
             )
         elif not meaningful:
+            step.attribution = "L4"
             # 退出码 0 但完全没有输出：多数情况说明「这个面不存在」，
             # 明确告诉模型这本身算一种结论，别重复调用同一工具同一参数。
             content = (
@@ -1680,6 +2012,8 @@ class Agent:
             "args": step.args,
             "risk": step.risk,
             "status": step.status,
+            # 失败归因档位（006 保留字段）：落库与复盘统计都依赖它
+            "attribution": step.attribution,
             # 落库/回前端前统一裁剪：头 + 尾都保留（原来只留尾部 output[-2000:]，
             # 会把工具开头的关键结果永久丢掉，而上下文压缩又提示模型「可检索」）。
             "output": clip_output(step.output),

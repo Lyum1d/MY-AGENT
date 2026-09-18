@@ -27,6 +27,18 @@
   --scrollbar: #2c3442;
   --scrollbar-hover: #3a4455;
   --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, "JetBrains Mono", monospace;
+  /* ---- 线索图（攻击图 / 因果图）节点类型色 ---- */
+  --g-project: #9a6cff;
+  --g-thread: #6d7cff;
+  --g-evidence: #38bdf8;
+  --g-keyfact: #fbbf24;
+  --g-hypothesis: #a78bfa;
+  --g-vuln: #fb923c;
+  --g-confirmed: #f87171;
+  --g-exploit: #f472b6;
+  --g-credential: #34d399;
+  --g-link: #3d4658;
+  --g-accent: #22d3ee;
 }
 
 :root[data-theme="light"] {
@@ -57,6 +69,18 @@
   --confirm-desc: #8a6a1f;
   --scrollbar: #cbd2dd;
   --scrollbar-hover: #aeb7c5;
+  /* ---- 线索图（攻击图 / 因果图）节点类型色 ---- */
+  --g-project: #6a4ff0;
+  --g-thread: #4f6ef7;
+  --g-evidence: #0284c7;
+  --g-keyfact: #d97706;
+  --g-hypothesis: #7c3aed;
+  --g-vuln: #ea580c;
+  --g-confirmed: #dc2626;
+  --g-exploit: #db2777;
+  --g-credential: #16a34a;
+  --g-link: #94a3b8;
+  --g-accent: #0891b2;
 }
 
 * { box-sizing: border-box; }
@@ -316,6 +340,15 @@ button.icon-btn { font-size: 16px; padding: 6px 10px; line-height: 1; }
 .confirm .actions { display: flex; gap: 8px; align-items: center; }
 .confirm label { font-size: 13px; display: flex; align-items: center; gap: 6px; color: var(--muted); }
 
+/* 确认框里的参数输入：默认只读的 <code> 改成可编辑，用户改完即按改后的执行 */
+.cfm-args {
+  width: 100%; min-height: 56px; margin: 0 0 10px; padding: 7px 9px; resize: vertical;
+  font-family: ui-monospace, Consolas, "Courier New", monospace; font-size: 12px; line-height: 1.55;
+  color: var(--text); background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.cfm-args:focus { outline: none; border-color: var(--accent); }
+
 /* 输入条 */
 .input-bar {
   display: flex; gap: 10px; align-items: flex-end; padding: 12px 16px 16px;
@@ -519,3 +552,90 @@ button.icon-btn { font-size: 16px; padding: 6px 10px; line-height: 1; }
 ::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
 ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); background-clip: content-box; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------- 线索图（攻击图 / 因果图） ---------- */
+/* 渲染逻辑在 web/graph.js：零依赖 SVG 分层 DAG（拓扑定层 + 重心法减交叉）。
+   这里只放容器与图元样式；颜色一律走变量，亮/暗主题自动跟随。 */
+.graph-modal {
+  width: 1180px; max-width: 96vw; height: 84vh; max-height: 88vh;
+  display: flex; flex-direction: column; padding: 0; overflow: hidden;
+}
+.graph-modal .modal-head {
+  margin-bottom: 0; padding: 14px 18px 11px;
+  border-bottom: 1px solid var(--border); gap: 12px; flex-shrink: 0;
+}
+.graph-tabs { display: flex; gap: 4px; margin-left: auto; }
+.gtab {
+  font-size: 12px; padding: 3px 12px; border-radius: 7px; cursor: pointer;
+  color: var(--muted); border: 1px solid transparent; transition: color .15s, background .15s;
+}
+.gtab:hover { color: var(--text); }
+.gtab.active { color: var(--accent-text); background: var(--accent-soft); border-color: var(--accent); }
+.graph-legend {
+  display: flex; flex-wrap: wrap; gap: 12px; padding: 7px 18px; flex-shrink: 0;
+  border-bottom: 1px solid var(--border); font-size: 11.5px; color: var(--muted);
+}
+.graph-legend .gl-item { display: flex; align-items: center; gap: 5px; }
+.graph-legend .gl-item i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.graph-canvas {
+  position: relative; flex: 1; min-height: 240px; overflow: hidden; background: var(--bg);
+}
+.graph-hint {
+  font-size: 11px; color: var(--muted); padding: 6px 18px; flex-shrink: 0;
+  border-top: 1px solid var(--border);
+}
+.graph-canvas .gsvg { width: 100%; height: 100%; display: block; cursor: grab; }
+.graph-canvas .gsvg.grabbing { cursor: grabbing; }
+.graph-canvas .graph-empty {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--placeholder); font-size: 12.5px; pointer-events: none; padding: 0 24px; text-align: center;
+}
+/* 悬停提示气泡 */
+.graph-tip {
+  position: absolute; z-index: 5; max-width: 290px; pointer-events: none;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px;
+  padding: 8px 10px; box-shadow: 0 8px 22px rgba(0,0,0,.35);
+}
+.graph-tip .gt-title { font-size: 12.5px; font-weight: 600; margin-bottom: 2px; }
+.graph-tip .gt-meta { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.graph-tip .gt-desc { font-size: 11.5px; color: var(--reasoning-text); line-height: 1.55; }
+/* 节点详情面板 */
+.graph-panel {
+  position: absolute; z-index: 6; right: 12px; top: 12px; width: 265px;
+  max-height: calc(100% - 24px); overflow-y: auto;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+  padding: 11px 12px; box-shadow: 0 10px 26px rgba(0,0,0,.35);
+}
+.graph-panel .gp-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
+.graph-panel .gp-type { font-size: 11px; font-weight: 600; }
+.graph-panel .gp-x {
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 0 2px;
+}
+.graph-panel .gp-x:hover { color: var(--danger); }
+.graph-panel .gp-title { font-size: 13px; font-weight: 600; margin-bottom: 4px; word-break: break-word; }
+.graph-panel .gp-meta { font-size: 11.5px; color: var(--muted); margin-bottom: 6px; }
+.graph-panel .gp-bar { height: 6px; border-radius: 3px; background: var(--panel-3); overflow: hidden; margin-bottom: 7px; }
+.graph-panel .gp-bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+.graph-panel .gp-desc { font-size: 12px; color: var(--reasoning-text); line-height: 1.6; margin-bottom: 7px; }
+.graph-panel .gp-pre {
+  margin: 0 0 8px; padding: 7px 8px; font-size: 11px; font-family: var(--mono);
+  white-space: pre-wrap; word-break: break-all; max-height: 190px; overflow-y: auto;
+  background: var(--code-bg); color: var(--code-text); border-radius: 7px;
+}
+.graph-panel .gp-acts { display: flex; flex-wrap: wrap; gap: 6px; }
+/* ---- SVG 图元 ---- */
+.gsvg .gn-box { fill: var(--panel-2); stroke: var(--border); stroke-width: 1.2; transition: stroke .15s; }
+.gsvg .gnode:hover .gn-box { stroke: var(--accent); }
+.gsvg .gnode.cur .gn-box,
+.gsvg .gnode.sel .gn-box { stroke: var(--accent); stroke-width: 2; }
+.gsvg .gnode.onpath .gn-box { stroke: var(--accent-text); }
+.gsvg .gnode.dimmed { opacity: .25; }
+.gsvg .gn-pilltext { font-size: 10px; fill: #fff; text-anchor: middle; }
+.gsvg .gn-title { font-size: 12px; fill: var(--text); }
+.gsvg .gn-sub { font-size: 10.5px; fill: var(--muted); }
+.gsvg .glink { fill: none; stroke: var(--g-link); stroke-width: 1.4; }
+.gsvg .glink.active { stroke: var(--accent); stroke-width: 2; }
+.gsvg .glink.dimmed { opacity: .18; }
+.gsvg .glabel { font-size: 10px; fill: var(--muted); }
+.gsvg .g-arrow-head { fill: var(--g-link); }

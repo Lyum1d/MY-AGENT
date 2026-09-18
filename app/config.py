@@ -78,7 +78,19 @@ DEFAULT_RISK_LEVEL = "L2"  # 未定级工具一律按 L2 处理，宁严不松
 SCRIPTABLE_TYPES = {"命令行", "Python", "JAVA8", "JAVA11", "批处理"}
 
 # ---------- Agent ----------
-MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "12"))  # 单轮最多执行步数，防止死循环
+MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "30"))  # 单轮最多执行步数，防止死循环
+# think 空转上限：到这一轮把「必须动手」推进上下文，再下一轮仍只推理就结束本轮。
+# 目的是不让一个「只想不做」的模型把步数预算全烧在思考上（每轮都是一次 LLM 调用）。
+THINK_STREAK_MAX = int(os.getenv("AGENT_THINK_STREAK_MAX", "3"))
+
+# 预算感知：剩余步数 <= 该值时，每轮在上下文里明确提示「即将超支」并要求收敛。
+BUDGET_REMIND_AT = int(os.getenv("AGENT_BUDGET_REMIND_AT", "3"))
+
+# 执行模式（消融开关）：react=严格单步，plan=整轮批量执行。
+EXECUTION_MODE = os.getenv("AGENT_EXECUTION_MODE", "react").strip().lower()
+if EXECUTION_MODE not in ("react", "plan"):
+    EXECUTION_MODE = "react"
+
 TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "600"))  # 单工具总时长上限（秒）
 TOOL_IDLE_TIMEOUT = int(os.getenv("TOOL_IDLE_TIMEOUT", "120"))  # 无输出多久判定卡死（秒）
 MAX_OUTPUT_LINES = int(os.getenv("MAX_OUTPUT_LINES", "2000"))  # 单工具最多回传多少行
@@ -95,6 +107,7 @@ INTEL_CAP = int(os.getenv("INTEL_CAP", "150"))
 # 幻觉，等于用一个不可靠环节去修另一个不可靠环节。只压 role=tool 消息的正文，绝不删消息。
 HISTORY_COMPRESS_AFTER_MESSAGES = int(os.getenv("HISTORY_COMPRESS_AFTER_MESSAGES", "24"))
 HISTORY_KEEP_RECENT = int(os.getenv("HISTORY_KEEP_RECENT", "12"))   # 最近 N 条保持原文
+HISTORY_EXCERPT_CHARS = int(os.getenv("HISTORY_EXCERPT_CHARS", "80"))
 HISTORY_SUMMARY_CHARS = int(os.getenv("HISTORY_SUMMARY_CHARS", "300"))  # 压缩后每条保留多少字
 
 # ---------- 续聊记忆恢复（SessionManager.adopt） ----------
@@ -166,6 +179,15 @@ SCOPE_FILE = DATA_DIR / "scope.json"  # 授权域名白名单
 # 注意：白名单为空时一律拒绝执行（含未配置 scope.json 的情况），
 #   宁可让工具跑不起来，也不能静默放行未授权目标。
 ENFORCE_SCOPE = os.getenv("ENFORCE_SCOPE", "1") == "1"
+
+# ---- 出网限速（实现见 app/ratelimit.py）----
+TOOL_MIN_INTERVAL = float(os.getenv("TOOL_MIN_INTERVAL", "1.0"))
+GLOBAL_MIN_INTERVAL = float(os.getenv("GLOBAL_MIN_INTERVAL", "0.2"))
+
+# ---- 远程访问（run.py 拒绝启动 + app/main.py 令牌中间件）----
+ALLOW_REMOTE = os.getenv("ALLOW_REMOTE", "0") == "1"
+ACCESS_TOKEN = os.getenv("SRC_AGENT_TOKEN", "")
+
 
 # ---------- Python 代码执行通道（py_exec，Agent 直出代码） ----------
 PY_EXEC_TIMEOUT = int(os.getenv("PY_EXEC_TIMEOUT", "90"))    # 单段代码上限（秒），超时中断

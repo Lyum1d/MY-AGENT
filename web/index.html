@@ -131,7 +131,7 @@
     <div class="panel-body" id="factList"><div class="empty">暂无已证事实</div></div>
 
     <div class="report-bar">
-      <button class="ghost" onclick="openGraphView()">🗺 线索图</button>
+      <button class="ghost" onclick="openGraph()">🗺 线索图</button>
       <button class="ghost" onclick="viewReport()">查看报告</button>
       <button class="primary" onclick="exportReport()">导出报告</button>
     </div>
@@ -139,21 +139,24 @@
 
 </div>
 
-<!-- ============ 线索图（攻击图 / 因果图） · v012 P2-1 恢复 ============ -->
-<div id="graphModal" class="modal-mask" style="display:none;">
-  <div class="modal" style="width:min(1100px, 94vw); height:min(760px, 92vh); display:flex; flex-direction:column;">
+<!-- ============ 线索图（攻击图 / 因果图） ============ -->
+<div id="graphModal" class="modal-mask">
+  <div class="modal graph-modal">
     <div class="modal-head">
-      <b>线索图</b>
+      <b>线索图 · 项目推理全景</b>
+      <div class="graph-tabs">
+        <div class="gtab active" id="gTabAttack" onclick="switchGraph('attack')">攻击图</div>
+        <div class="gtab" id="gTabCausal" onclick="switchGraph('causal')">因果图</div>
+      </div>
       <div style="display:flex;gap:8px;align-items:center;">
-        <button class="sm" id="graphTabAttack" onclick="switchGraphView('attack')">攻击图</button>
-        <button class="sm" id="graphTabCausal" onclick="switchGraphView('causal')">因果图</button>
-        <button class="sm" onclick="GraphView &amp;&amp; GraphView.fit()">适应窗口</button>
-        <button class="sm" onclick="closeGraphView()">关闭</button>
+        <button class="ghost sm" onclick="graphFit()" title="缩放平移到刚好容纳全图">适应窗口</button>
+        <button class="mini" id="gDeriveBtn" onclick="deriveCausal()" title="按现有工具执行 / 已证事实 / 漏洞发现重建整张因果图">从数据派生</button>
+        <button class="mini" onclick="closeGraph()">关闭</button>
       </div>
     </div>
-    <div class="modal-tip" id="graphLegend"></div>
-    <!-- graph.js mount 宿主：GraphView 会在此创建 canvas / 空态 / 详情面板 -->
-    <div id="graphHost" style="flex:1; position:relative; min-height:0; border:1px solid var(--border,#e3e3e3); border-radius:8px; overflow:hidden;"></div>
+    <div class="graph-legend" id="graphLegend"></div>
+    <div class="graph-canvas" id="graphCanvas"></div>
+    <div class="graph-hint">滚轮缩放 · 拖拽平移 · 双击空白适应窗口 · 单击节点看详情；攻击图上单击「线索」节点可直接切到那条对话。</div>
   </div>
 </div>
 
