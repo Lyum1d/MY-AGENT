@@ -597,9 +597,18 @@ async def add_finding(pid: str, req: FindingRequest):
 
 @app.post("/api/projects/{pid}/findings/{fid}/review")
 async def review_finding(pid: str, fid: str, req: ReviewRequest):
-    """人工复核漏洞（v012 P1-1）：确认后方可进正式报告的「已确认漏洞」章节。"""
+    """人工复核漏洞（v012 P1-1）：确认后方可进正式报告的「已确认漏洞」章节。
+
+    v017.4 硬闸门：action=confirmed 时五项 checklist 必须全部勾选——
+    「可重复/权限差异明确/最小复现链/只读或无损害/影响可证明」缺任何一项
+    都拒绝确认（400），防止半证据漏洞流进正式报告。
+    """
     if not store.get_project(pid):
         raise HTTPException(404, "项目不存在")
+    if req.action == "confirmed" and not store.checks_complete(fid):
+        raise HTTPException(
+            400, "五项复核清单未完成（可重复/权限差异/复现链/只读或无损害/影响可证明），"
+                 "请先在复核清单中逐项确认后再执行确认。")
     rec = store.review_finding(pid, fid, req.action, req.note)
     if rec is None:
         raise HTTPException(404, "漏洞发现不存在或不属于该项目")
@@ -1228,18 +1237,97 @@ async def diff_run(pid: str, req: DiffRunRequest):
         anon_note = ("匿名请求同样返回 200——请进一步确认该接口是否本应需要登录"
                      "（未授权访问线索，与越权结论分开验证）")
 
+    # 证据链落库（v017.4）：只存脱敏数据，可回溯
+    masked = (req.target_value[:2] + "***" + req.target_value[-2:]) \
+        if len(req.target_value) > 6 else req.target_value
+    run_id = store.add_diff_run(pid, {
+        "request_id": req.request_id,
+        "baseline_identity": base_rec.get("label", ""),
+        "target_field": req.target_field,
+        "target_location": req.target_location,
+        "target_value_masked": masked,
+        "verdict": verdict.get("verdict", ""),
+        "reason": verdict.get("reason", ""),
+        "stable": stable,
+        "steps": steps,
+        "variant_url": variant_req["url"],
+    })
+
+    # 一键登记候选的预填材料（suspect 时前端直接调 POST /findings）
+    finding_draft = None
+    if verdict.get("verdict") == "suspect_idor":
+        finding_draft = {
+            "title": f"疑似越权：基准身份可访问他人对象（{req.target_field}={masked}）",
+            "severity": "高危",
+            "target": urlsplit(variant_req["url"]).netloc,
+            "vuln_type": "水平越权/IDOR",
+            "detail": (f"差分判定：{verdict.get('reason', '')}\n\n"
+                       f"基准身份 {base_rec.get('label', '')} 请求替换对象"
+                       f"（{req.target_field}={masked}，{req.target_location} 位置）后"
+                       f"返回了他人对象数据；变体重复 {repeat} 次结果"
+                       f"{'一致' if stable else '不一致'}。\n"
+                       f"差分记录：{run_id}。请在请求库/Burp 中人工核对响应后补充完整复现链。"),
+            "evidence": "\n".join(
+                f"{s.get('tag')}: {s.get('status') or s.get('error') or ''} {s.get('url', '')}"
+                for s in steps),
+            "reproduction": (f"1. 以 {base_rec.get('label', '')} 身份登录；\n"
+                             f"2. 访问 {variant_req['url']}；\n"
+                             f"3. 响应中包含非本人对象数据（目标 {masked}）；\n"
+                             f"4. 重复请求结果一致。"),
+        }
+
     return {
+        "run_id": run_id,
         "verdict": verdict,
         "stable": stable,
         "steps": steps,
         "anonymous_note": anon_note,
         "variant_url": variant_req["url"],
         "target": {"field": req.target_field, "location": req.target_location,
-                   "value_masked": (req.target_value[:2] + "***" + req.target_value[-2:])
-                   if len(req.target_value) > 6 else req.target_value},
+                   "value_masked": masked},
+        "finding_draft": finding_draft,
         "note": ("suspect_idor 仅为候选建议：请在请求库/Burp 中人工核对响应内容，"
                  "确认对象归属后用「登记漏洞」写入候选（draft），复核确认才进报告。"),
     }
+
+
+@app.get("/api/projects/{pid}/diff-runs")
+async def list_diff_runs(pid: str, limit: int = 50):
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return {"items": store.list_diff_runs(pid, limit=limit)}
+
+
+# ---------- 五项复核清单（v017.4） ----------
+CHECK_KEYS = ("c1_repeat", "c2_permission_delta", "c3_minimal_chain",
+              "c4_readonly_or_safe", "c5_impact_proven")
+
+
+class ChecklistRequest(BaseModel):
+    c1_repeat: bool = False
+    c2_permission_delta: bool = False
+    c3_minimal_chain: bool = False
+    c4_readonly_or_safe: bool = False
+    c5_impact_proven: bool = False
+    note: str = ""
+
+
+@app.get("/api/projects/{pid}/findings/{fid}/checklist")
+async def get_checklist(pid: str, fid: str):
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    if not any(f["id"] == fid for f in store.list_findings(pid)):
+        raise HTTPException(404, "漏洞发现不存在或不属于该项目")
+    return store.get_checks(fid) or {k: 0 for k in CHECK_KEYS} | {"note": ""}
+
+
+@app.put("/api/projects/{pid}/findings/{fid}/checklist")
+async def set_checklist(pid: str, fid: str, req: ChecklistRequest):
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    if not any(f["id"] == fid for f in store.list_findings(pid)):
+        raise HTTPException(404, "漏洞发现不存在或不属于该项目")
+    return store.set_checks(fid, req.model_dump(), note=req.note)
 
 
 @app.get("/api/sessions/{sid}/stream")

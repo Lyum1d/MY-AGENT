@@ -211,6 +211,15 @@ def _finding_detail(i: int, f: dict) -> list[str]:
     L.append(f"\n**修复建议**\n\n{f.get('remediation') or remediation_for(f.get('vuln_type'))}\n")
     if f.get("review_note"):
         L.append(f"\n> 人工复核备注：{_esc_cell(f['review_note'])}\n")
+    # v017.4：复核清单状态（五项勾选进报告——缺项标 ⚠ 提示报告可信度缺口）。
+    # 无清单记录 = 未复核：同样按全缺显示（比静默不渲染更诚实）。
+    ck = store.get_checks(f.get("id") or "") or {}
+    items = [("可重复验证", "c1_repeat"), ("权限差异明确", "c2_permission_delta"),
+             ("最小复现链完整", "c3_minimal_chain"),
+             ("只读或无真实损害", "c4_readonly_or_safe"),
+             ("影响可证明", "c5_impact_proven")]
+    marks = "；".join(f"{'✔' if ck.get(k) else '⚠ 缺'} {name}" for name, k in items)
+    L.append(f"\n**复核清单**：{marks}\n")
     return L
 
 

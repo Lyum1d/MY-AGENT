@@ -66,6 +66,7 @@ PY_TESTS = [
     ("请求导入（Burp/HAR，v017.1）", "test_import.py", False),
     ("测试身份库与 DPAPI（v017.2）", "test_identity_store.py", False),
     ("只读身份差分（v017.3）", "test_diff.py", False),
+    ("证据链与复核闸门（v017.4）", "test_evidence_bundle.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

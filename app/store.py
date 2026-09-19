@@ -116,6 +116,35 @@ CREATE TABLE IF NOT EXISTS identities (
     created_at    REAL
 );
 CREATE INDEX IF NOT EXISTS idx_identities_proj ON identities(project_id);
+-- v017.4 差分运行记录：只读身份差分的证据链（可回溯到执行序列）。
+-- 只存脱敏数据：目标对象值打码、身份只存 label——凭据从不入此表。
+CREATE TABLE IF NOT EXISTS diff_runs (
+    id            TEXT PRIMARY KEY,
+    project_id    TEXT,
+    request_id    TEXT,
+    baseline_identity TEXT,         -- 基准身份 label（非 id，审计可读）
+    target_field  TEXT,
+    target_location TEXT,
+    target_value_masked TEXT,
+    verdict       TEXT,             -- suspect_idor | access_denied | no_diff | unstable | invalid_baseline
+    reason        TEXT,
+    stable        INTEGER DEFAULT 0,
+    steps_json    TEXT,             -- 执行序列 JSON（URL + 状态码 + 错误）
+    variant_url   TEXT,
+    created_at    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_diff_runs_proj ON diff_runs(project_id);
+-- v017.4 五项复核清单（finding 一对一）。确认闸门：五项不全 → 拒绝 confirmed。
+CREATE TABLE IF NOT EXISTS finding_checks (
+    finding_id  TEXT PRIMARY KEY,
+    c1_repeat INTEGER DEFAULT 0,          -- 至少重复两次且结果一致
+    c2_permission_delta INTEGER DEFAULT 0, -- 权限/身份差异明确
+    c3_minimal_chain INTEGER DEFAULT 0,   -- 最小 HTTP 复现链完整
+    c4_readonly_or_safe INTEGER DEFAULT 0, -- 只读证明或写操作无真实损害
+    c5_impact_proven INTEGER DEFAULT 0,   -- 对象/数据/状态影响可证明
+    note TEXT DEFAULT '',
+    updated_at REAL
+);
 CREATE TABLE IF NOT EXISTS chat_messages (
     id          TEXT PRIMARY KEY,
     session_id  TEXT,
@@ -1084,6 +1113,93 @@ def count_identities(project_id: str) -> int:
         row = c.execute("SELECT COUNT(*) AS n FROM identities WHERE project_id=?",
                         (project_id,)).fetchone()
     return int(row["n"] or 0)
+
+
+# ---------- 差分记录与复核清单（v017.4） ----------
+def add_diff_run(project_id: str, rec: dict) -> str:
+    rid = uuid.uuid4().hex[:12]
+    with _db() as c:
+        c.execute(
+            "INSERT INTO diff_runs (id,project_id,request_id,baseline_identity,"
+            "target_field,target_location,target_value_masked,verdict,reason,"
+            "stable,steps_json,variant_url,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (rid, project_id, rec.get("request_id", ""), rec.get("baseline_identity", ""),
+             rec.get("target_field", ""), rec.get("target_location", ""),
+             rec.get("target_value_masked", ""), rec.get("verdict", ""),
+             rec.get("reason", ""), 1 if rec.get("stable") else 0,
+             json.dumps(rec.get("steps", []), ensure_ascii=False),
+             rec.get("variant_url", ""), time.time()))
+    return rid
+
+
+def list_diff_runs(project_id: str, limit: int = 50) -> list[dict]:
+    with _db() as c:
+        rows = c.execute(
+            "SELECT * FROM diff_runs WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
+            (project_id, max(1, min(int(limit), 200)))).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["steps"] = json.loads(d.pop("steps_json") or "[]")
+        except (TypeError, ValueError):
+            d["steps"] = []
+        out.append(d)
+    return out
+
+
+def get_diff_run(project_id: str, run_id: str) -> dict | None:
+    with _db() as c:
+        row = c.execute("SELECT * FROM diff_runs WHERE id=? AND project_id=?",
+                        (run_id, project_id)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["steps"] = json.loads(d.pop("steps_json") or "[]")
+    except (TypeError, ValueError):
+        d["steps"] = []
+    return d
+
+
+def get_checks(finding_id: str) -> dict | None:
+    with _db() as c:
+        row = c.execute("SELECT * FROM finding_checks WHERE finding_id=?",
+                        (finding_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_checks(finding_id: str, checks: dict, note: str = "") -> dict:
+    """写入五项复核清单（upsert）。返回完整清单。"""
+    with _db() as c:
+        c.execute(
+            "INSERT INTO finding_checks (finding_id,c1_repeat,c2_permission_delta,"
+            "c3_minimal_chain,c4_readonly_or_safe,c5_impact_proven,note,updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(finding_id) DO UPDATE SET c1_repeat=excluded.c1_repeat,"
+            " c2_permission_delta=excluded.c2_permission_delta,"
+            " c3_minimal_chain=excluded.c3_minimal_chain,"
+            " c4_readonly_or_safe=excluded.c4_readonly_or_safe,"
+            " c5_impact_proven=excluded.c5_impact_proven,"
+            " note=excluded.note, updated_at=excluded.updated_at",
+            (finding_id,
+             1 if checks.get("c1_repeat") else 0,
+             1 if checks.get("c2_permission_delta") else 0,
+             1 if checks.get("c3_minimal_chain") else 0,
+             1 if checks.get("c4_readonly_or_safe") else 0,
+             1 if checks.get("c5_impact_proven") else 0,
+             note[:1000], time.time()))
+    return get_checks(finding_id)
+
+
+def checks_complete(finding_id: str) -> bool:
+    """五项是否全部勾选——confirmed 的硬闸门依据。"""
+    ck = get_checks(finding_id)
+    if not ck:
+        return False
+    return all(ck[k] for k in ("c1_repeat", "c2_permission_delta",
+                               "c3_minimal_chain", "c4_readonly_or_safe",
+                               "c5_impact_proven"))
 
 
 def delete_fact(project_id: str, fid: str) -> bool:
