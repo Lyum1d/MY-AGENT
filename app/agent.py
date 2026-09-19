@@ -654,6 +654,13 @@ class Agent:
         if session.target:
             await session.emit({"type": "target", "data": session.target})
         system = SYSTEM_PROMPT.format(tool_list=registry.alias_reference())
+        # v022（整改报告 P2-5）：schema 因配额被截断的工具，明确告知模型
+        # 「它们存在但本轮不可用」——否则模型会凭空否认工具存在或臆造调用格式。
+        omitted = list(registry.last_omitted_aliases)
+        if omitted:
+            system += ("\n\n【配额省略说明】以下工具因本轮 schema 配额限制未列出详情，"
+                       f"如需使用请先说明需求由用户确认：{', '.join(omitted)}。"
+                       "不要假设它们的参数格式，更不要声称它们不存在。")
         # 注入项目上下文（名称/目标/备注），让模型在首轮就明确目标，无需再向用户索要
         if proj:
             ctx_lines: list[str] = []
@@ -1852,6 +1859,14 @@ class Agent:
                 edited = raw if isinstance(raw, str) else None
                 break
         except asyncio.TimeoutError:
+            # v022 修复（测试组 021 整改报告 P2-4）：超时不能静默——只写 logger
+            # 前端会一直停在「执行中」，用户无法区分「在跑」与「已卡死」。
+            # 实测 021 整改时静默卡死 4 分钟靠翻日志才定位。emit 后前端立即可见。
+            await session.emit({
+                "type": "reasoning",
+                "data": f"（确认超时（{config.CONFIRM_TIMEOUT}s）：已按拒绝处理该步骤，"
+                        f"如需执行请重新发起任务）",
+            })
             logger.warning("确认超时（session=%s step=%s）：按拒绝处理", session.id, step.id)
             approved = False
         finally:

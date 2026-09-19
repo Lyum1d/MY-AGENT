@@ -163,6 +163,7 @@ class ToolRegistry:
         self._by_name: dict[str, Tool] = {}
         self.loaded = False
         self.errors: list[str] = []
+        self.last_omitted_aliases: list[str] = []   # v022：上次 build_schemas 因配额省略的工具
 
     # ---------- 加载 ----------
     def load(self) -> "ToolRegistry":
@@ -544,8 +545,13 @@ class ToolRegistry:
         order = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
         tools = sorted(self.usable_scriptable(), key=lambda t: order.get(t.risk_level, 2))
         builtins = [t for t in tools if t.type == "内置"]
-        rest = [t for t in tools if t.type != "内置"][: max(0, max_tools - len(builtins))]
+        rest_all = [t for t in tools if t.type != "内置"]
+        rest = rest_all[: max(0, max_tools - len(builtins))]
         tools = builtins + rest
+        # v022（测试组 021 整改报告 P2-5）：记录因配额被省略的工具 alias，
+        # agent 在 system prompt 明确列出——否则模型会凭空否认某个工具存在
+        # （实测 deny httpx，而 httpx 实为 L0 且在 schema 内），浪费决策轮次。
+        self.last_omitted_aliases = [t.alias for t in rest_all[len(rest):]]
 
         schemas = []
         for t in tools:
