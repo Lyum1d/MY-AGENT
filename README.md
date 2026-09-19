@@ -460,6 +460,15 @@ src-agent/
    host 命中但端口/协议不在授权列表时拒绝执行；未声明 ports/schemes 则不限制。结构化 host 自动纳入 argv 复核与目标列表校验的白名单视图。
 6. **FOFA 范围约束**：fofa_search 的查询语句必须包含至少一个授权白名单内的主机，否则拒绝执行（防在授权范围外收集资产）。
 
+## 请求库（v017.1）
+
+1. **Burp XML / HAR 导入**：`POST /api/projects/{pid}/imports/preview`（解析+统计，不入库）→ 确认后 `POST /imports/commit`（只收 scope 白名单内的请求）。统一请求模型含方法/URL/脱敏头/Cookie/查询/体/状态码/对象候选。
+2. **导入即脱敏**：Authorization、Cookie、API Key 等敏感头在入库前替换为 `<redacted:NAME:len>` 占位——完整凭据永不入 SQLite/日志/报告/LLM 上下文（完整凭据属 v017.2 身份库，走 DPAPI 受保护存储）。
+3. **scope 双重闸门**：预览与 commit 各做一次白名单判定，越界请求标记 `rejected` 且不进入执行队列；执行阶段（差分运行）还会再校验一次。
+4. **去重**：方法 + 规范化 URL（查询值占位、路径数字归一）+ 参数名集合 + JSON/表单结构指纹；重复请求打 `duplicate` 标签默认不入库。
+5. **对象候选识别**：query/path/body 中语义键名（userId/orderId/fileId/tenantId…）标 high、纯数字参数标 medium；候选值脱敏展示，替换动作留给 v017.3 受控差分。
+6. 测试：`test_import.py`（36 项，覆盖解析/脱敏/去重/对象识别/项目隔离/scope 双闸门）。
+
 ## 测试
 
 `test_*.py` 是自带的回归脚本（非 pytest 收集式，直接 `python test_xxx.py` 运行，退出码 0 表示全过）。

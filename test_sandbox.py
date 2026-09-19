@@ -127,17 +127,27 @@ else:
         dt = time.monotonic() - t0
         check("关闭 Job 句柄后子进程被终止（<8s）", died and dt < 8, f"{dt:.2f}s")
 
-        # 孙子也要没：整树终止是 Job 相比 proc.kill() 的核心价值
+        # 孙子也要没：整树终止是 Job 相比 proc.kill() 的核心价值。
+        # 注意：进程对象终止后其内核对象要等所有句柄释放才消失，且系统负载
+        # 高时终止通知有延迟——全量回归并发跑时此处曾偶发误报，故给 3 次重试。
         if _m:
             import ctypes
             gpid = int(_m.group(1))
-            h = ctypes.windll.kernel32.OpenProcess(0x100000, False, gpid)  # SYNCHRONIZE
-            if not h:
-                grand_alive = False   # 进程已不存在
-            else:
+
+            def _grand_alive(pid: int) -> bool:
+                h = ctypes.windll.kernel32.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
+                if not h:
+                    return False      # 进程已不存在
                 w = ctypes.windll.kernel32.WaitForSingleObject(h, 0)
-                grand_alive = (w == 0x00000102)   # WAIT_TIMEOUT = 还活着
                 ctypes.windll.kernel32.CloseHandle(h)
+                return w == 0x00000102   # WAIT_TIMEOUT = 还活着
+
+            grand_alive = True
+            for _ in range(3):
+                grand_alive = _grand_alive(gpid)
+                if not grand_alive:
+                    break
+                time.sleep(0.5)   # 给内核清理时间再判一次
             check("孙子进程一并被终止（整树语义）", not grand_alive)
         job = None
 

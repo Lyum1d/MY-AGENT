@@ -63,6 +63,7 @@ PY_TESTS = [
     ("代码执行通道 py_exec（L3）", "test_pyexec.py", False),
     ("HTTP 重放器（授权与只读）", "test_replayer.py", False),
     ("证据状态模型与报告增强（v012）", "test_evidence.py", False),
+    ("请求导入（Burp/HAR，v017.1）", "test_import.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from . import config, providers, report, scope, store, usage
 from . import graph
+from .importers import common as importers_common
 from .agent import agent, sessions
 from .executor import executor
 from .llm import current_backend_name, get_backend, set_backend
@@ -915,6 +916,85 @@ async def session_review(sid: str):
         if not store.get_session_row(sid):
             raise HTTPException(404, "会话不存在")
     return r
+
+
+# ---------- 请求库导入（v017.1：Burp XML / HAR） ----------
+class ImportCommitRequest(BaseModel):
+    """commit 与 preview 使用同样的文件内容——服务端重新解析（避免大 JSON 回传），
+
+    两轮解析结果一致；commit 只入库 scope_status=allowed 且未标记 duplicate 的
+    记录（除非 include_duplicates=True）。
+    """
+    filename: str
+    content_base64: str
+    include_duplicates: bool = False
+
+
+@app.post("/api/projects/{pid}/imports/preview")
+async def imports_preview(pid: str, req: ImportCommitRequest):
+    """导入预览：解析 + scope 过滤 + 去重统计，**不入库**。
+
+    返回每条记录的脱敏摘要与 scope_status，由用户确认后再 commit。
+    """
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    try:
+        records, stat = importers_common.parse_import_file(req.filename, req.content_base64)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "stat": stat,
+        "requests": [
+            {k: rec.get(k) for k in ("method", "url", "normalized_url", "scope_status",
+                                     "object_candidates", "tags", "status_code",
+                                     "content_type")}
+            for rec in records[:500]   # 预览截断，防止超大导入拖死前端
+        ],
+        "truncated": len(records) > 500,
+    }
+
+
+@app.post("/api/projects/{pid}/imports/commit")
+async def imports_commit(pid: str, req: ImportCommitRequest):
+    """确认入库：只收 scope_status=allowed 的记录（rejected 仅保留统计）。
+
+    scope 校验在预览与 commit 各做一次（同一代码路径），执行阶段（v017.3
+    差分执行）还会再校验一次——导入/执行双重闸门。
+    """
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    try:
+        records, stat = importers_common.parse_import_file(req.filename, req.content_base64)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    inserted = 0
+    for rec in records:
+        if rec["scope_status"] != "allowed":
+            continue
+        if "duplicate" in rec.get("tags", []) and not req.include_duplicates:
+            continue
+        store.add_request(pid, rec)
+        inserted += 1
+    return {"stat": stat, "inserted": inserted}
+
+
+@app.get("/api/projects/{pid}/requests")
+async def list_requests(pid: str, scope_status: str = "", method: str = "",
+                        limit: int = 200):
+    """请求库列表（脱敏副本；凭据永远只是占位符）。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return {"items": store.list_requests(pid, scope_status=scope_status,
+                                         method=method, limit=limit)}
+
+
+@app.delete("/api/projects/{pid}/requests/{rid}")
+async def delete_request(pid: str, rid: str):
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    if not store.delete_request(pid, rid):
+        raise HTTPException(404, "请求不存在或不属于该项目")
+    return {"ok": True}
 
 
 @app.get("/api/sessions/{sid}/stream")
