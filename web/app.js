@@ -228,7 +228,7 @@ async function init() {
     $('status').innerHTML = `<span class="dot bad"></span>后端未连接：${esc(e.message)}`;
     return;
   }
-  loadProjects().then(() => { autoSelectProject(); renderProjects(); updateProjectHeader(); loadFindings(); loadFacts(); loadIdentities(); loadTree(); });
+  loadProjects().then(() => { autoSelectProject(); renderProjects(); updateProjectHeader(); loadFindings(); loadFacts(); loadIdentities(); loadRequests(); loadTree(); });
   loadTools();
   refreshUsageBadge();
 }
@@ -366,6 +366,7 @@ async function createProject() {
   loadFindings();
   loadFacts();
   loadIdentities();
+  loadRequests();
   loadTree();
 }
 
@@ -377,6 +378,7 @@ async function selectProject(pid) {
   loadFindings();
   loadFacts();
   loadIdentities();
+  loadRequests();
   // 切项目 = 切对话树：清空当前线程，聊天区回到空态
   if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
   state.sessionId = null;
@@ -1849,6 +1851,101 @@ async function delIdentity(iid) {
     await api(`/api/projects/${state.currentProject}/identities/${iid}`, { method: 'DELETE' });
     loadIdentities();
   } catch (e) { log('删除失败：' + (e.message || e), 'c-err'); }
+}
+
+/* ---------- 请求库与身份差分（v017.1/.3）---------- */
+async function loadRequests() {
+  if (!state.currentProject) return;
+  try {
+    const d = await api(`/api/projects/${state.currentProject}/requests?scope_status=allowed&limit=50`);
+    const items = d.items || [];
+    $('reqLibCount').textContent = items.length;
+    const el = $('reqLibList');
+    if (!items.length) {
+      el.innerHTML = '<div class="empty">暂无导入请求（Burp 右键 Save items 导出 XML，或浏览器导出 HAR）</div>';
+      return;
+    }
+    el.innerHTML = items.map(r => `
+      <div class="list-item">
+        <div style="display:flex;justify-content:space-between;gap:6px;align-items:center;">
+          <span style="font-weight:600;">${esc(r.method)}</span>
+          <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.8;" title="${esc(r.url)}">${esc(r.url)}</span>
+          <button class="mini" onclick="delRequest('${r.id}')">删</button>
+        </div>
+        ${r.object_candidates && r.object_candidates.length
+          ? `<div style="font-size:11px;opacity:.7;margin-top:2px;">对象候选: ${r.object_candidates.map(c => esc(c.field) + '@' + esc(c.location)).join(', ')}</div>`
+          : ''}
+      </div>`).join('');
+  } catch (e) { /* 静默 */ }
+}
+
+async function importRequests(input) {
+  const file = input.files && input.files[0];
+  if (!file || !state.currentProject) return;
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const b64 = reader.result.split(',')[1];
+    try {
+      const pv = await api(`/api/projects/${state.currentProject}/imports/preview`, {
+        method: 'POST', body: JSON.stringify({ filename: file.name, content_base64: b64 }),
+      });
+      const s = pv.stat;
+      if (!confirm(`解析 ${s.total} 条：授权内 ${s.allowed}，越界 ${s.rejected}（不入库），重复 ${s.duplicates}。\n确认导入授权内的请求？`)) return;
+      const cm = await api(`/api/projects/${state.currentProject}/imports/commit`, {
+        method: 'POST', body: JSON.stringify({ filename: file.name, content_base64: b64 }),
+      });
+      log(`已导入 ${cm.inserted} 条请求到请求库`, 'c-ok');
+      loadRequests();
+    } catch (e) { log('导入失败：' + (e.message || e), 'c-err'); }
+    input.value = '';
+  };
+  reader.readAsDataURL(file);
+}
+
+async function delRequest(rid) {
+  if (!state.currentProject) return;
+  try {
+    await api(`/api/projects/${state.currentProject}/requests/${rid}`, { method: 'DELETE' });
+    loadRequests();
+  } catch (e) { log('删除失败：' + (e.message || e), 'c-err'); }
+}
+
+/* 差分：prompt 依次取目标字段与值（最小交互；工作台面板在后续版本完善） */
+async function runDiff(rid) {
+  if (!state.currentProject) return;
+  const ids = (await api(`/api/projects/${state.currentProject}/identities`)).items || [];
+  if (!ids.length) return log('请先在「测试身份」登记基准身份（如 account_a）', 'c-warn');
+  const idOpts = ids.map(i => `${i.id}=${i.label}(${i.role})`).join('\n');
+  const baseline = prompt('选择基准身份（复制其一的 ID）:\n' + idOpts);
+  if (!baseline) return;
+  const field = prompt('对象字段名（如 userId / orderId）:');
+  if (!field) return;
+  const location = prompt('位置（query / path / body）:', 'query');
+  if (!location) return;
+  const value = prompt('目标对象值（从响应或页面中取得的他人对象 ID）:');
+  if (!value) return;
+  log('差分执行中（只读请求，可能需要数十秒）…', 'c-dim');
+  try {
+    const r = await api(`/api/projects/${state.currentProject}/diff-run`, {
+      method: 'POST',
+      body: JSON.stringify({ request_id: rid, baseline_identity_id: baseline.trim(),
+                             target_field: field.trim(), target_location: location.trim(),
+                             target_value: value.trim(), with_anonymous: true, repeat: 2 }),
+    });
+    const v = r.verdict || {};
+    if (v.verdict === 'suspect_idor') {
+      log(`⚠ 疑似越权：${v.reason}（已标记候选建议，请人工核对后登记漏洞）`, 'c-warn');
+    } else if (v.verdict === 'access_denied') {
+      log(`差分结论：${v.reason}`, 'c-ok');
+    } else if (v.verdict === 'no_diff') {
+      log(`差分结论：${v.reason}`, 'c-dim');
+    } else {
+      log(`差分结论：${v.reason || v.verdict}`, 'c-warn');
+    }
+    if (r.anonymous_note) log(`另：${r.anonymous_note}`, 'c-warn');
+    const detail = (r.steps || []).map(s => `${s.tag}: ${s.status || s.error || ''}`).join(' | ');
+    if (detail) log(`执行序列  ${detail}`, 'c-dim');
+  } catch (e) { log('差分失败：' + (e.message || e), 'c-err'); }
 }
 
 init();

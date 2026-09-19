@@ -121,6 +121,13 @@
     <div class="panel-body" id="findingList"><div class="empty">暂无记录</div></div>
 
     <div class="panel-head">
+      请求库 <span class="badge" id="reqLibCount">0</span>
+      <button class="mini" onclick="document.getElementById('importFile').click()">导入</button>
+    </div>
+    <input type="file" id="importFile" accept=".xml,.har" style="display:none;" onchange="importRequests(this)">
+    <div class="panel-body" id="reqLibList"><div class="empty">暂无导入请求（Burp 右键 Save items 导出 XML，或浏览器导出 HAR）</div></div>
+
+    <div class="panel-head">
       测试身份 <span class="badge" id="identityCount">0</span>
       <button class="mini" onclick="toggleIdentityForm()">+ 登记</button>
     </div>
