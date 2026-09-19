@@ -97,6 +97,25 @@ CREATE TABLE IF NOT EXISTS request_library (
     created_at    REAL
 );
 CREATE INDEX IF NOT EXISTS idx_req_lib_proj ON request_library(project_id);
+-- v017.2 测试身份库：凭据经 DPAPI 加密（CurrentUser 作用域）后才入列——
+-- headers_enc/cookies_enc 是 base64 密文，解密唯一入口是 app/secretbox.py。
+-- 任何接口都不得把解密结果写日志/响应/LLM 上下文。
+CREATE TABLE IF NOT EXISTS identities (
+    id            TEXT PRIMARY KEY,
+    project_id    TEXT,
+    label         TEXT,             -- 展示标签（anonymous/account_a/...）
+    role          TEXT,             -- anonymous | user | admin（自报，不校验）
+    tenant        TEXT DEFAULT '',
+    headers_enc   TEXT DEFAULT '',  -- DPAPI 密文 base64
+    cookies_enc   TEXT DEFAULT '',
+    source        TEXT DEFAULT 'manual',
+    status        TEXT DEFAULT 'active',  -- active | expired | invalid | disabled
+    last_checked_at REAL,
+    check_url     TEXT DEFAULT '',  -- 有效性检查用的目标 URL（可空）
+    notes         TEXT DEFAULT '',  -- 不含凭据的备注
+    created_at    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_identities_proj ON identities(project_id);
 CREATE TABLE IF NOT EXISTS chat_messages (
     id          TEXT PRIMARY KEY,
     session_id  TEXT,
@@ -997,6 +1016,74 @@ def delete_request(project_id: str, rid: str) -> bool:
         cur = c.execute("DELETE FROM request_library WHERE id=? AND project_id=?",
                         (rid, project_id))
     return cur.rowcount > 0
+
+
+# ---------- 测试身份库（v017.2） ----------
+def add_identity(project_id: str, label: str, role: str = "user",
+                 tenant: str = "", headers_enc: str = "", cookies_enc: str = "",
+                 source: str = "manual", check_url: str = "",
+                 notes: str = "") -> dict:
+    """登记测试身份。headers_enc/cookies_enc 必须是 secretbox.seal_dict 的产物。"""
+    iid = uuid.uuid4().hex[:12]
+    with _db() as c:
+        c.execute(
+            "INSERT INTO identities (id,project_id,label,role,tenant,headers_enc,"
+            "cookies_enc,source,status,check_url,notes,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (iid, project_id, label, role, tenant, headers_enc, cookies_enc,
+             source, "active", check_url, notes, time.time()),
+        )
+    return {"id": iid, "project_id": project_id, "label": label, "role": role,
+            "tenant": tenant, "status": "active", "check_url": check_url}
+
+
+def list_identities(project_id: str) -> list[dict]:
+    """列出身份元数据——**不含任何凭据字段**（headers_enc/cookies_enc 不出库层）。"""
+    with _db() as c:
+        rows = c.execute(
+            "SELECT id,label,role,tenant,source,status,last_checked_at,check_url,"
+            "notes,created_at FROM identities WHERE project_id=? ORDER BY created_at",
+            (project_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_identity(project_id: str, iid: str) -> dict | None:
+    """取单条身份（含密文字段，仅供 secretbox 解密路径使用）。归属不符返回 None。"""
+    with _db() as c:
+        row = c.execute("SELECT * FROM identities WHERE id=? AND project_id=?",
+                        (iid, project_id)).fetchone()
+    return dict(row) if row else None
+
+
+def update_identity_status(project_id: str, iid: str, status: str,
+                           last_checked_at: float | None = None) -> bool:
+    if status not in ("active", "expired", "invalid", "disabled"):
+        return False
+    with _db() as c:
+        if last_checked_at is not None:
+            cur = c.execute(
+                "UPDATE identities SET status=?, last_checked_at=? WHERE id=? AND project_id=?",
+                (status, last_checked_at, iid, project_id))
+        else:
+            cur = c.execute(
+                "UPDATE identities SET status=? WHERE id=? AND project_id=?",
+                (status, iid, project_id))
+    return cur.rowcount > 0
+
+
+def delete_identity(project_id: str, iid: str) -> bool:
+    """删除身份（凭据密文随行删除；审计上只保留不含秘密的元数据在此不保留）。"""
+    with _db() as c:
+        cur = c.execute("DELETE FROM identities WHERE id=? AND project_id=?",
+                        (iid, project_id))
+    return cur.rowcount > 0
+
+
+def count_identities(project_id: str) -> int:
+    with _db() as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM identities WHERE project_id=?",
+                        (project_id,)).fetchone()
+    return int(row["n"] or 0)
 
 
 def delete_fact(project_id: str, fid: str) -> bool:

@@ -7,15 +7,16 @@ import json
 import logging
 from datetime import datetime
 from typing import AsyncIterator
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import config, providers, report, scope, store, usage
-from . import graph
+from . import graph, ratelimit, secretbox
 from .importers import common as importers_common
 from .agent import agent, sessions
 from .executor import executor
@@ -995,6 +996,121 @@ async def delete_request(pid: str, rid: str):
     if not store.delete_request(pid, rid):
         raise HTTPException(404, "请求不存在或不属于该项目")
     return {"ok": True}
+
+
+# ---------- 测试身份库（v017.2） ----------
+class IdentityRequest(BaseModel):
+    """创建身份。headers/cookies 明文仅出现在本请求体内（HTTPS/回环本地），
+    服务端 seal 后落库，**任何响应都不回显明文**。"""
+    label: str
+    role: str = "user"
+    tenant: str = ""
+    headers: dict = {}
+    cookies: dict = {}
+    check_url: str = ""      # 有效性检查用的目标 URL（必须在本项目 scope 内）
+    notes: str = ""
+
+
+def _mask_summary(d: dict) -> dict:
+    """身份凭据摘要：只保留键名 + 值长度，供前端确认「存了什么」而不泄露值。"""
+    return {k: f"<set:{len(str(v))}>" for k, v in (d or {}).items()}
+
+
+@app.post("/api/projects/{pid}/identities")
+async def add_identity(pid: str, req: IdentityRequest):
+    """登记测试身份（匿名身份 headers/cookies 留空即可）。
+
+    凭据经 DPAPI（CurrentUser 作用域）加密后落库；解密唯一出口在
+    app/secretbox.py。若 check_url 非空，必须是本项目授权范围内的 URL。
+    """
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    if not secretbox.available():
+        raise HTTPException(500, "当前环境不支持 DPAPI，凭据受保护存储不可用，已拒绝保存")
+    label = (req.label or "").strip()
+    if not label:
+        raise HTTPException(400, "label 不能为空")
+    if req.check_url:
+        denied = scope.check_scope(req.check_url)
+        if denied:
+            raise HTTPException(400, f"check_url 不在授权范围内：{denied}")
+    headers_enc = secretbox.seal_dict(req.headers) or ""
+    cookies_enc = secretbox.seal_dict(req.cookies) or ""
+    if (req.headers or req.cookies) and not (headers_enc or cookies_enc):
+        raise HTTPException(500, "凭据加密失败，已拒绝保存（不会明文落盘）")
+    rec = store.add_identity(pid, label, role=req.role, tenant=req.tenant,
+                             headers_enc=headers_enc, cookies_enc=cookies_enc,
+                             source="manual", check_url=req.check_url,
+                             notes=req.notes[:500])
+    return {**rec, "headers_summary": _mask_summary(req.headers),
+            "cookies_summary": _mask_summary(req.cookies)}
+
+
+@app.get("/api/projects/{pid}/identities")
+async def list_identities(pid: str):
+    """身份列表——只含标签/角色/状态/最近检查时间，**无任何凭据字段**。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return {"items": store.list_identities(pid)}
+
+
+@app.delete("/api/projects/{pid}/identities/{iid}")
+async def delete_identity(pid: str, iid: str):
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    if not store.delete_identity(pid, iid):
+        raise HTTPException(404, "身份不存在或不属于该项目")
+    return {"ok": True}
+
+
+@app.post("/api/projects/{pid}/identities/{iid}/check")
+async def check_identity(pid: str, iid: str):
+    """身份有效性检查：解密凭据 → 注入单发只读请求 → 按 HTTP 状态判活。
+
+    红线：scope 校验（check_url 必须在白名单内）、限速、只读方法、
+    响应**只取状态码与耗时**（不回传响应体——防止把受保护页面内容
+    连同判断一起写进日志/前端）。凭据失效把身份标记为 expired。
+    """
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    rec = store.get_identity(pid, iid)
+    if not rec:
+        raise HTTPException(404, "身份不存在或不属于该项目")
+    if rec["status"] == "disabled":
+        raise HTTPException(400, "身份已禁用")
+    check_url = rec.get("check_url") or ""
+    if not check_url:
+        raise HTTPException(400, "该身份未配置 check_url，无法自动检查")
+    denied = scope.check_scope(check_url)
+    if denied:
+        store.update_identity_status(pid, iid, "invalid")
+        raise HTTPException(400, f"check_url 不在授权范围内，身份已标记 invalid：{denied}")
+    headers = secretbox.unseal_dict(rec.get("headers_enc"))
+    cookies = secretbox.unseal_dict(rec.get("cookies_enc"))
+    if headers is None and cookies is None and (rec.get("headers_enc") or rec.get("cookies_enc")):
+        # 密文存在但解不开：换用户/损坏——标记失效，绝不带残缺凭据继续
+        store.update_identity_status(pid, iid, "invalid")
+        raise HTTPException(409, "凭据解密失败（可能因换 Windows 用户或密文损坏），身份已标记 invalid")
+    import time as _t
+    await ratelimit.acquire(urlsplit(check_url).netloc or "default",
+                            config.TOOL_MIN_INTERVAL, config.GLOBAL_MIN_INTERVAL)
+    merged_headers = {k: v for k, v in (headers or {}).items()}
+    t0 = _t.monotonic()
+    try:
+        async with httpx.AsyncClient(trust_env=False, follow_redirects=False,
+                                     timeout=15.0) as client:
+            r = await client.get(check_url, headers=merged_headers,
+                                 cookies=cookies or None)
+        status_code = r.status_code
+    except Exception as e:
+        raise HTTPException(502, f"检查请求失败：{type(e).__name__}")
+    latency = round(_t.monotonic() - t0, 2)
+    # 401/403 = 凭据失效；407（代理要求认证）也算失效信号
+    ok = status_code not in (401, 403, 407)
+    store.update_identity_status(pid, iid, "active" if ok else "expired",
+                                 last_checked_at=_t.time())
+    return {"ok": ok, "status_code": status_code, "latency": latency,
+            "status": "active" if ok else "expired"}
 
 
 @app.get("/api/sessions/{sid}/stream")

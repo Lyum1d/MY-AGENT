@@ -121,6 +121,28 @@
     <div class="panel-body" id="findingList"><div class="empty">暂无记录</div></div>
 
     <div class="panel-head">
+      测试身份 <span class="badge" id="identityCount">0</span>
+      <button class="mini" onclick="toggleIdentityForm()">+ 登记</button>
+    </div>
+    <div id="identityForm" class="form-card" style="display:none;">
+      <input id="identityLabel" placeholder="标签，如 account_a / anonymous">
+      <div style="display:flex; gap:6px;">
+        <select id="identityRole" style="flex:1;">
+          <option value="anonymous">匿名</option>
+          <option value="user" selected>普通用户</option>
+          <option value="admin">管理员（如有测试账号）</option>
+        </select>
+        <input id="identityTenant" placeholder="租户(可选)" style="flex:1;">
+      </div>
+      <input id="identityCheckUrl" placeholder="有效性检查 URL（须在授权范围内，如 https://.../profile）">
+      <textarea id="identityHeaders" placeholder='请求头 JSON（可选），如 {"Authorization": "Bearer xxx"}'></textarea>
+      <textarea id="identityCookies" placeholder='Cookie JSON（可选），如 {"SESSIONID": "xxx"}'></textarea>
+      <div class="form-tip" style="font-size:11px; opacity:.7; margin:4px 0;">凭据经 Windows DPAPI 加密落盘，界面与日志只显示占位摘要，不回显明文。</div>
+      <button class="primary" onclick="addIdentity()">保存身份</button>
+    </div>
+    <div class="panel-body" id="identityList"><div class="empty">暂无测试身份</div></div>
+
+    <div class="panel-head">
       已证事实 <span class="badge" id="factCount">0</span>
       <button class="mini" onclick="toggleFactForm()">+ 记录</button>
     </div>
