@@ -936,7 +936,9 @@ async function openThread(sid) {
   // 重绘确认框。否则用户会看到「执行中」却没有任何可点的按钮，只能干等到超时。
   if (d.pending_confirm && d.pending_confirm.step) {
     log('该线索有一步高危操作正在等待你的授权确认…', 'c-warn');
-    showConfirm({ step: d.pending_confirm.step, risk: d.pending_confirm.risk || {} });
+    // v022：state 接口现在回传 token/second——刷新后重绘的确认框可正常提交（P1-2）
+    showConfirm({ step: d.pending_confirm.step, risk: d.pending_confirm.risk || {},
+                  token: d.pending_confirm.token || '', second: d.pending_confirm.second });
   }
   renderTree();
   scrollToBottom();

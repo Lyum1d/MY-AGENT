@@ -68,6 +68,7 @@ PY_TESTS = [
     ("只读身份差分（v017.3）", "test_diff.py", False),
     ("证据链与复核闸门（v017.4）", "test_evidence_bundle.py", False),
     ("流程绕过检测（v017.5）", "test_flow.py", False),
+    ("整改报告修复回归（v022）", "test_022_fixes.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

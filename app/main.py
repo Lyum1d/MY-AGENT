@@ -1548,8 +1548,16 @@ async def session_state(sid: str):
         if s.state == "awaiting_confirm" and s.pending_step_id:
             for st in s.steps:
                 if st.id == s.pending_step_id:
+                    # v022 修复（测试组 021 整改报告 P1-2）：一并回传 token 与 second。
+                    # 此前只回传 step/risk——页面刷新后前端重绘的确认框没有令牌，
+                    # 提交必然 409「确认令牌无效」，用户只能干等 600s 超时。
+                    # 本接口只在本机回环暴露且经会话归属校验，token 短时一次性，
+                    # 经 state 往返的风险可控（远程模式另有全站 Bearer 闸门）。
+                    pend = s.pending_confirm or {}
                     pending = {"step": agent._step_dict(st),
-                               "risk": st.risk or registry.risk_of(st.tool_alias) or {}}
+                               "risk": st.risk or registry.risk_of(st.tool_alias) or {},
+                               "token": pend.get("token", ""),
+                               "second": bool(pend.get("double_confirm"))}
                     break
         return {
             "id": s.id,
