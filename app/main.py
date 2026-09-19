@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from . import config, providers, report, scope, store, usage
 from . import graph, ratelimit, secretbox
-from . import difftest
+from . import difftest, flowtest
 from .importers import common as importers_common
 from .agent import agent, sessions
 from .executor import executor
@@ -1296,6 +1296,80 @@ async def list_diff_runs(pid: str, limit: int = 50):
     if not store.get_project(pid):
         raise HTTPException(404, "项目不存在")
     return {"items": store.list_diff_runs(pid, limit=limit)}
+
+
+# ---------- 流程绕过检测（v017.5） ----------
+class FlowRunRequest(BaseModel):
+    """流程检查：request_ids 为按流程顺序排列的请求库 ID 序列，
+
+    最后一条是目标步骤。只读流程链（GET/HEAD/OPTIONS）；含写步骤的流程
+    需人工在 Burp 验证（模块层方法硬白名单会拒绝执行写请求并中断）。
+    """
+    request_ids: list[str]
+    identity_id: str = ""        # 可空 = 纯匿名流程（检测未授权链路）
+
+
+@app.post("/api/projects/{pid}/flow-run")
+async def flow_run(pid: str, req: FlowRunRequest):
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    if not req.request_ids or len(req.request_ids) < 2:
+        raise HTTPException(400, "流程至少需要 2 个步骤（前置 + 目标）")
+    all_reqs = {r["id"]: r for r in store.list_requests(pid, limit=1000)}
+    seq = []
+    for rid in req.request_ids:
+        rec = all_reqs.get(rid)
+        if not rec:
+            raise HTTPException(404, f"请求 {rid} 不存在或不属于该项目")
+        seq.append(rec)
+    identity_headers, identity_cookies = {}, {}
+    identity_label = "anonymous"
+    if req.identity_id:
+        rec = store.get_identity(pid, req.identity_id)
+        if not rec:
+            raise HTTPException(404, "身份不存在或不属于该项目")
+        identity_headers = secretbox.unseal_dict(rec.get("headers_enc")) or {}
+        identity_cookies = secretbox.unseal_dict(rec.get("cookies_enc")) or {}
+        identity_label = rec.get("label", "")
+        if (rec.get("headers_enc") or rec.get("cookies_enc")) and \
+                not identity_headers and not identity_cookies:
+            store.update_identity_status(pid, req.identity_id, "invalid")
+            raise HTTPException(409, "身份凭据解密失败，已标记 invalid")
+    result = await flowtest.run_flow_check(seq, identity_headers, identity_cookies)
+    run_id = store.add_flow_run(pid, {
+        "identity_label": identity_label,
+        "step_ids": req.request_ids,
+        "verdict": result.get("verdict", ""),
+        "reason": result.get("reason", ""),
+        "steps": result.get("steps", []),
+    })
+    finding_draft = None
+    if result.get("verdict", "").startswith("suspect_"):
+        last_url = seq[-1]["url"]
+        is_unauth = result["verdict"] == "suspect_unauthorized"
+        finding_draft = {
+            "title": ("疑似未授权访问：" if is_unauth else
+                      "疑似流程绕过：跳过前置步骤后目标接口仍返回数据"),
+            "severity": "高危" if not is_unauth else "高危",
+            "target": urlsplit(last_url).netloc,
+            "vuln_type": "未授权访问" if is_unauth else "业务流程绕过",
+            "detail": (f"流程检查判定：{result.get('reason', '')}\n"
+                       f"流程步骤数：{len(seq)}（末步：{last_url}）。\n"
+                       f"记录：{run_id}。请人工核响应内容后补全复现链。"),
+            "evidence": "\n".join(
+                f"{s.get('tag')}: {s.get('status') or s.get('error') or ''} {s.get('url', '')}"
+                for s in result.get("steps", [])),
+            "reproduction": ("1. 不完成前置步骤（或无凭据）直接访问末步 URL；\n"
+                             f"2. {last_url}\n3. 观察响应返回了本应受保护的数据。"),
+        }
+    return {"run_id": run_id, **result, "finding_draft": finding_draft}
+
+
+@app.get("/api/projects/{pid}/flow-runs")
+async def list_flow_runs(pid: str, limit: int = 50):
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return {"items": store.list_flow_runs(pid, limit=limit)}
 
 
 # ---------- 五项复核清单（v017.4） ----------

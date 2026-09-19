@@ -1827,6 +1827,7 @@ async function loadIdentities() {
   try {
     const d = await api(`/api/projects/${state.currentProject}/identities`);
     const items = d.items || [];
+    biz.identities = items;   // 工作台下拉复用
     $('identityCount').textContent = items.length;
     const el = $('identityList');
     if (!items.length) { el.innerHTML = '<div class="empty">暂无测试身份</div>'; return; }
@@ -1924,9 +1925,10 @@ async function loadRequests() {
   } catch (e) { /* 静默 */ }
 }
 
-async function importRequests(input) {
+async function importRequests(input, cb) {
   const file = input.files && input.files[0];
   if (!file || !state.currentProject) return;
+  const after = cb || loadRequests;
   const reader = new FileReader();
   reader.onload = async () => {
     const b64 = reader.result.split(',')[1];
@@ -1941,6 +1943,7 @@ async function importRequests(input) {
       });
       log(`已导入 ${cm.inserted} 条请求到请求库`, 'c-ok');
       loadRequests();
+      if (typeof after === 'function') after();
     } catch (e) { log('导入失败：' + (e.message || e), 'c-err'); }
     input.value = '';
   };
@@ -2007,5 +2010,125 @@ async function runDiff(rid) {
     if (detail) log(`执行序列  ${detail}`, 'c-dim');
   } catch (e) { log('差分失败：' + (e.message || e), 'c-err'); }
 }
+
+/* ---------- 业务测试工作台（v017）---------- */
+const biz = { selected: [], identities: [] };
+
+async function openBiz() {
+  if (!state.currentProject) return log('先选择项目', 'c-warn');
+  $('bizModal').style.display = 'flex';
+  biz.selected = [];
+  await loadIdentities();
+  await loadBizRequests();
+}
+
+function closeBiz() { $('bizModal').style.display = 'none'; }
+
+async function loadBizRequests() {
+  const el = $('bizReqList');
+  el.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const d = await api(`/api/projects/${state.currentProject}/requests?scope_status=allowed&limit=100`);
+    const items = d.items || [];
+    if (!items.length) { el.innerHTML = '<div class="empty">请求库为空——先导入 Burp XML / HAR</div>'; return; }
+    el.innerHTML = items.map(r => `
+      <div class="list-item" style="margin-bottom:4px;">
+        <label style="display:flex; gap:6px; align-items:start; cursor:pointer;">
+          <input type="checkbox" class="biz-req-cb" data-rid="${r.id}" onchange="bizToggle('${r.id}', this.checked)">
+          <span style="min-width:0;">
+            <b>${esc(r.method)}</b>
+            <span style="opacity:.8; font-size:11px; word-break:break-all;">${esc(r.url)}</span>
+            ${r.object_candidates && r.object_candidates.length
+              ? `<div style="font-size:11px; opacity:.65;">候选: ${r.object_candidates.map(c => esc(c.field) + '@' + esc(c.location)).join(', ')}</div>` : ''}
+          </span>
+        </label>
+      </div>`).join('');
+  } catch (e) { el.innerHTML = '<div class="empty">加载失败</div>'; }
+  // 身份下拉
+  const sel = $('bizIdentity');
+  sel.innerHTML = '<option value="">— 选择基准身份 —</option>' +
+    (biz.identities || []).map(i => `<option value="${esc(i.id)}">${esc(i.label)}（${esc(i.role)}）</option>`).join('');
+}
+
+function bizToggle(rid, checked) {
+  if (checked) { if (!biz.selected.includes(rid)) biz.selected.push(rid); }
+  else biz.selected = biz.selected.filter(x => x !== rid);
+}
+
+function renderBizResult(html) { $('bizResult').innerHTML = html; }
+
+async function runDiffFromWorkbench() {
+  if (!state.currentProject) return;
+  const rid = biz.selected[0];
+  if (!rid) return log('请先在左侧勾选一条请求作为差分对象', 'c-warn');
+  const identity = $('bizIdentity').value;
+  const field = $('bizField').value.trim();
+  const value = $('bizValue').value.trim();
+  if (!identity || !field || !value) return log('请完整填写基准身份、对象字段与目标值', 'c-warn');
+  renderBizResult('<div class="empty">差分执行中…（只读请求，含重复验证）</div>');
+  try {
+    const r = await api(`/api/projects/${state.currentProject}/diff-run`, {
+      method: 'POST',
+      body: JSON.stringify({ request_id: rid, baseline_identity_id: identity,
+                             target_field: field, target_location: $('bizLocation').value,
+                             target_value: value, with_anonymous: $('bizAnon').checked,
+                             repeat: 2 }),
+    });
+    renderDiffResult(r);
+  } catch (e) { renderBizResult(`<div class="empty">差分失败：${esc(e.message || e)}</div>`); }
+}
+
+function renderDiffResult(r) {
+  const v = r.verdict || {};
+  const colors = { suspect_idor: '#d97706', suspect_unauthorized: '#d97706',
+                   access_denied: '#16a34a', no_diff: '#6b7280',
+                   flow_protected: '#16a34a', suspect_flow_bypass: '#d97706',
+                   flow_invalid: '#6b7280', unstable: '#6b7280' };
+  let html = `<div style="font-weight:700; color:${colors[v.verdict] || 'inherit'}; font-size:14px;">
+    ${esc(v.verdict || '')}</div>
+    <div style="margin:4px 0;">${esc(v.reason || '')}</div>`;
+  if (r.anonymous_note) html += `<div style="color:#d97706; margin:4px 0;">⚠ ${esc(r.anonymous_note)}</div>`;
+  html += `<div style="margin:6px 0;"><b>执行序列</b><br>` +
+    (r.steps || []).map(s => `${esc(s.tag)}: ${esc(String(s.status || s.error || ''))} <span style="opacity:.7">${esc(s.url)}</span>`).join('<br>') + `</div>`;
+  if (r.finding_draft) {
+    html += `<button class="primary" onclick="registerDraftFinding()">登记为候选漏洞（draft）</button>
+      <div style="font-size:11px; opacity:.7; margin-top:4px;">登记后仍需人工核对并完成五项复核清单才能确认。</div>`;
+  }
+  renderBizResult(html);
+  window._lastDraft = r.finding_draft || null;
+}
+
+async function registerDraftFinding() {
+  const d = window._lastDraft;
+  if (!d) return;
+  try {
+    await api(`/api/projects/${state.currentProject}/findings`, {
+      method: 'POST',
+      body: JSON.stringify({ title: d.title, severity: d.severity, target: d.target,
+                             detail: d.detail, evidence: d.evidence,
+                             reproduction: d.reproduction, vuln_type: d.vuln_type,
+                             status: 'draft' }),
+    });
+    log('候选漏洞已登记（draft）——请完成五项复核后确认', 'c-ok');
+    loadFindings();
+    renderBizResult('<div class="empty">已登记为候选漏洞（draft）。请在右侧漏洞面板完成五项复核清单后再确认。</div>');
+  } catch (e) { log('登记失败：' + (e.message || e), 'c-err'); }
+}
+
+async function runFlowFromWorkbench() {
+  if (!state.currentProject) return;
+  if (biz.selected.length < 2) return log('流程检查需要勾选至少 2 条请求（按顺序，最后一条为目标步骤）', 'c-warn');
+  const identity = $('bizIdentity').value;
+  renderBizResult('<div class="empty">流程检查执行中…</div>');
+  try {
+    const r = await api(`/api/projects/${state.currentProject}/flow-run`, {
+      method: 'POST',
+      body: JSON.stringify({ request_ids: biz.selected.slice(), identity_id: identity }),
+    });
+    renderDiffResult(r);
+  } catch (e) { renderBizResult(`<div class="empty">流程检查失败：${esc(e.message || e)}</div>`); }
+}
+
+$('bizModal').addEventListener('click', e => { if (e.target.id === 'bizModal') closeBiz(); });
 
 init();
