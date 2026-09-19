@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from . import config, providers, report, scope, store, usage
 from . import graph, ratelimit, secretbox
+from . import difftest
 from .importers import common as importers_common
 from .agent import agent, sessions
 from .executor import executor
@@ -1111,6 +1112,134 @@ async def check_identity(pid: str, iid: str):
                                  last_checked_at=_t.time())
     return {"ok": ok, "status_code": status_code, "latency": latency,
             "status": "active" if ok else "expired"}
+
+
+# ---------- 只读身份差分（v017.3） ----------
+class DiffRunRequest(BaseModel):
+    """对请求库中的一条请求执行身份/对象差分。
+
+    baseline_identity_id：基准身份（应能正常访问自己的对象）；
+    target_field/target_location/target_value：替换对象字段（如 userId=20002），
+      value 由用户从响应/页面中取得，系统不做邻号猜测；
+    with_anonymous：是否追加「无凭据」对照（未授权检测）；
+    repeat：变体重复次数（默认 2——两次一致才算稳定候选）。
+    """
+    request_id: str
+    baseline_identity_id: str
+    target_field: str
+    target_location: str = "query"
+    target_value: str
+    with_anonymous: bool = True
+    repeat: int = 2
+
+
+def _identity_creds(rec: dict) -> tuple[dict, dict]:
+    """解密身份凭据；失败返回 ({}, {}) 并由调用方按 invalid 处理。"""
+    headers = secretbox.unseal_dict(rec.get("headers_enc")) or {}
+    cookies = secretbox.unseal_dict(rec.get("cookies_enc")) or {}
+    return headers, cookies
+
+
+def _build_exec_headers(lib_rec: dict, id_headers: dict, id_cookies: dict) -> tuple[dict, dict]:
+    """合成执行用头：身份凭据接管敏感头，其余非敏感头沿用请求库记录。"""
+    headers = {}
+    for k, v in (lib_rec.get("headers") or {}).items():
+        if isinstance(v, str) and v.startswith("<redacted:"):
+            continue      # 占位头：由身份凭据接管；身份没提供就丢弃（不带假凭据）
+        headers[k] = v
+    headers.update(id_headers or {})
+    cookies = dict(id_cookies or {})
+    # 请求库 cookie 占位不进执行（真 Cookie 由身份提供）
+    return headers, cookies
+
+
+@app.post("/api/projects/{pid}/diff-run")
+async def diff_run(pid: str, req: DiffRunRequest):
+    """只读身份差分：基准 → 变体（对象替换）→ 匿名对照 → 重复验证。
+
+    判定保守（app/difftest.classify）：只有「变体 200 且返回可证明的对象
+    数据且重复一致」才给 suspect_idor 候选建议；结果需人工复核后才能
+    confirmed（v012 状态模型，本接口绝不直接写 confirmed）。
+    """
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    lib_rec = next((r for r in store.list_requests(pid, limit=1000)
+                    if r["id"] == req.request_id), None)
+    if not lib_rec:
+        raise HTTPException(404, "请求不存在或不属于该项目")
+    base_rec = store.get_identity(pid, req.baseline_identity_id)
+    if not base_rec:
+        raise HTTPException(404, "基准身份不存在或不属于该项目")
+    if req.target_location not in ("query", "path", "body"):
+        raise HTTPException(400, "target_location 仅支持 query/path/body")
+    repeat = max(1, min(int(req.repeat or 2), 4))
+
+    base_headers, base_cookies = _identity_creds(base_rec)
+    if (base_rec.get("headers_enc") or base_rec.get("cookies_enc")) and \
+            not base_headers and not base_cookies:
+        store.update_identity_status(pid, req.baseline_identity_id, "invalid")
+        raise HTTPException(409, "基准身份凭据解密失败，已标记 invalid")
+    ex_h, ex_c = _build_exec_headers(lib_rec, base_headers, base_cookies)
+
+    steps: list[dict] = []
+
+    async def _run(tag: str, url: str, body: str) -> dict:
+        ev = await difftest.execute_readonly(url, lib_rec["method"], ex_h, ex_c, body)
+        steps.append({"tag": tag, "url": url, "status": ev.get("status_code"),
+                      "error": ev.get("error")})
+        return ev
+
+    # 1) 基准：A 身份 + 原对象
+    baseline = await _run("baseline", lib_rec["url"], lib_rec.get("body") or "")
+
+    # 2) 变体：同一身份 + 目标对象（重复 repeat 次，取稳定性）
+    variant_req = difftest.apply_replacement(lib_rec, req.target_field,
+                                             req.target_location, req.target_value)
+    variant_runs = []
+    for i in range(repeat):
+        variant_runs.append(await _run(f"variant#{i+1}",
+                                       variant_req["url"], variant_req["body"]))
+    # 稳定性：各次变体响应规范化后一致
+    def _norm_resp(e):
+        return difftest._strip_noise(e.get("body_json")) if e.get("body_json") is not None \
+            else re.sub(r"\s+", " ", e.get("body_text") or "").strip()
+    stable = len({json.dumps(_norm_resp(e), ensure_ascii=False, sort_keys=True,
+                             default=str) for e in variant_runs}) == 1
+
+    # 3) 匿名对照（可选）：无凭据 + 原对象
+    anon = None
+    if req.with_anonymous:
+        anon = await difftest.execute_readonly(lib_rec["url"], lib_rec["method"],
+                                               {k: v for k, v in
+                                                (lib_rec.get("headers") or {}).items()
+                                                if not str(v).startswith("<redacted:")},
+                                               None, lib_rec.get("body") or "")
+        steps.append({"tag": "anonymous", "url": lib_rec["url"],
+                      "status": anon.get("status_code"), "error": anon.get("error")})
+
+    verdict = difftest.classify(baseline, variant_runs[0], req.target_value)
+    # 重复不一致 → 降级 unstable（不产生候选建议）
+    if verdict["verdict"] == "suspect_idor" and not stable:
+        verdict = {"verdict": "unstable",
+                   "reason": f"变体重复 {repeat} 次结果不一致（可能是缓存/随机数据），不产生候选"}
+    # 匿名也 200 且有数据 → 附未授权观察（独立信号，不合并结论）
+    anon_note = None
+    if anon and anon.get("status_code") == 200:
+        anon_note = ("匿名请求同样返回 200——请进一步确认该接口是否本应需要登录"
+                     "（未授权访问线索，与越权结论分开验证）")
+
+    return {
+        "verdict": verdict,
+        "stable": stable,
+        "steps": steps,
+        "anonymous_note": anon_note,
+        "variant_url": variant_req["url"],
+        "target": {"field": req.target_field, "location": req.target_location,
+                   "value_masked": (req.target_value[:2] + "***" + req.target_value[-2:])
+                   if len(req.target_value) > 6 else req.target_value},
+        "note": ("suspect_idor 仅为候选建议：请在请求库/Burp 中人工核对响应内容，"
+                 "确认对象归属后用「登记漏洞」写入候选（draft），复核确认才进报告。"),
+    }
 
 
 @app.get("/api/sessions/{sid}/stream")
