@@ -1326,9 +1326,12 @@ async function loadFindings() {
   }
   el.innerHTML = d.findings.map(f => `
     <div class="finding">
-      <div class="ftitle">${esc(f.title)} <span class="badge">${esc(f.severity)}</span></div>
-      <div class="fmeta">${esc(f.target || '无目标')}</div>
-      <div style="margin-top:6px;">
+      <div class="ftitle">${esc(f.title)} <span class="badge">${esc(f.severity)}</span>
+        <span class="badge" style="${f.status === 'confirmed' ? '' : 'opacity:.6;'}">${esc(f.status || 'draft')}</span></div>
+      <div class="fmeta">${esc(f.target || '无目标')}${f.vuln_type ? ' · ' + esc(f.vuln_type) : ''}</div>
+      <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+        <button class="mini" onclick="reviewFinding('${f.id}')" title="五项复核清单：可重复/权限差异/复现链/无损害/影响可证明">复核</button>
+        ${f.status !== 'confirmed' ? `<button class="mini" onclick="confirmFinding('${f.id}')">确认</button>` : ''}
         <button class="sm danger" onclick="delFinding('${f.id}')">删除</button>
       </div>
     </div>`).join('');
@@ -1358,6 +1361,48 @@ async function delFinding(fid) {
   await api(`/api/projects/${state.currentProject}/findings/${fid}`, { method: 'DELETE' });
   loadFindings();
   loadProjects();
+}
+
+/* 五项复核清单（v017.4）：逐项 confirm 收集，PUT 落库。
+   confirmed 硬闸门：五项不全时服务端拒绝确认（400）。 */
+async function reviewFinding(fid) {
+  if (!state.currentProject) return;
+  const items = [
+    ['c1_repeat', '① 至少重复两次且结果一致？'],
+    ['c2_permission_delta', '② 权限/身份差异是否明确？'],
+    ['c3_minimal_chain', '③ 最小 HTTP 请求/响应复现链是否完整？'],
+    ['c4_readonly_or_safe', '④ 只读证明优先，写操作无真实损害？'],
+    ['c5_impact_proven', '⑤ 对象/数据/状态影响可证明？'],
+  ];
+  const checks = {};
+  for (const [k, q] of items) {
+    checks[k] = confirm(q + '\n\n（取消 = 该项未达成）');
+    if (!checks[k]) break;
+  }
+  if (Object.values(checks).some(v => !v)) {
+    log('五项复核未全部达成——该漏洞只能保持候选状态，无法确认进报告', 'c-warn');
+  }
+  const note = prompt('复核备注（可空）：') || '';
+  try {
+    await api(`/api/projects/${state.currentProject}/findings/${fid}/checklist`, {
+      method: 'PUT', body: JSON.stringify({ ...checks, note }),
+    });
+    log('复核清单已保存', 'c-ok');
+  } catch (e) { log('复核清单保存失败：' + (e.message || e), 'c-err'); }
+}
+
+async function confirmFinding(fid) {
+  if (!state.currentProject) return;
+  if (!confirm('确认该漏洞进入正式报告（confirmed）？\n五项复核清单必须已全部达成，否则将被拒绝。')) return;
+  try {
+    await api(`/api/projects/${state.currentProject}/findings/${fid}/review`, {
+      method: 'POST', body: JSON.stringify({ action: 'confirmed', approved: true }),
+    });
+    log('漏洞已确认，进入正式报告', 'c-ok');
+    loadFindings();
+  } catch (e) {
+    log('确认被拒绝：' + (e.message || e) + '\n请先完成五项复核清单', 'c-err');
+  }
 }
 
 /* ---------- 已证事实 ---------- */
@@ -1935,6 +1980,21 @@ async function runDiff(rid) {
     const v = r.verdict || {};
     if (v.verdict === 'suspect_idor') {
       log(`⚠ 疑似越权：${v.reason}（已标记候选建议，请人工核对后登记漏洞）`, 'c-warn');
+      if (r.finding_draft && confirm('已生成候选漏洞预填材料。\n\n' + r.finding_draft.title +
+          '\n\n确认登记为候选漏洞（draft，需人工复核确认）？')) {
+        const d = r.finding_draft;
+        try {
+          await api(`/api/projects/${state.currentProject}/findings`, {
+            method: 'POST',
+            body: JSON.stringify({ title: d.title, severity: d.severity, target: d.target,
+                                   detail: d.detail, evidence: d.evidence,
+                                   reproduction: d.reproduction, vuln_type: d.vuln_type,
+                                   status: 'draft' }),
+          });
+          log('候选漏洞已登记（draft）——请在漏洞面板补全证据并完成五项复核', 'c-ok');
+          loadFindings();
+        } catch (e) { log('登记失败：' + (e.message || e), 'c-err'); }
+      }
     } else if (v.verdict === 'access_denied') {
       log(`差分结论：${v.reason}`, 'c-ok');
     } else if (v.verdict === 'no_diff') {
