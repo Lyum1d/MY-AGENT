@@ -74,6 +74,29 @@ CREATE TABLE IF NOT EXISTS facts (
     step_id     TEXT DEFAULT '',
     created_at  REAL
 );
+-- v017.1 请求库：Burp XML / HAR 导入的请求（脱敏副本）。
+-- 敏感头（Authorization/Cookie 等）入库前已被替换为 <redacted:*:len> 占位——
+-- 完整凭据永不入 SQLite（v017.2 身份库走 DPAPI 受保护存储，与本表无关）。
+CREATE TABLE IF NOT EXISTS request_library (
+    id            TEXT PRIMARY KEY,
+    project_id    TEXT,
+    source        TEXT,             -- burp_xml | har | manual
+    method        TEXT,
+    url           TEXT,             -- 原始 URL
+    normalized_url TEXT,            -- 去噪 URL（查询值占位、路径数字归一），去重与筛选用
+    headers       TEXT,             -- 脱敏后 JSON
+    cookies       TEXT,             -- 脱敏后 JSON
+    query         TEXT,             -- JSON（参数名 → 原始值）
+    body          TEXT,             -- 脱敏后请求体（截断 4KB）
+    content_type  TEXT,
+    status_code   INTEGER,
+    tags          TEXT,             -- JSON 数组
+    scope_status  TEXT,             -- allowed | rejected（导入预览时判定）
+    dedup_key     TEXT,             -- 方法+规范化URL+参数名集合+body结构键
+    object_candidates TEXT,         -- JSON [{field, location, value_masked, source, confidence}]
+    created_at    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_req_lib_proj ON request_library(project_id);
 CREATE TABLE IF NOT EXISTS chat_messages (
     id          TEXT PRIMARY KEY,
     session_id  TEXT,
@@ -915,6 +938,65 @@ def list_facts(project_id: str) -> list[dict]:
             "SELECT * FROM facts WHERE project_id=? ORDER BY created_at DESC", (project_id,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------- 请求库（v017.1：Burp/HAR 导入） ----------
+def add_request(project_id: str, rec: dict) -> dict:
+    """入库一条导入请求（rec 已由 importer 完成脱敏/scope 判定/去重键计算）。"""
+    rid = rec.get("id") or uuid.uuid4().hex[:12]
+    with _db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO request_library (id,project_id,source,method,url,"
+            "normalized_url,headers,cookies,query,body,content_type,status_code,tags,"
+            "scope_status,dedup_key,object_candidates,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (rid, project_id, rec.get("source", ""), rec.get("method", ""),
+             rec.get("url", ""), rec.get("normalized_url", ""),
+             json.dumps(rec.get("headers", {}), ensure_ascii=False),
+             json.dumps(rec.get("cookies", {}), ensure_ascii=False),
+             json.dumps(rec.get("query", {}), ensure_ascii=False),
+             rec.get("body", ""), rec.get("content_type", ""),
+             rec.get("status_code"), json.dumps(rec.get("tags", []), ensure_ascii=False),
+             rec.get("scope_status", "allowed"), rec.get("dedup_key", ""),
+             json.dumps(rec.get("object_candidates", []), ensure_ascii=False),
+             time.time()),
+        )
+    rec["id"] = rid
+    return rec
+
+
+def list_requests(project_id: str, scope_status: str = "", method: str = "",
+                  limit: int = 200) -> list[dict]:
+    q = "SELECT * FROM request_library WHERE project_id=?"
+    args: list = [project_id]
+    if scope_status:
+        q += " AND scope_status=?"
+        args.append(scope_status)
+    if method:
+        q += " AND method=?"
+        args.append(method.upper())
+    q += " ORDER BY created_at DESC LIMIT ?"
+    args.append(max(1, min(int(limit), 1000)))
+    with _db() as c:
+        rows = c.execute(q, args).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        for col in ("headers", "cookies", "query", "tags", "object_candidates"):
+            try:
+                d[col] = json.loads(d.get(col) or ("{}" if col != "tags" else "[]"))
+            except (TypeError, ValueError):
+                pass
+        out.append(d)
+    return out
+
+
+def delete_request(project_id: str, rid: str) -> bool:
+    """删除一条请求库记录（WHERE 双条件防跨项目，同 delete_fact）。"""
+    with _db() as c:
+        cur = c.execute("DELETE FROM request_library WHERE id=? AND project_id=?",
+                        (rid, project_id))
+    return cur.rowcount > 0
 
 
 def delete_fact(project_id: str, fid: str) -> bool:
