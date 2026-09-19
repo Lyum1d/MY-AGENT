@@ -228,7 +228,7 @@ async function init() {
     $('status').innerHTML = `<span class="dot bad"></span>后端未连接：${esc(e.message)}`;
     return;
   }
-  loadProjects().then(() => { autoSelectProject(); renderProjects(); updateProjectHeader(); loadFindings(); loadFacts(); loadTree(); });
+  loadProjects().then(() => { autoSelectProject(); renderProjects(); updateProjectHeader(); loadFindings(); loadFacts(); loadIdentities(); loadTree(); });
   loadTools();
   refreshUsageBadge();
 }
@@ -365,6 +365,7 @@ async function createProject() {
   updateProjectHeader();
   loadFindings();
   loadFacts();
+  loadIdentities();
   loadTree();
 }
 
@@ -375,6 +376,7 @@ async function selectProject(pid) {
   updateProjectHeader();
   loadFindings();
   loadFacts();
+  loadIdentities();
   // 切项目 = 切对话树：清空当前线程，聊天区回到空态
   if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
   state.sessionId = null;
@@ -1764,5 +1766,89 @@ async function setGraphThreadStatus(sid, action) {
 }
 
 $('graphModal').addEventListener('click', e => { if (e.target.id === 'graphModal') closeGraph(); });
+
+/* ---------- 测试身份（v017.2）----------
+   凭据 DPAPI 加密落盘；前端只提交明文一次（本地回环），之后只显示
+   标签/角色/状态——服务端任何接口都不回显凭据。 */
+function toggleIdentityForm() {
+  const f = $('identityForm');
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+}
+
+async function loadIdentities() {
+  if (!state.currentProject) return;
+  try {
+    const d = await api(`/api/projects/${state.currentProject}/identities`);
+    const items = d.items || [];
+    $('identityCount').textContent = items.length;
+    const el = $('identityList');
+    if (!items.length) { el.innerHTML = '<div class="empty">暂无测试身份</div>'; return; }
+    el.innerHTML = items.map(i => `
+      <div class="list-item">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
+          <b>${esc(i.label)}</b>
+          <span style="opacity:.65;font-size:11px;">${esc(i.role)}${i.tenant ? ' · ' + esc(i.tenant) : ''}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:2px;">
+          <span class="badge" style="${i.status === 'active' ? '' : 'opacity:.55;'}">${esc(i.status)}</span>
+          <span>
+            <button class="mini" onclick="checkIdentity('${i.id}')" title="发一次只读请求验证凭据是否有效">检查</button>
+            <button class="mini" onclick="delIdentity('${i.id}')">删除</button>
+          </span>
+        </div>
+      </div>`).join('');
+  } catch (e) { /* 项目未选等场景静默 */ }
+}
+
+async function addIdentity() {
+  if (!state.currentProject) return log('先选择项目', 'c-warn');
+  const parseJson = (id, name) => {
+    const raw = ($(id).value || '').trim();
+    if (!raw) return {};
+    try { return JSON.parse(raw); }
+    catch (e) { throw new Error(`${name} 不是合法 JSON`); }
+  };
+  let headers, cookies;
+  try {
+    headers = parseJson('identityHeaders', '请求头');
+    cookies = parseJson('identityCookies', 'Cookie');
+  } catch (e) { return log(e.message, 'c-err'); }
+  try {
+    await api(`/api/projects/${state.currentProject}/identities`, {
+      method: 'POST',
+      body: JSON.stringify({
+        label: $('identityLabel').value.trim(),
+        role: $('identityRole').value,
+        tenant: $('identityTenant').value.trim(),
+        headers, cookies,
+        check_url: $('identityCheckUrl').value.trim(),
+      }),
+    });
+    log('身份已登记（凭据已加密保存）', 'c-ok');
+    $('identityLabel').value = ''; $('identityCheckUrl').value = '';
+    $('identityHeaders').value = ''; $('identityCookies').value = '';
+    toggleIdentityForm();
+    loadIdentities();
+  } catch (e) { log('登记失败：' + (e.message || e), 'c-err'); }
+}
+
+async function checkIdentity(iid) {
+  if (!state.currentProject) return;
+  log('正在检查身份有效性（只读请求）…', 'c-dim');
+  try {
+    const r = await api(`/api/projects/${state.currentProject}/identities/${iid}/check`, { method: 'POST' });
+    log(`身份检查：${r.ok ? '有效' : '凭据已失效'}（HTTP ${r.status_code}，${r.latency}s）`, r.ok ? 'c-ok' : 'c-warn');
+    loadIdentities();
+  } catch (e) { log('检查失败：' + (e.message || e), 'c-err'); loadIdentities(); }
+}
+
+async function delIdentity(iid) {
+  if (!state.currentProject) return;
+  if (!confirm('删除该身份及其加密凭据？')) return;
+  try {
+    await api(`/api/projects/${state.currentProject}/identities/${iid}`, { method: 'DELETE' });
+    loadIdentities();
+  } catch (e) { log('删除失败：' + (e.message || e), 'c-err'); }
+}
 
 init();
