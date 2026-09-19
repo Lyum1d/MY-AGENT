@@ -134,6 +134,18 @@ CREATE TABLE IF NOT EXISTS diff_runs (
     created_at    REAL
 );
 CREATE INDEX IF NOT EXISTS idx_diff_runs_proj ON diff_runs(project_id);
+-- v017.5 流程绕过检测记录（与 diff_runs 同等脱敏标准）。
+CREATE TABLE IF NOT EXISTS flow_runs (
+    id            TEXT PRIMARY KEY,
+    project_id    TEXT,
+    identity_label TEXT,
+    step_ids_json TEXT,            -- 流程步骤的 request_library id 序列
+    verdict       TEXT,            -- suspect_flow_bypass | suspect_unauthorized | flow_protected | flow_invalid | unstable
+    reason        TEXT,
+    steps_json    TEXT,
+    created_at    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_flow_runs_proj ON flow_runs(project_id);
 -- v017.4 五项复核清单（finding 一对一）。确认闸门：五项不全 → 拒绝 confirmed。
 CREATE TABLE IF NOT EXISTS finding_checks (
     finding_id  TEXT PRIMARY KEY,
@@ -1160,6 +1172,36 @@ def get_diff_run(project_id: str, run_id: str) -> dict | None:
     except (TypeError, ValueError):
         d["steps"] = []
     return d
+
+
+def add_flow_run(project_id: str, rec: dict) -> str:
+    rid = uuid.uuid4().hex[:12]
+    with _db() as c:
+        c.execute(
+            "INSERT INTO flow_runs (id,project_id,identity_label,step_ids_json,"
+            "verdict,reason,steps_json,created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (rid, project_id, rec.get("identity_label", ""),
+             json.dumps(rec.get("step_ids", []), ensure_ascii=False),
+             rec.get("verdict", ""), rec.get("reason", ""),
+             json.dumps(rec.get("steps", []), ensure_ascii=False), time.time()))
+    return rid
+
+
+def list_flow_runs(project_id: str, limit: int = 50) -> list[dict]:
+    with _db() as c:
+        rows = c.execute(
+            "SELECT * FROM flow_runs WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
+            (project_id, max(1, min(int(limit), 200)))).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        for col in ("step_ids_json", "steps_json"):
+            try:
+                d[col.replace("_json", "")] = json.loads(d.pop(col) or "[]")
+            except (TypeError, ValueError):
+                d[col.replace("_json", "")] = []
+        out.append(d)
+    return out
 
 
 def get_checks(finding_id: str) -> dict | None:

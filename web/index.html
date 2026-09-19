@@ -160,6 +160,7 @@
     <div class="panel-body" id="factList"><div class="empty">暂无已证事实</div></div>
 
     <div class="report-bar">
+      <button class="ghost" onclick="openBiz()">🧪 业务测试</button>
       <button class="ghost" onclick="openGraph()">🗺 线索图</button>
       <button class="ghost" onclick="viewReport()">查看报告</button>
       <button class="primary" onclick="exportReport()">导出报告</button>
@@ -186,6 +187,54 @@
     <div class="graph-legend" id="graphLegend"></div>
     <div class="graph-canvas" id="graphCanvas"></div>
     <div class="graph-hint">滚轮缩放 · 拖拽平移 · 双击空白适应窗口 · 单击节点看详情；攻击图上单击「线索」节点可直接切到那条对话。</div>
+  </div>
+</div>
+
+<!-- ============ 业务测试工作台（v017） ============ -->
+<div id="bizModal" class="modal-mask">
+  <div class="modal" style="width:min(1000px,94vw); height:min(720px,92vh); display:flex; flex-direction:column;">
+    <div class="modal-head">
+      <b>业务逻辑测试 · 身份差分 / 流程检查</b>
+      <div style="display:flex;gap:8px;">
+        <button class="sm" onclick="closeBiz()">关闭</button>
+      </div>
+    </div>
+    <div class="modal-tip" style="flex:none;">
+      只读方法（GET/HEAD/OPTIONS）自动执行；差分：同身份替换对象 ID 看是否越权；流程：勾选多条请求按顺序组成链，检测能否跳过前置步骤。suspect 结果仅为候选建议，需人工复核确认。
+    </div>
+    <div style="flex:1; min-height:0; display:flex; gap:10px; overflow:hidden;">
+      <!-- 左：请求列表（可勾选组成流程） -->
+      <div style="flex:1.2; display:flex; flex-direction:column; min-width:0;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+          <b style="font-size:12px;">请求库（勾选可组成流程链，顺序=勾选顺序）</b>
+          <button class="mini" onclick="document.getElementById('importFile2').click()">导入</button>
+        </div>
+        <input type="file" id="importFile2" accept=".xml,.har" style="display:none;" onchange="importRequests(this, loadBizRequests)">
+        <div id="bizReqList" style="flex:1; overflow:auto; border:1px solid rgba(128,128,128,.25); border-radius:8px; padding:6px;">
+          <div class="empty">加载中…</div>
+        </div>
+        <button class="primary" style="margin-top:6px;" onclick="runFlowFromWorkbench()">▶ 流程检查（勾选的请求按序执行）</button>
+      </div>
+      <!-- 右：差分参数 + 结果 -->
+      <div style="flex:1; display:flex; flex-direction:column; min-width:0;">
+        <b style="font-size:12px; margin-bottom:4px;">身份差分（单请求 × 对象替换）</b>
+        <div style="display:flex; flex-direction:column; gap:5px;">
+          <select id="bizIdentity"><option value="">— 选择基准身份 —</option></select>
+          <input id="bizField" placeholder="对象字段名（如 orderId / userId）">
+          <select id="bizLocation">
+            <option value="query">query 参数</option>
+            <option value="path">URL 路径段</option>
+            <option value="body">请求体字段</option>
+          </select>
+          <input id="bizValue" placeholder="目标对象值（从响应或页面中取得他人对象 ID）">
+          <label style="font-size:12px;"><input type="checkbox" id="bizAnon" checked> 追加匿名对照（未授权检测）</label>
+          <button class="primary" onclick="runDiffFromWorkbench()">▶ 执行身份差分</button>
+        </div>
+        <div id="bizResult" style="flex:1; overflow:auto; margin-top:8px; border:1px solid rgba(128,128,128,.25); border-radius:8px; padding:8px; font-size:12px;">
+          <div class="empty">差分/流程结果将显示在这里</div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 

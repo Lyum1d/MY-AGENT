@@ -232,6 +232,10 @@ def classify(baseline: dict, variant: dict, target_value: str = "") -> dict:
             "reason": "文本响应存在差异但无法自动判定对象归属，请人工查看响应内容"}
 
 
+def _norm_text(t: str) -> str:
+    return re.sub(r"\s+", " ", t or "").strip()
+
+
 def _looks_empty(obj) -> bool:
     if obj is None:
         return True
