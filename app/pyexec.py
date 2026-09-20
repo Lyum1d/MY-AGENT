@@ -247,7 +247,8 @@ def _scope_check_target(target: str) -> str | None:
     return None
 
 
-async def run_py_exec(code: str, target: str = "", cancel_event=None) -> AsyncIterator[dict]:
+async def run_py_exec(code: str, target: str = "", cancel_event=None,
+                      project_id: str = "", session_id: str = "") -> AsyncIterator[dict]:
     """执行一段 Python 代码，产出与 executor 一致的事件流。
 
     yield: {"type": "output"|"error"|"exit", "data":..., "code":...}
@@ -324,7 +325,9 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None) -> AsyncIt
             # workdir（留档仍在 data/scripts/exec/ 不动），让模块可被导入。
             run_path = workdir / "_script.py"
             run_path.write_text(code, encoding="utf-8")
-            bridge = pyexec_bridge.ScriptBridge(workdir, tool_alias="py_exec")
+            bridge = pyexec_bridge.ScriptBridge(workdir, tool_alias="py_exec",
+                                                project_id=project_id,
+                                                session_id=session_id)
         except Exception:
             logger.warning("受控网络通道初始化失败（脚本仍可执行，但无受控通道）", exc_info=True)
     try:

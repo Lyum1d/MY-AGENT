@@ -125,11 +125,12 @@ class ScriptBridge:
     """宿主侧桥接任务：服务脚本发出的受控请求。"""
 
     def __init__(self, workdir: Path, *, project_id: str = "", tool_alias: str = "py_exec",
-                 max_requests: int = 0) -> None:
+                 max_requests: int = 0, session_id: str = "") -> None:
         self.workdir = Path(workdir)
         self.req_dir = self.workdir / BRIDGE_DIR / REQ_DIR
         self.resp_dir = self.workdir / BRIDGE_DIR / RESP_DIR
         self.project_id = project_id
+        self.session_id = session_id
         self.tool_alias = tool_alias
         self.max_requests = max_requests or config.PY_EXEC_MAX_REQUESTS
         self.count = 0
@@ -201,8 +202,8 @@ class ScriptBridge:
         # 调度器许可（scope / 预算 / 并发 / 暂停态 / 审计）
         try:
             permit = await traffic.governor.acquire(
-                url, project_id=self.project_id, tool_alias=self.tool_alias,
-                method=method)
+                url, project_id=self.project_id, session_id=self.session_id,
+                tool_alias=self.tool_alias, method=method)
         except traffic.TrafficError as e:
             kind = type(e).__name__
             resp = {"error": kind.upper(), "hint": str(e)}
@@ -228,10 +229,21 @@ class ScriptBridge:
             return
         await traffic.governor.release(permit, status_code=r.status_code,
                                       bytes_in=len(r.content))
+        # v023.6（实战反馈）：截断必须显式告知——否则脚本以为自己拿到了完整
+        # 响应体，可能漏掉位于页尾的关键证据（实战中 serverPath 就在 64KB 之后）。
+        full_len = len(r.content)
+        text = r.text
         resp = {"status_code": r.status_code,
                 "headers": {k: v for k, v in list(r.headers.items())[:20]},
-                "text": r.text[:65536],
+                "text": text[:65536],
                 "elapsed": round(time.monotonic() - t0, 3)}
+        if len(text) > 65536:
+            resp["truncated"] = True
+            resp["total_chars"] = len(text)
+            resp["truncation_note"] = (
+                f"响应体已截断：仅返回前 65536 字符（原始 {len(text)} 字符，"
+                f"{full_len} 字节）。如需页尾内容，请用 Range 头分片获取，"
+                "或把响应保存到本地文件后离线解析。")
 
         await self._write_resp(rid, resp)
 

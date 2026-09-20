@@ -1146,10 +1146,24 @@ class Agent:
                     approved, edited_args = await self._await_confirm(session, step)
                     if not approved:
                         step.status = "denied"
+                        # v023.6（实战反馈）：拒绝后要给**可执行的替代路径**，
+                        # 否则模型只能自己猜怎么降级（实测 py_exec 被拒后，
+                        # 模型多花一步才想到改用 httpreplay 单发）。
+                        hint = ""
+                        if tool.alias == "py_exec":
+                            hint = ("可用替代：①内置 `httpreplay` 单发一次请求（args 用 "
+                                    "`-X GET --timeout 15`，只读、L2）；②若要多次取数，"
+                                    "改用受控接口 `from srcagent import safe_http_request` "
+                                    "且**不要**写 for/while 循环（展开为顺序调用）。")
+                        elif risk.get("level") == "L3":
+                            hint = ("可用替代：改用同功能的 L0/L1 只读工具，或把范围收窄后"
+                                    "再说明为什么必须用该高风险通道。")
                         session.messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
-                            "content": f"用户拒绝执行 {tool.name}（风险等级 {risk.get('level')}）。请改用其他更低风险的方式，或说明为什么必须执行。",
+                            "content": (f"用户拒绝执行 {tool.name}（风险等级 {risk.get('level')}）。"
+                                        f"请改用其他更低风险的方式，或说明为什么必须执行。"
+                                        + (f"\n{hint}" if hint else "")),
                         })
                         await session.emit({"type": "step_denied", "step": self._step_dict(step)})
                         try:
@@ -2027,18 +2041,22 @@ class Agent:
         # 内置工具走 app/replayer.py 托管运行器（不 spawn 工具箱子进程）；
         # v012 后半：四个通道全部接入取消硬终止（cancel_event 由用户
         # /api/sessions/{sid}/cancel 置位）。
+        # v023.6：把项目/会话上下文透传到每个出网入口——否则流量事件的
+        # project_id 为空，项目维度的流量审计（面板/报告）查不到任何数据
+        # （shhxqh 实战暴露：442 条事件全部落在空项目桶）。
+        _ctx = {"project_id": session.project or "", "session_id": session.id}
         if tool.alias == "httpreplay":
             gen = replayer.run_replay(step.target, step.args,
-                                      cancel_event=session.cancel_event)
+                                      cancel_event=session.cancel_event, **_ctx)
         elif tool.alias == "nuclei_cli":
             gen = replayer.run_nuclei(tool, step.target, step.args,
-                                      cancel_event=session.cancel_event)
+                                      cancel_event=session.cancel_event, **_ctx)
         elif tool.alias == "py_exec":
             gen = pyexec.run_py_exec(step.args, step.target,
-                                     cancel_event=session.cancel_event)
+                                     cancel_event=session.cancel_event, **_ctx)
         else:
             gen = executor.run(tool, step.target, step.args,
-                               cancel_event=session.cancel_event)
+                               cancel_event=session.cancel_event, **_ctx)
         async for ev in gen:
             etype = ev.get("type")
             if etype == "cancelled":

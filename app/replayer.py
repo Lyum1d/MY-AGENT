@@ -39,10 +39,12 @@ _host_allowed = scope.host_in_scope
 _load_scope = scope.load_scope
 
 # ---------- 出网许可（v023.1：统一走 TrafficGovernor） ----------
-async def _rate_limit(url: str = "", method: str = "GET") -> dict:
+async def _rate_limit(url: str = "", method: str = "GET",
+                      project_id: str = "", session_id: str = "") -> dict:
     """取得一次出网许可。调度器内已含 scope 兜底、滑动窗口预算、
     目标/根域名并发限制、暂停状态检查与流量事件落库。"""
-    return await traffic.governor.acquire(url, tool_alias="httpreplay", method=method)
+    return await traffic.governor.acquire(url, tool_alias="httpreplay", method=method,
+                                          project_id=project_id, session_id=session_id)
 
 
 # ---------- 参数解析 ----------
@@ -99,8 +101,13 @@ def _parse_args(args: str) -> tuple[str, list[tuple[str, str]], dict[str, str], 
 
 
 # ---------- 主入口 ----------
-async def run_replay(url: str, args: str = "", cancel_event=None):
-    """HTTP 重放器事件流。事件格式与 executor.run 一致。"""
+async def run_replay(url: str, args: str = "", cancel_event=None,
+                     project_id: str = "", session_id: str = "") -> AsyncIterator[dict]:
+    """HTTP 重放器事件流。事件格式与 executor.run 一致。
+
+    v023.6：project_id/session_id 透传到流量事件——缺了它们，项目维度的
+    流量审计查不到数据（shhxqh 实战暴露：事件全落在空项目桶）。
+    """
     url = (url or "").strip().strip("'\"")
     # v012 后半：取消硬终止——发请求前检查，置位即放弃本次请求
     if cancel_event is not None and cancel_event.is_set():
@@ -148,7 +155,7 @@ async def run_replay(url: str, args: str = "", cancel_event=None):
 
     # 3. 发请求（出网许可 + 信任环境关闭，防系统代理劫持）
     try:
-        permit = await _rate_limit(url, method)
+        permit = await _rate_limit(url, method, project_id, session_id)
     except traffic.TrafficError as e:
         yield {"type": "error", "data": str(e)}
         yield {"type": "exit", "code": 1}
@@ -201,7 +208,8 @@ async def run_replay(url: str, args: str = "", cancel_event=None):
 
 
 # ---------- nuclei 托管运行 ----------
-async def run_nuclei(tool, target: str, args: str = "", cancel_event=None):
+async def run_nuclei(tool, target: str, args: str = "", cancel_event=None,
+                     project_id: str = "", session_id: str = ""):
     """运行 data/bin/nuclei.exe（若存在）。与 executor 相同的事件流格式。"""
     exe = tool.executable
     yield {"type": "tool", "data": "Nuclei CLI"}
@@ -230,6 +238,18 @@ async def run_nuclei(tool, target: str, args: str = "", cancel_event=None):
 
     cmd = [exe, "-u", target, "-silent", "-no-color"] + extra
     yield {"type": "command", "data": " ".join(cmd)}
+
+    # v023.6：nuclei 扫描器启动前取一次出网许可（预算/并发/暂停态），并带上
+    # 项目/会话上下文——否则事件归属为空，项目流量审计看不到这次扫描。
+    try:
+        permit = await traffic.governor.acquire(
+            target, tool_alias=tool.alias or "nuclei_cli", method="GET",
+            project_id=project_id, session_id=session_id)
+        await traffic.governor.release(permit)
+    except traffic.TrafficError as e:
+        yield {"type": "error", "data": f"出网调度拒绝（不启动 nuclei）：{e}"}
+        yield {"type": "exit", "code": 126}
+        return
 
     total = tool.tool_timeout or config.TOOL_TIMEOUT
     deadline = time.time() + total

@@ -329,7 +329,7 @@ class Executor(ABC):
 
     @abstractmethod
     async def run(self, tool: Tool, target: str, args: str = "",
-                  cancel_event=None) -> AsyncIterator[dict]:
+                  cancel_event=None, project_id: str = "", session_id: str = "") -> AsyncIterator[dict]:
         """执行工具并流式产出输出行。
 
         cancel_event（v012 后半）：取消硬终止——调用方传入 asyncio.Event，
@@ -418,7 +418,7 @@ class LocalExecutor(Executor):
 
     # ---------- 执行 ----------
     async def run(self, tool: Tool, target: str, args: str = "",
-                  cancel_event=None) -> AsyncIterator[dict]:
+                  cancel_event=None, project_id: str = "", session_id: str = "") -> AsyncIterator[dict]:
         # ---- 授权范围校验（执行前最后一道闸门）----
         # 命令行工具此前只校验 target 格式、不校验是否授权，
         # 配合「项目 target 自动注入」后目标来源变多，越权路径更短，故在此兜底。
@@ -434,20 +434,20 @@ class LocalExecutor(Executor):
             yield {"type": "error", "data": f"工具文件不存在：{tool.name}（{tool.rel_path}）"}
             return
 
-        # v023.2：扫描器内部速率能力声明（network_control）——未声明者流量不可观测，
-        # 默认警告放行（过渡期），AGENT_SCANNER_REQUIRE_DECLARATION=1 时严格拒绝。
-        # 必须放在 build_command 之前：已声明能力的工具要注入保守速率参数。
+        # v023.2：扫描器内部速率能力声明（network_control）。**注意（v023.6 修）**：
+        # 未声明提示已移到工具清单描述里（registry.build_schemas）——实战发现
+        # 每次执行前都 yield 一遍会让同一段长警告刷屏，污染输出与上下文。
+        # 这里只保留：严格模式拒绝 + 审计留痕（不再输出提示文本）。
         nc = tool.network_control or {}
         if not nc.get("declared"):
-            warn = (f"⚠「{tool.name}」未在 data/tool_overrides.json 的 network_control 中"
-                    f"声明内部速率/并发能力——其内部请求量不可观测，"
-                    f"调度器只能限制启动次数。请人工确认速率参数，"
-                    f"或补全声明（declared/supports_rate/rate_flags/traffic_class）。")
             if config.SCANNER_REQUIRE_DECLARATION:
-                yield {"type": "error", "data": "已拒绝执行（严格模式）：" + warn}
+                yield {"type": "error", "data": (
+                    f"已拒绝执行（严格模式）：「{tool.name}」未声明内部速率/并发能力"
+                    f"（network_control.declared），其内部请求量不可观测。"
+                    f"请在 data/tool_overrides.json 补齐声明，或关闭 "
+                    f"AGENT_SCANNER_REQUIRE_DECLARATION。")}
                 yield {"type": "exit", "code": 126}
                 return
-            yield {"type": "output", "data": warn}
         else:
             # 已声明能力：自动注入保守速率/并发值（args 里用户已显式给出则不覆盖）
             args, injected = _apply_network_control(tool, args)
@@ -522,7 +522,8 @@ class LocalExecutor(Executor):
                 else f"https://{host_for_traffic}/"
             try:
                 permit = await traffic.governor.acquire(
-                    probe_url, tool_alias=tool.alias or tool.name, method="GET")
+                    probe_url, tool_alias=tool.alias or tool.name, method="GET",
+                    project_id=project_id, session_id=session_id)
                 await traffic.governor.release(permit)
             except traffic.TrafficError as e:
                 yield {"type": "error", "data": f"出网调度拒绝（不启动扫描器）：{e}"}
