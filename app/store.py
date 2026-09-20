@@ -320,6 +320,15 @@ def _db():
 def init_db() -> None:
     with _db() as c:
         c.executescript(SCHEMA)
+        # ---- v023.3 迁移：traffic_states 补 resolved_ip ----
+        # v023.1 建表时漏了这一列，而「同 IP 聚合暂停」靠它反查兄弟主机。
+        # CREATE TABLE IF NOT EXISTS 对已存在的表不加列，必须显式 ALTER。
+        try:
+            tcols = {r["name"] for r in c.execute("PRAGMA table_info(traffic_states)")}
+            if tcols and "resolved_ip" not in tcols:
+                c.execute("ALTER TABLE traffic_states ADD COLUMN resolved_ip TEXT DEFAULT ''")
+        except Exception:
+            pass
         # 旧库升级：会话树新增列（分支对话树功能）。逐列检查，缺哪个补哪个。
         cols = {r["name"] for r in c.execute("PRAGMA table_info(sessions)").fetchall()}
         for col, ddl in (
@@ -1296,12 +1305,16 @@ def checks_complete(finding_id: str) -> bool:
 
 # ---------- 流量安全（v023.1） ----------
 def upsert_traffic_state(project_id: str, st: dict) -> None:
-    """写入/更新目标状态（root_domain 为主键——跨项目共享同一目标的封禁状态）。"""
+    """写入/更新目标状态（root_domain 为主键——跨项目共享同一目标的封禁状态）。
+
+    注意必须写入 resolved_ip：同 IP 聚合暂停靠它反查兄弟主机（v023.3 踩坑：
+    漏了这一列导致「同 IP 兄弟主机一并暂停」静默失效）。
+    """
     with _db() as c:
         c.execute(
             "INSERT INTO traffic_states (root_domain,project_id,state,reason,signal_count,"
             "cooldown_until,last_success_at,last_error_at,last_error_type,last_error_code,"
-            "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+            "resolved_ip,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(root_domain) DO UPDATE SET state=excluded.state,"
             " reason=excluded.reason, signal_count=excluded.signal_count,"
             " cooldown_until=excluded.cooldown_until,"
@@ -1309,12 +1322,15 @@ def upsert_traffic_state(project_id: str, st: dict) -> None:
             " last_error_at=COALESCE(excluded.last_error_at, traffic_states.last_error_at),"
             " last_error_type=excluded.last_error_type,"
             " last_error_code=excluded.last_error_code,"
+            " resolved_ip=CASE WHEN excluded.resolved_ip<>'' THEN excluded.resolved_ip"
+            "                  ELSE traffic_states.resolved_ip END,"
             " project_id=excluded.project_id, updated_at=excluded.updated_at",
             (st.get("root_domain", ""), project_id, st.get("state", "NORMAL"),
              st.get("reason", ""), int(st.get("signal_count") or 0),
              float(st.get("cooldown_until") or 0), st.get("last_success_at"),
              st.get("last_error_at"), st.get("last_error_type", ""),
-             int(st.get("last_error_code") or 0), time.time()))
+             int(st.get("last_error_code") or 0), st.get("resolved_ip", ""),
+             time.time()))
 
 
 def get_traffic_state(root_domain: str) -> dict | None:

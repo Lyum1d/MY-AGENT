@@ -77,6 +77,7 @@ PY_TESTS = [
     ("整改报告修复回归（v022）", "test_022_fixes.py", False),
     ("统一流量调度（v023.1）", "test_traffic.py", False),
     ("py_exec 与扫描器治理（v023.2）", "test_pyexec_traffic.py", False),
+    ("网络层 WAF 状态机（v023.3）", "test_waf.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

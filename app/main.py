@@ -1446,6 +1446,48 @@ async def traffic_resume(pid: str, req: TrafficPolicyRequest):
     return traffic.governor.resume(req.root_domain, project_id=pid)
 
 
+class TrafficProbeRequest(BaseModel):
+    """手动恢复探测：单次低风险只读请求（计划 9.2）。"""
+    root_domain: str
+    probe_url: str = ""          # 为空则用该身份的 check_url 或目标首页（须在 scope 内）
+
+
+@app.post("/api/projects/{pid}/traffic/resume-probe")
+async def traffic_resume_probe(pid: str, req: TrafficProbeRequest):
+    """**用户手动**发起的单次恢复探测（v023.3）。
+
+    - 只发一个 GET，不经状态检查（探测本身就是验证手段），但仍过 scope 与限速；
+    - 成功 → RECOVERED（等待 confirm-resume 才真正恢复）；
+    - 失败 → BLOCKED（不连续重试，避免探测本身续期封禁）。
+    """
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    url = (req.probe_url or "").strip()
+    if not url:
+        raise HTTPException(400, "请提供 probe_url（须在授权范围内）")
+    result = await traffic.governor.manual_probe(req.root_domain, url, project_id=pid)
+    if not result.get("ok") and result.get("error", "").startswith("探测 URL 不在授权范围内"):
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.post("/api/projects/{pid}/traffic/confirm-resume")
+async def traffic_confirm_resume(pid: str, req: TrafficPolicyRequest):
+    """探测成功后由用户确认恢复（RECOVERED → NORMAL）。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return traffic.governor.confirm_resume(req.root_domain, project_id=pid)
+
+
+@app.post("/api/projects/{pid}/traffic/clear-state")
+async def traffic_clear_state(pid: str, req: TrafficPolicyRequest):
+    """人工强制清除状态（仅前端人工操作，Agent 工具不可调用；有审计记录）。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return traffic.governor.clear_state(req.root_domain, project_id=pid,
+                                       reason="前端人工清除")
+
+
 @app.get("/api/projects/{pid}/traffic/policy")
 async def get_traffic_policy(pid: str, root_domain: str):
     if not store.get_project(pid):
