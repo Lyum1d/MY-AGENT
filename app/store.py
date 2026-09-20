@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import sqlite3
 import time
 import uuid
@@ -11,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from . import config
+
+logger = logging.getLogger("src_agent.store")
 
 DB_PATH = config.DATA_DIR / "projects.db"
 
@@ -327,6 +331,13 @@ def init_db() -> None:
             tcols = {r["name"] for r in c.execute("PRAGMA table_info(traffic_states)")}
             if tcols and "resolved_ip" not in tcols:
                 c.execute("ALTER TABLE traffic_states ADD COLUMN resolved_ip TEXT DEFAULT ''")
+        except Exception:
+            pass
+        # ---- v023.6：清理 v023.2 之前的 IP 解析残留（如 root_domain='0.1'）----
+        try:
+            clean_n = cleanup_traffic_states()
+            if clean_n:
+                logger.info("已清理 %d 条无效流量状态（IP 解析残留）", clean_n)
         except Exception:
             pass
         # 旧库升级：会话树新增列（分支对话树功能）。逐列检查，缺哪个补哪个。
@@ -1425,6 +1436,30 @@ def set_traffic_policy(root_domain: str, policy: dict) -> dict:
              int(policy.get("host_concurrency") or 1), int(policy.get("root_concurrency") or 1),
              1 if policy.get("manual_resume_required", True) else 0, time.time()))
     return get_traffic_policy(root_domain)
+
+
+def cleanup_traffic_states() -> int:
+    """清理结构上无效的目标状态行（v023.6，幂等）。
+
+    背景：v023.2 之前 `root_domain_of()` 会把 IP 按末两段切分，产生 `0.1`
+    这类不存在的「根域名」（127.0.0.1 → 0.1）。这类行只会污染审计与状态列表，
+    且再也不会被匹配到，安全删除。
+    """
+    removed = 0
+    try:
+        with _db() as c:
+            rows = c.execute(
+                "SELECT root_domain FROM traffic_states").fetchall()
+            for r in rows:
+                rd = (r["root_domain"] or "").strip()
+                # 两段纯数字（且不是合法 IPv4/IPv6）→ 解析残留
+                if re.fullmatch(r"\d{1,3}\.\d{1,3}", rd):
+                    c.execute("DELETE FROM traffic_states WHERE root_domain=?", (rd,))
+                    c.execute("DELETE FROM traffic_events WHERE root_domain=?", (rd,))
+                    removed += 1
+    except Exception:
+        logger.debug("清理无效流量状态失败", exc_info=True)
+    return removed
 
 
 def traffic_summary(project_id: str) -> dict:

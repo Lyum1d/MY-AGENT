@@ -207,9 +207,15 @@ check("未声明工具 network_control 为空 dict",
 print("== H. 真实 overrides 声明解析 ==")
 reg.loaded = True
 reg.load()
-declared = [t.alias for t in reg.tools if (t.network_control or {}).get("declared")]
-check("当前仓库尚无已声明工具（声明数据待补，全部走警告路径）",
-      declared == [], declared)
+declared = sorted(t.alias for t in reg.tools if (t.network_control or {}).get("declared"))
+# v023.6：httpx/ehole 已按实战反馈补声明（此前为空、全部走警告路径）
+check("已声明工具包含 httpx 与 ehole（v023.6 补声明后）",
+      {"httpx", "ehole"} <= set(declared), declared)
+undeclared = [t.alias for t in reg.tools
+              if not (t.network_control or {}).get("declared")
+              and t.risk_level in ("L2", "L3") and t.scriptable]
+check("仍有未声明的 L2/L3 工具（待补，但已在清单里提示）",
+      len(undeclared) > 0, len(undeclared))
 reg.loaded = True
 reg.load()
 
