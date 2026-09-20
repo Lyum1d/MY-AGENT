@@ -1147,6 +1147,9 @@ class DiffRunRequest(BaseModel):
     target_value: str
     with_anonymous: bool = True
     repeat: int = 2
+    # v023.4 证据模式：minimal（默认，2 请求起步，只有 suspect 才复验+匿名对照）
+    # | full（旧行为：固定 repeat 次 + 匿名对照，请求量更大）
+    evidence_mode: str = "minimal"
 
 
 def _identity_creds(rec: dict) -> tuple[dict, dict]:
@@ -1199,45 +1202,67 @@ async def diff_run(pid: str, req: DiffRunRequest):
 
     steps: list[dict] = []
 
-    async def _run(tag: str, url: str, body: str) -> dict:
-        ev = await difftest.execute_readonly(url, lib_rec["method"], ex_h, ex_c, body)
+    async def _run(tag: str, url: str, body: str, variant_id: str = "",
+                   no_cache: bool = False) -> dict:
+        ev = await difftest.execute_readonly(
+            url, lib_rec["method"], ex_h, ex_c, body,
+            identity_id=req.baseline_identity_id, variant_id=variant_id,
+            project_id=pid, no_cache=no_cache)
         steps.append({"tag": tag, "url": url, "status": ev.get("status_code"),
-                      "error": ev.get("error")})
+                      "error": ev.get("error"), "cached": bool(ev.get("cached"))})
         return ev
 
+    # ---- v023.4 最小充分证据流程 ----
+    # 旧流程固定发 baseline + variant×repeat + anonymous ≈ 4+ 个请求；
+    # 实测事故教训是「请求量本身就是风险」，故改为：
+    #   ① baseline（1）→ ② variant（1）→ ③ 只有出现高价值差异(suspect)才
+    #   延迟复验（1，真实发出）+ 匿名对照（1）。非 suspect 场景固定 2 个请求。
+    minimal = (req.evidence_mode or "minimal").lower() != "full"
     # 1) 基准：A 身份 + 原对象
-    baseline = await _run("baseline", lib_rec["url"], lib_rec.get("body") or "")
+    baseline = await _run("baseline", lib_rec["url"], lib_rec.get("body") or "",
+                          variant_id="baseline")
 
-    # 2) 变体：同一身份 + 目标对象（重复 repeat 次，取稳定性）
+    # 2) 变体：同一身份 + 目标对象（1 次；完整模式按 repeat 次）
     variant_req = difftest.apply_replacement(lib_rec, req.target_field,
                                              req.target_location, req.target_value)
     variant_runs = []
-    for i in range(repeat):
-        variant_runs.append(await _run(f"variant#{i+1}",
-                                       variant_req["url"], variant_req["body"]))
-    # 稳定性：各次变体响应规范化后一致
+    first_round = 1 if minimal else max(1, repeat)
+    for i in range(first_round):
+        variant_runs.append(await _run(f"variant#{i+1}", variant_req["url"],
+                                       variant_req["body"], variant_id="v1"))
+
+    verdict = difftest.classify(baseline, variant_runs[0], req.target_value)
+
+    # 3) 只有高价值差异才做延迟复验（真实发出：no_cache + 独立 variant_id）
+    if minimal and verdict.get("verdict") == "suspect_idor":
+        await asyncio.sleep(2.0)                    # 延迟复验（避开缓存/瞬时抖动）
+        variant_runs.append(await _run("verify#1", variant_req["url"],
+                                       variant_req["body"], variant_id="verify",
+                                       no_cache=True))
+
     def _norm_resp(e):
         return difftest._strip_noise(e.get("body_json")) if e.get("body_json") is not None \
             else re.sub(r"\s+", " ", e.get("body_text") or "").strip()
     stable = len({json.dumps(_norm_resp(e), ensure_ascii=False, sort_keys=True,
                              default=str) for e in variant_runs}) == 1
 
-    # 3) 匿名对照（可选）：无凭据 + 原对象
+    # 4) 匿名对照：最小模式下只在 suspect 时做（未授权线索的独立验证）
     anon = None
-    if req.with_anonymous:
-        anon = await difftest.execute_readonly(lib_rec["url"], lib_rec["method"],
-                                               {k: v for k, v in
-                                                (lib_rec.get("headers") or {}).items()
-                                                if not str(v).startswith("<redacted:")},
-                                               None, lib_rec.get("body") or "")
+    need_anon = (not minimal) or verdict.get("verdict") == "suspect_idor"
+    if req.with_anonymous and need_anon:
+        anon = await difftest.execute_readonly(
+            lib_rec["url"], lib_rec["method"],
+            {k: v for k, v in (lib_rec.get("headers") or {}).items()
+             if not str(v).startswith("<redacted:")},
+            None, lib_rec.get("body") or "", variant_id="anonymous", project_id=pid)
         steps.append({"tag": "anonymous", "url": lib_rec["url"],
-                      "status": anon.get("status_code"), "error": anon.get("error")})
+                      "status": anon.get("status_code"), "error": anon.get("error"),
+                      "cached": bool(anon.get("cached"))})
 
-    verdict = difftest.classify(baseline, variant_runs[0], req.target_value)
     # 重复不一致 → 降级 unstable（不产生候选建议）
     if verdict["verdict"] == "suspect_idor" and not stable:
         verdict = {"verdict": "unstable",
-                   "reason": f"变体重复 {repeat} 次结果不一致（可能是缓存/随机数据），不产生候选"}
+                   "reason": f"变体复核结果不一致（可能是缓存/随机数据），不产生候选"}
     # 匿名也 200 且有数据 → 附未授权观察（独立信号，不合并结论）
     anon_note = None
     if anon and anon.get("status_code") == 200:

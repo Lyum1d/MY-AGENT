@@ -16,6 +16,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# v023.1 起出网走统一调度器——本套件请求量会超默认突发阈值，测试模式放大
+import os
+os.environ.setdefault("AGENT_TRAFFIC_TEST_MODE", "1")
+
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
