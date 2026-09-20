@@ -1428,7 +1428,7 @@ def set_traffic_policy(root_domain: str, policy: dict) -> dict:
 
 
 def traffic_summary(project_id: str) -> dict:
-    """目标流量摘要（v023.1 基础版；v023.5 扩展为审计报告）。"""
+    """目标流量摘要（v023.1 基础版；v023.5 扩展为完整审计报告）。"""
     with _db() as c:
         rows = c.execute(
             "SELECT root_domain,event_type,status_code,error_type,COUNT(*) AS n"
@@ -1453,6 +1453,84 @@ def traffic_summary(project_id: str) -> dict:
             d["paused"] += r["n"]
     return {"project_id": project_id, "total_events": int(total["n"] or 0),
             "by_root": by_root}
+
+
+def traffic_audit(project_id: str) -> dict:
+    """完整流量审计（v023.5，对齐 v023 计划第 8 节字段）。
+
+    只读聚合，不联网。所有数字来自 traffic_events（每条请求都有 sent 事件，
+    网络层错误在 settled 里带 error_type/os_error_code）。
+    """
+    with _db() as c:
+        span = c.execute(
+            "SELECT MIN(created_at) AS t0, MAX(created_at) AS t1,"
+            " SUM(CASE WHEN event_type='sent' THEN 1 ELSE 0 END) AS sent,"
+            " SUM(CASE WHEN event_type='settled' THEN 1 ELSE 0 END) AS settled,"
+            " SUM(CASE WHEN event_type IN ('rejected','cancelled') THEN 1 ELSE 0 END) AS rejected,"
+            " SUM(CASE WHEN event_type='paused' THEN 1 ELSE 0 END) AS paused,"
+            " SUM(CASE WHEN event_type='state_changed' THEN 1 ELSE 0 END) AS state_changes,"
+            " SUM(CASE WHEN event_type='manual_probe' THEN 1 ELSE 0 END) AS probes"
+            " FROM traffic_events WHERE project_id=?", (project_id,)).fetchone()
+        by_tool = c.execute(
+            "SELECT tool_alias, COUNT(*) AS n FROM traffic_events"
+            " WHERE project_id=? AND event_type='sent' GROUP BY tool_alias"
+            " ORDER BY n DESC", (project_id,)).fetchall()
+        by_root = c.execute(
+            "SELECT root_domain, COUNT(*) AS n FROM traffic_events"
+            " WHERE project_id=? AND event_type='sent' GROUP BY root_domain"
+            " ORDER BY n DESC", (project_id,)).fetchall()
+        by_error = c.execute(
+            "SELECT COALESCE(error_type,'') AS et, os_error_code, COUNT(*) AS n"
+            " FROM traffic_events WHERE project_id=? AND event_type='settled'"
+            " AND (error_type<>'' OR os_error_code<>0) GROUP BY error_type, os_error_code"
+            " ORDER BY n DESC LIMIT 20", (project_id,)).fetchall()
+        by_status = c.execute(
+            "SELECT status_code, COUNT(*) AS n FROM traffic_events"
+            " WHERE project_id=? AND event_type='settled' AND status_code IS NOT NULL"
+            " GROUP BY status_code ORDER BY n DESC LIMIT 20", (project_id,)).fetchall()
+        sends = c.execute(
+            "SELECT created_at FROM traffic_events WHERE project_id=? AND event_type='sent'"
+            " ORDER BY created_at", (project_id,)).fetchall()
+        waf = c.execute(
+            "SELECT redaction_summary, created_at FROM traffic_events"
+            " WHERE project_id=? AND (event_type='state_changed' OR event_type='paused')"
+            " ORDER BY created_at DESC LIMIT 20", (project_id,)).fetchall()
+        states = c.execute(
+            "SELECT root_domain,state,reason,resolved_ip,updated_at FROM traffic_states"
+            " ORDER BY updated_at DESC LIMIT 50").fetchall()
+
+    ts = [float(r["created_at"]) for r in sends if r["created_at"]]
+    gaps = [b - a for a, b in zip(ts, ts[1:])] if len(ts) > 1 else []
+    span_s = (float(span["t1"]) - float(span["t0"])) if span and span["t0"] else 0
+    return {
+        "project_id": project_id,
+        "span_seconds": round(span_s, 1),
+        "span_text": _fmt_duration(span_s),
+        "total_sent": int(span["sent"] or 0),
+        "total_settled": int(span["settled"] or 0),
+        "total_rejected": int(span["rejected"] or 0),
+        "auto_pauses": int(span["paused"] or 0),
+        "state_changes": int(span["state_changes"] or 0),
+        "manual_probes": int(span["probes"] or 0),
+        "avg_interval": round(sum(gaps) / len(gaps), 2) if gaps else None,
+        "min_interval": round(min(gaps), 2) if gaps else None,
+        "by_tool": [{"tool": r["tool_alias"] or "(未标注)", "sent": r["n"]} for r in by_tool],
+        "by_root": [{"root_domain": r["root_domain"], "sent": r["n"]} for r in by_root],
+        "by_status": [{"status_code": r["status_code"], "n": r["n"]} for r in by_status],
+        "errors": [{"error_type": r["et"], "os_error_code": r["os_error_code"], "n": r["n"]}
+                   for r in by_error],
+        "waf_events": [{"at": r["created_at"], "reason": r["redaction_summary"]} for r in waf],
+        "states": [dict(r) for r in states],
+    }
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = int(max(0, seconds))
+    if s >= 3600:
+        return f"{s // 3600} 小时 {(s % 3600) // 60} 分"
+    if s >= 60:
+        return f"{s // 60} 分 {s % 60} 秒"
+    return f"{s} 秒"
 
 
 def delete_fact(project_id: str, fid: str) -> bool:

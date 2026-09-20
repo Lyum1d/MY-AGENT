@@ -114,6 +114,8 @@ class TrafficGovernor:
         self._window_loaded: set[str] = set()        # 已从 DB 恢复过窗口的 key
         self._policy_cache: dict[str, dict] = {}     # root → DB 策略覆盖
         self._signals: dict[str, deque] = {}         # root → 窗口内防护信号 (ts, sig)
+        self._queue_cleared: dict[str, float] = {}   # root → 人工清空排队的标记时刻
+        self._peak_inflight: dict[str, int] = {}     # root → 峰值并发（审计用）
         self._ip_resolve_enabled = True
 
     # ---------- 事件循环与锁管理 ----------
@@ -432,6 +434,23 @@ class TrafficGovernor:
         return [{"at": t, "signal": s, "label": wafsignal.signal_label(s)}
                 for t, s in dq if now - t <= SIGNAL_WINDOW]
 
+    # ---------- 排队清空（v023.5） ----------
+    def clear_queue(self, root: str, *, project_id: str = "") -> dict:
+        """清空某目标的待发（排队）请求。
+
+        实现：打一个「清空标记」，正卡在锁等待里的请求拿到锁前会发现标记
+        （且自身未获得许可）→ 抛 TrafficCancelled，不再发出。标记在下一次
+        成功取许可时自动失效。已发出的请求无法撤回（计划：不能撤回但记录审计）。
+        """
+        root = self.root_domain_of(root) or root
+        self._queue_cleared[root] = time.time()
+        cleared = self._queued.get(root, 0)
+        self._audit(root, "", "queue_cleared",
+                    reason=f"人工清空排队请求（当时排队 {cleared} 个）",
+                    project_id=project_id)
+        return {"root_domain": root, "queued_at_clear": cleared,
+                "note": "排队中的请求将在取得许可前被取消；已发出的请求无法撤回（已计入审计）"}
+
     # ---------- 窗口与预算 ----------
     def _recover_window(self, key: str) -> None:
         """首次访问某 key 时从 DB 恢复最近窗口内的发送时间戳（重启恢复）。"""
@@ -594,6 +613,9 @@ class TrafficGovernor:
                     if config.TRAFFIC_FP_TTL > 0 and fingerprint:
                         self.put_observation(fingerprint, -1)
                     self._inflight[root] = self._inflight.get(root, 0) + 1
+                    self._peak_inflight[root] = max(self._peak_inflight.get(root, 0),
+                                                    self._inflight[root])
+                    self._queue_cleared.pop(root, None)   # 取到许可 → 清空标记失效
                     permit = {"root": root, "host": host, "resolved_ip": ip,
                               "sent_at": now, "fingerprint": fingerprint,
                               "project_id": project_id, "session_id": session_id,
@@ -606,9 +628,15 @@ class TrafficGovernor:
             self._queued[root] = max(0, self._queued.get(root, 0) - 1)
 
     def _check_pause_during_wait(self, root: str, project_id: str, cancelled) -> None:
-        """拿到锁后、真正发送前，再查一次状态与取消（计划 5.4：暂停后不得发出）。"""
+        """拿到锁后、真正发送前，再查一次状态、取消与「清空排队」标记
+        （计划 5.4：暂停后不得发出；人工清空后排队请求不得继续）。"""
         if cancelled():
             raise TrafficCancelled("任务已取消，排队请求不再发出")
+        cleared_at = self._queue_cleared.get(root)
+        if cleared_at:
+            # 标记只对「清空之前就已排队的请求」生效：本请求尚未取得许可 → 取消
+            self._queue_cleared.pop(root, None)
+            raise TrafficCancelled("排队请求已被人工清空（未发出）")
         st = self._load_state(root, project_id)
         if st.get("state") in BLOCKING_STATES:
             raise TrafficPaused(f"目标 {root} 已进入 {st.get('state')}，排队请求终止")
