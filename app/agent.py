@@ -1904,6 +1904,37 @@ class Agent:
         if exit_code == 126:
             return "SCOPE", ("该目标被授权白名单拒绝，属于授权边界：不要换参数或换工具绕过，"
                              "直接停止对该目标的测试并向用户说明。")
+        # v023.3：目标防护状态优先判——WAF 封禁必须与普通失败分开，
+        # 绝不能把它解释成「换编码/换参数继续试」（实测事故教训）。
+        try:
+            from . import traffic as _traffic
+            root = _traffic.governor.root_domain_of(step.target or "")
+            st = _traffic.governor.state_of(root) if root else {}
+            state = (st or {}).get("state", "")
+            if state in (_traffic.ST_BLOCKED, _traffic.ST_COOLDOWN,
+                         _traffic.ST_PAUSED, _traffic.ST_MANUAL_PROBE):
+                return "WAF_BLOCKED", (
+                    f"目标已进入 {state} 状态（{(st or {}).get('reason', '')[:80]}）："
+                    "**立即停止对该目标的任何自动请求——不要换参数、换编码、换工具或"
+                    "换子域名继续尝试**。保存已有证据并向用户说明，等待人工恢复"
+                    "（恢复需用户手动发起单次只读探测并确认）。")
+        except Exception:
+            logger.debug("目标流量状态查询失败（按普通归因继续）", exc_info=True)
+        # 网络层封禁特征（RST/连接拒绝/超时）单独归因，不当作「工具坏了」
+        try:
+            from . import wafsignal as _ws
+            sig = _ws.classify_text(out)
+            if sig in (_ws.SIG_NET_RST, _ws.SIG_NET_REFUSED):
+                return "WAF_CAUTION", (
+                    f"检测到网络层异常（{_ws.signal_label(sig)}）：可能是目标防护或网络问题。"
+                    "**停止加速与扩大测试面**，不要换编码/参数反复重试；"
+                    "如需继续，先降低请求频率并观察是否恢复。")
+            if sig == _ws.SIG_NET_TIMEOUT:
+                return "NETWORK", (
+                    "网络超时/连接不畅：可能是目标防护或本机网络问题。"
+                    "不要连续重试；先确认本机网络，再考虑以更低频率少量验证。")
+        except Exception:
+            pass
         # L1：进程没起来 / 超时 / 异常终止
         if exit_code in (124, 137) or any(h in out for h in _L1_HINTS):
             return "L1", "工具本身没能正常执行：换参数、放大超时，或改用功能相近的其他工具。"
