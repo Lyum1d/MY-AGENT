@@ -14,6 +14,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# v023.1 起所有出网请求走统一流量调度器（默认 10 分钟 30 请求 / 10 秒 5 突发）。
+# 本套件对本地 fixture 的请求量会超突发阈值——测试模式显式放大（生产不设即保守）。
+import os
+os.environ.setdefault("AGENT_TRAFFIC_TEST_MODE", "1")
+
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 

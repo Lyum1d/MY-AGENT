@@ -237,6 +237,39 @@ def _budget_note(budget: dict) -> str:
     return head + "预算充足，按最优顺序推进即可。"
 
 
+def _traffic_note(target: str) -> str:
+    """v023.4 目标流量预算提示：把「目标还剩多少请求额度、是否被防护拦截」
+    写进上下文。
+
+    理由与 _budget_note 同源：模型不知道自己还能发多少请求，就会持续扩大
+    测试面——直到预算耗尽被强制暂停（甚至触发目标封禁）。把余量摆在眼前，
+    模型才能主动收敛（计划 11.1 第 8 条：追加探测必须消耗可见的请求预算）。
+    """
+    try:
+        from . import traffic as _traffic
+        root = _traffic.governor.root_domain_of(target or "")
+        if not root:
+            return ""
+        st = _traffic.governor.stats(root)
+        state = st.get("state", _traffic.ST_NORMAL)
+        remaining = st.get("remaining", 0)
+        used = st.get("used", 0)
+        win = int(st.get("window_seconds", 600) // 60)
+        line = (f"\n\n【目标流量预算】{root}：{win} 分钟窗口内已用 {used}/"
+                f"{st.get('max_requests')} 请求，剩余 {remaining}。")
+        if state != _traffic.ST_NORMAL:
+            return line + (f"**当前状态 {state}（{st.get('reason', '')[:80]}）——"
+                           "已停止自动请求，不要换参数/换工具/换子域名继续尝试；"
+                           "请保存证据并等待人工恢复。**")
+        if remaining <= max(2, int(st.get("max_requests", 30)) * 0.2):
+            return line + ("剩余额度很低，必须收敛：只做最能验证当前假设的少量请求，"
+                           "不要开启新扫描面，不要并行拆分。")
+        return line + "请保持低频、单变量推进。"
+    except Exception:
+        logger.debug("流量预算提示构造失败", exc_info=True)
+        return ""
+
+
 def _budget_exhausted_note(session, total: int) -> str:
     # 步数耗尽时的收尾：给出「跑到哪了」的归因，而不是一句干巴巴的「已达最大步数」。
     ok = sum(1 for st in session.steps if st.status == "done")
@@ -1497,6 +1530,33 @@ class Agent:
             return note
         subs = subs[: config.SUBTASK_MAX_COUNT]
 
+        # v023.4 同目标背压：并行子任务 = 对同一目标同时发更多请求的放大器
+        # （计划 7.3：目标并发上限优先于 SUBTASK_MAX_CONCURRENCY）。预算不足、
+        # 目标处于防护状态时**拒绝拆分**——不拆就不会有 N 路并发叠加。
+        try:
+            from . import traffic as _traffic
+            root = _traffic.governor.root_domain_of(session.target or "")
+            if root:
+                st = _traffic.governor.stats(root)
+                if st.get("state") != _traffic.ST_NORMAL:
+                    note = (f"目标 {root} 当前状态 {st.get('state')}"
+                            f"（{st.get('reason', '')[:60]}）：**不允许拆分并发子任务**——"
+                            "并行只会加重目标防护反应。请先单独、低频地完成最关键的一步。")
+                    session.messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                             "content": note})
+                    await session.emit({"type": "reasoning", "data": "（split_task 被目标防护状态阻止）"})
+                    return note
+                if st.get("remaining", 999) < config.SUBTASK_MIN_BUDGET:
+                    note = (f"目标 {root} 剩余请求预算不足（{st.get('remaining')} 次 < "
+                            f"拆分下限 {config.SUBTASK_MIN_BUDGET} 次）：不能拆分并发子任务，"
+                            "否则预算会在并行中被瞬间耗尽。请串行完成、优先收敛。")
+                    session.messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                             "content": note})
+                    await session.emit({"type": "reasoning", "data": "（split_task 被预算背压阻止）"})
+                    return note
+        except Exception:
+            logger.debug("split_task 背压检查失败（放行）", exc_info=True)
+
         parent_task = next((str(m.get("content") or "") for m in session.messages
                             if m.get("role") == "user"), "") or session.target
         started_at = time.time()
@@ -1731,6 +1791,11 @@ class Agent:
         parts: list[str] = []
         if budget:
             parts.append(_budget_note(budget))
+        if session.target:
+            # v023.4：目标流量预算/防护状态提示（与步数预算提示并列）
+            tnote = _traffic_note(session.target)
+            if tnote:
+                parts.append(tnote)
         if session.target:
             if _is_host_like(session.target):
                 note = (f"所有工具的 target 参数都必须填 `{session.target}`，"

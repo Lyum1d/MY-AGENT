@@ -520,17 +520,23 @@ class TrafficGovernor:
         return hashlib.sha256(json.dumps(h, sort_keys=True).encode()).hexdigest()[:32]
 
     def cached_observation(self, fp: str) -> dict | None:
-        """TTL 内是否已有同指纹成功观察（TTL=0 时永远返回 None）。"""
+        """TTL 内是否已有同指纹成功观察（TTL=0 时永远返回 None）。
+
+        v023.4：缓存里存的是**完整脱敏响应**（供差分/流程直接复用，避免重复请求）；
+        命中时调用方应把 cached=True 标进返回，便于审计区分「真实请求」与「复用」。
+        """
         if config.TRAFFIC_FP_TTL <= 0 or not fp:
             return None
         rec = self._fingerprints.get(fp)
         if rec and time.time() - rec["at"] < config.TRAFFIC_FP_TTL:
-            return rec
+            return dict(rec)
         return None
 
-    def put_observation(self, fp: str, status_code: int) -> None:
+    def put_observation(self, fp: str, status_code: int, response: dict | None = None) -> None:
+        """登记一次观察。response 为可复用的完整响应（已截断，不含凭据）。"""
         if config.TRAFFIC_FP_TTL > 0 and fp:
-            self._fingerprints[fp] = {"at": time.time(), "status": status_code}
+            self._fingerprints[fp] = {"at": time.time(), "status": status_code,
+                                      "response": dict(response or {})}
 
     # ---------- 许可（核心） ----------
     async def acquire(self, url: str, *, project_id: str = "", session_id: str = "",

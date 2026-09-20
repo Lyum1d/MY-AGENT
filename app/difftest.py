@@ -100,12 +100,15 @@ def urlunsplit_min(parts, query: str) -> str:
 async def execute_readonly(url: str, method: str, headers: dict,
                            cookies: dict | None, body: str = "",
                            *, identity_id: str = "", variant_id: str = "",
-                           project_id: str = "", session_id: str = "") -> dict:
+                           project_id: str = "", session_id: str = "",
+                           no_cache: bool = False) -> dict:
     """执行单次只读请求。返回 {status_code, content_type, body_json, body_text}。
 
     - 方法硬白名单（写方法直接拒绝，不走确认流程——差分根本不需要写）；
     - v023.1 起统一走 TrafficGovernor：scope 兜底 + 滑动窗口预算 + 目标/根域名
       并发限制 + 暂停状态检查（排队请求在暂停后不会发出）+ 流量事件落库；
+    - v023.4：同指纹短期复用（no_cache=True 绕过——**复验必须绕过**，
+      否则「重复验证」会拿到缓存而不是真实响应）；
     - 响应体截断 64KB；JSON 自动解析供语义比较。
     """
     method = method.upper()
@@ -114,6 +117,16 @@ async def execute_readonly(url: str, method: str, headers: dict,
     fp = traffic.governor.fingerprint(method, url, body=body,
                                       identity_id=identity_id, variant_id=variant_id,
                                       headers=headers)
+    # v023.4 短期复用：同指纹（方法+URL+身份+变体）在 TTL 内已有成功观察时，
+    # 直接复用不再发请求——多分支测试同一接口时只有一次真实流量。
+    # 复验必须传不同的 variant_id（如 "verify"）以绕开复用，保证复验真实发出。
+    if not no_cache:
+        hit = traffic.governor.cached_observation(fp)
+        if hit and isinstance(hit.get("response"), dict) and hit["response"]:
+            cached = dict(hit["response"])
+            cached["cached"] = True
+            cached["fingerprint"] = fp
+            return cached
     try:
         permit = await traffic.governor.acquire(
             url, project_id=project_id, session_id=session_id,
@@ -141,9 +154,15 @@ async def execute_readonly(url: str, method: str, headers: dict,
             j = r.json()
         except (ValueError, TypeError):
             j = None
-    return {"status_code": r.status_code, "content_type": ct,
-            "body_json": j, "body_text": text if j is None else "",
-            "fingerprint": fp}
+    result = {"status_code": r.status_code, "content_type": ct,
+              "body_json": j, "body_text": text if j is None else "",
+              "fingerprint": fp, "cached": False}
+    # 只缓存成功响应（错误/拦截不缓存——复验必须能重新观察）
+    if 200 <= r.status_code < 400:
+        traffic.governor.put_observation(
+            fp, r.status_code,
+            {k: v for k, v in result.items() if k != "fingerprint"})
+    return result
 
 
 def _strip_noise(obj, depth: int = 0):
