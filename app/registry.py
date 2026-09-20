@@ -45,6 +45,8 @@ class Tool:
     disallowed_flags: list = field(default_factory=list)  # 明确禁止的旗标黑名单（v012 P2-2），命中即剔除并记录
     target_type: str = ""                              # target 形态声明（v012 P2-2）：url|domain|host，空=不校验
     stdin_input: str = ""               # 启动时写入子进程 stdin 的内容（用于绕开交互式提问）
+    # v023.2 扫描器内部流量能力声明（来自 overrides 的 network_control）
+    network_control: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -212,6 +214,18 @@ class ToolRegistry:
                 # target_type 形态声明（url|domain|host），均从 overrides 读入
                 tool.disallowed_flags = list(ov.get("disallowed_flags") or [])
                 tool.target_type = str(ov.get("target_type") or "").strip().lower()
+                # v023.2：扫描器内部速率/并发能力声明（network_control）。
+                # 未声明 = 流量不可观测（executor 会警告；严格模式下拒绝运行）。
+                nc = ov.get("network_control") or {}
+                if isinstance(nc, dict):
+                    tool.network_control = {
+                        "declared": bool(nc.get("declared")),
+                        "supports_rate": bool(nc.get("supports_rate")),
+                        "supports_concurrency": bool(nc.get("supports_concurrency")),
+                        "rate_flags": [str(x) for x in (nc.get("rate_flags") or [])],
+                        "concurrency_flags": [str(x) for x in (nc.get("concurrency_flags") or [])],
+                        "traffic_class": str(nc.get("traffic_class") or "unknown"),
+                    }
                 tool.stdin_input = ov.get("stdin_input", "") or ""
 
             if scriptable:

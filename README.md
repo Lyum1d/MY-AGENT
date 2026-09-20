@@ -483,6 +483,18 @@ src-agent/
 
 > 后续（v023.2-.5）：`py_exec` 受控网络接口、扫描器内部速率治理、网络层 WAF 状态机（CAUTION/COOLDOWN/BLOCKED）、低流量策略、流量面板与审计报告。
 
+## py_exec 治理与扫描器速率声明（v023.2）
+
+**核心机制：把网络能力从脚本进程收回宿主**（事故复盘：封禁由脚本内部 `for` 循环直连目标造成，外层限速管不住）。
+
+1. **受控通道 `safe_http_request`**：脚本内 `from srcagent import safe_http_request`（宿主自动注入该模块到工作目录）即可发受控请求——同步接口，内部通过「请求文件 → 宿主调度器 → 响应文件」的桥接实现。脚本的循环**无法绕过** scope/预算/并发/暂停态：预算耗尽返回 `TRAFFIC_BUDGET_EXCEEDED`，目标暂停时宿主直接终止脚本进程树。
+2. **静态检测（防误触，非对抗性边界）**：`网络库 + 循环 + URL` 的事故模式在 `safe` 策略（默认）下**直接拒绝执行**并提示改用受控接口；`warn` 只警告；`legacy` 关闭治理（排障用）。`AGENT_PY_EXEC_NETWORK_POLICY` 切换。
+3. **脚本请求预算**：单脚本经受控通道最多 `AGENT_PY_EXEC_MAX_REQUESTS`（默认 20）次请求，宿主侧计数——脚本无法自增绕过。
+4. **写方法不放行**：脚本通道只允许 GET/HEAD/OPTIONS；POST 等返回 `WRITE_METHOD_NOT_ALLOWED_IN_SCRIPT`，写操作必须走命令行工具的 L2/L3 人工闸门。
+5. **扫描器速率声明**：`data/tool_overrides.json` 支持 `network_control`（declared/supports_rate/rate_flags/concurrency_flags/traffic_class）。已声明者自动注入保守速率参数（`AGENT_SCANNER_DEFAULT_RATE`=5/s、`AGENT_SCANNER_DEFAULT_THREADS`=2，args 里显式给出则不覆盖）；未声明者默认**警告放行**（过渡期），设 `AGENT_SCANNER_REQUIRE_DECLARATION=1` 切严格模式（直接拒绝运行）。
+   > ⚠ 声明数据待补：声明前请对照工具实际 `--help` 核对旗标名（写错会导致工具报错退出）；注入的旗标需同步加入该工具 `allowed_flags`，否则会被参数清洗剔除（系统会在输出中明确提示）。
+6. 测试：`test_pyexec_traffic.py`（20 项：静态检测、受控通道真实往返、脚本预算、写方法拒绝、暂停即终止、速率注入与白名单提示）。
+
 ## 测试
 
 `test_*.py` 是自带的回归脚本（非 pytest 收集式，直接 `python test_xxx.py` 运行，退出码 0 表示全过）。

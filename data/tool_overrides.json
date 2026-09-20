@@ -1,5 +1,5 @@
 {
-  "_说明": "实测不可用或行为异常的工具。disabled=true 的工具不会进入 Agent 的工具清单，但仍可在工具箱面板手动启动。确认可用后把 disabled 改为 false 即可。timeout=单工具总时长覆写（秒），caveat=写进给模型的注意事项。 target_type=target 形态声明（url=完整URL / domain=裸域名 / host=域名或IP），形态不符会被执行器拒绝并提示模型；disallowed_flags=明确禁止的旗标黑名单（执行时连同取值一起剔除，无论 allowed_flags 是否启用）。",
+  "_说明": "实测不可用或行为异常的工具。disabled=true 的工具不会进入 Agent 的工具清单，但仍可在工具箱面板手动启动。确认可用后把 disabled 改为 false 即可。timeout=单工具总时长覆写（秒），caveat=写进给模型的注意事项。 target_type=target 形态声明（url=完整URL / domain=裸域名 / host=域名或IP），形态不符会被执行器拒绝并提示模型；disallowed_flags=明确禁止的旗标黑名单（执行时连同取值一起剔除，无论 allowed_flags 是否启用）。 【v023.2 新增 network_control：扫描器内部速率/并发能力声明】本字段用于流量安全治理：未声明（或 declared=false）的工具在启动前会被提示「流量不可观测」——其内部请求量调度器无法逐条统计，只能限制启动次数；环境变量 AGENT_SCANNER_REQUIRE_DECLARATION=1 时未声明者直接拒绝自动运行（严格模式）。声明格式：\"network_control\": {\"declared\": true, \"supports_rate\": true, \"supports_concurrency\": true, \"rate_flags\": [\"-rate-limit\"], \"concurrency_flags\": [\"-t\"], \"traffic_class\": \"high\"}。字段含义：declared=是否已核实该工具的流量控制能力；rate_flags=控制每秒请求数的旗标（未在 args 中出现时系统注入 AGENT_SCANNER_DEFAULT_RATE，默认 5）；concurrency_flags=控制并发线程数的旗标（注入 AGENT_SCANNER_DEFAULT_THREADS，默认 2）；traffic_class=low|medium|high|unknown 流量量级标注（供审计）。注意：注入的旗标若不在该工具 allowed_flags 白名单中会被参数清洗剔除——声明 rate_flags/concurrency_flags 时请同步把这些旗标加入 allowed_flags。**声明前请对照工具实际 --help 核对旗标名**，写错会导致工具报错退出。",
   "enscan": {
     "disabled": true,
     "timeout": 90,
