@@ -20,7 +20,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import httpx
 
-from . import config, ratelimit, scope
+from . import config, ratelimit, scope, traffic
 
 _UA = "SRC-Agent-Replay/1.0 (authorized bug-bounty test)"
 _ALLOWED_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -38,10 +38,11 @@ _ALLOWED_METHODS = {"GET", "HEAD", "OPTIONS"}
 _host_allowed = scope.host_in_scope
 _load_scope = scope.load_scope
 
-# ---------- 限速 ----------
-async def _rate_limit(url: str = "") -> None:
-    key = scope.target_host(url) or url or "default"
-    await ratelimit.acquire(key, config.REPLAY_MIN_INTERVAL, config.GLOBAL_MIN_INTERVAL)
+# ---------- 出网许可（v023.1：统一走 TrafficGovernor） ----------
+async def _rate_limit(url: str = "", method: str = "GET") -> dict:
+    """取得一次出网许可。调度器内已含 scope 兜底、滑动窗口预算、
+    目标/根域名并发限制、暂停状态检查与流量事件落库。"""
+    return await traffic.governor.acquire(url, tool_alias="httpreplay", method=method)
 
 
 # ---------- 参数解析 ----------
@@ -145,16 +146,25 @@ async def run_replay(url: str, args: str = "", cancel_event=None):
         shown += " | " + " ".join(f"-H '{k}: {v}'" for k, v in headers.items())
     yield {"type": "command", "data": shown}
 
-    # 3. 发请求（限速 + 信任环境关闭，防系统代理劫持）
-    await _rate_limit(url)
+    # 3. 发请求（出网许可 + 信任环境关闭，防系统代理劫持）
+    try:
+        permit = await _rate_limit(url, method)
+    except traffic.TrafficError as e:
+        yield {"type": "error", "data": str(e)}
+        yield {"type": "exit", "code": 1}
+        return
     try:
         async with httpx.AsyncClient(trust_env=False, follow_redirects=False,
                                      timeout=float(timeout)) as client:
             r = await client.request(method, url, headers=req_headers)
     except Exception as e:
+        await traffic.governor.release(permit, error_type=type(e).__name__,
+                                       os_error_code=getattr(e, "errno", 0) or 0)
         yield {"type": "error", "data": f"请求失败：{e}"}
         yield {"type": "exit", "code": 1}
         return
+    await traffic.governor.release(permit, status_code=r.status_code,
+                                  bytes_in=len(r.content))
 
     # 4. 结构化回传
     lines = [

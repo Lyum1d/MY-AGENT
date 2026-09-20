@@ -21,7 +21,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import AsyncIterator
 
-from . import config, ratelimit
+from . import config, ratelimit, traffic
 from .registry import Tool
 from .scope import check_scope, first_unauthorized_host_in_argv
 from .scope import first_unauthorized_target_list_in_argv
@@ -456,10 +456,22 @@ class LocalExecutor(Executor):
         env.setdefault("TEMP", env.get("TEMP") or home + os.sep + "AppData" + os.sep + "Local" + os.sep + "Temp")
         env.setdefault("TMP", env["TEMP"])
 
-        # 出网限速：与 HTTP 重放器共用 app/ratelimit.py 的同一个计时器。
-        # 原先重放器自带一份节流、命令行扫描器没有任何限速，并发一开就是无上限。
-        await ratelimit.acquire(_target_host(target) or target or "default",
-                                config.TOOL_MIN_INTERVAL, config.GLOBAL_MIN_INTERVAL)
+        # 出网许可（v023.1）：统一走 TrafficGovernor——滑动窗口预算、目标/根域名
+        # 并发、暂停状态检查与流量事件落库。扫描器**内部**的并发请求当前无法逐条
+        # 统计（v023.2 的 manifest 速率治理解决），此处先把它计为一次出网配额并
+        # 在目标已暂停/预算耗尽时直接拒绝启动（不启动就不会有内部并发）。
+        host_for_traffic = _target_host(target) or target or ""
+        if host_for_traffic:
+            probe_url = host_for_traffic if "://" in host_for_traffic \
+                else f"https://{host_for_traffic}/"
+            try:
+                permit = await traffic.governor.acquire(
+                    probe_url, tool_alias=tool.alias or tool.name, method="GET")
+                await traffic.governor.release(permit)
+            except traffic.TrafficError as e:
+                yield {"type": "error", "data": f"出网调度拒绝（不启动扫描器）：{e}"}
+                yield {"type": "exit", "code": 126}
+                return
 
 
         try:

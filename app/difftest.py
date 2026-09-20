@@ -18,7 +18,7 @@ from urllib.parse import urlsplit, parse_qsl, urlencode
 
 import httpx
 
-from . import config, ratelimit, scope
+from . import config, ratelimit, scope, traffic
 
 READONLY_METHODS = ("GET", "HEAD", "OPTIONS")
 
@@ -98,21 +98,29 @@ def urlunsplit_min(parts, query: str) -> str:
 
 
 async def execute_readonly(url: str, method: str, headers: dict,
-                           cookies: dict | None, body: str = "") -> dict:
+                           cookies: dict | None, body: str = "",
+                           *, identity_id: str = "", variant_id: str = "",
+                           project_id: str = "", session_id: str = "") -> dict:
     """执行单次只读请求。返回 {status_code, content_type, body_json, body_text}。
 
     - 方法硬白名单（写方法直接拒绝，不走确认流程——差分根本不需要写）；
-    - scope + 限速强制；
+    - v023.1 起统一走 TrafficGovernor：scope 兜底 + 滑动窗口预算 + 目标/根域名
+      并发限制 + 暂停状态检查（排队请求在暂停后不会发出）+ 流量事件落库；
     - 响应体截断 64KB；JSON 自动解析供语义比较。
     """
     method = method.upper()
     if method not in READONLY_METHODS:
         return {"error": f"差分只允许只读方法 {'/'.join(READONLY_METHODS)}，拒绝 {method}"}
-    denied = scope.check_scope(url)
-    if denied:
-        return {"error": denied}
-    await ratelimit.acquire(urlsplit(url).netloc or "default",
-                            config.TOOL_MIN_INTERVAL, config.GLOBAL_MIN_INTERVAL)
+    fp = traffic.governor.fingerprint(method, url, body=body,
+                                      identity_id=identity_id, variant_id=variant_id,
+                                      headers=headers)
+    try:
+        permit = await traffic.governor.acquire(
+            url, project_id=project_id, session_id=session_id,
+            identity_id=identity_id, tool_alias="difftest", method=method,
+            fingerprint=fp)
+    except traffic.TrafficError as e:
+        return {"error": str(e), "traffic_rejected": type(e).__name__}
     try:
         async with httpx.AsyncClient(trust_env=False, follow_redirects=False,
                                      timeout=20.0) as client:
@@ -120,7 +128,11 @@ async def execute_readonly(url: str, method: str, headers: dict,
                                      cookies=cookies or None,
                                      content=body.encode("utf-8") if body else None)
     except Exception as e:
+        await traffic.governor.release(permit, error_type=type(e).__name__,
+                                       os_error_code=getattr(e, "errno", 0) or 0)
         return {"error": f"请求失败：{type(e).__name__}: {e}"}
+    await traffic.governor.release(permit, status_code=r.status_code,
+                                  bytes_in=len(r.content))
     text = r.text[:65536]
     j = None
     ct = (r.headers.get("content-type") or "").lower()
@@ -130,7 +142,8 @@ async def execute_readonly(url: str, method: str, headers: dict,
         except (ValueError, TypeError):
             j = None
     return {"status_code": r.status_code, "content_type": ct,
-            "body_json": j, "body_text": text if j is None else ""}
+            "body_json": j, "body_text": text if j is None else "",
+            "fingerprint": fp}
 
 
 def _strip_noise(obj, depth: int = 0):

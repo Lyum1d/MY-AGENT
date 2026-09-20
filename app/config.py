@@ -184,6 +184,23 @@ ENFORCE_SCOPE = os.getenv("ENFORCE_SCOPE", "1") == "1"
 TOOL_MIN_INTERVAL = float(os.getenv("TOOL_MIN_INTERVAL", "1.0"))
 GLOBAL_MIN_INTERVAL = float(os.getenv("GLOBAL_MIN_INTERVAL", "0.2"))
 
+# ---- 统一流量调度（v023.1，实现见 app/traffic.py）----
+# 滑动窗口请求预算：同一 root_domain 在窗口内最多发这么多请求，超出即暂停
+# （不是自动提高额度）。默认值取「保守档」——由 zueb.edu.cn 实测事故确定：
+# 单脚本连发几十个敏感后缀请求即触发 IP 级封禁且封禁 >20 分钟。
+TRAFFIC_WINDOW_SECONDS = int(os.getenv("AGENT_TRAFFIC_WINDOW", "600"))
+TRAFFIC_MAX_REQUESTS = int(os.getenv("AGENT_TRAFFIC_MAX_REQUESTS", "30"))
+TRAFFIC_BURST = int(os.getenv("AGENT_TRAFFIC_BURST", "5"))
+# 并发上限：同一主机 1、同一根域名 1（v023.1 保守档，不可自动提高）
+TRAFFIC_HOST_CONCURRENCY = int(os.getenv("AGENT_TRAFFIC_HOST_CONCURRENCY", "1"))
+TRAFFIC_ROOT_CONCURRENCY = int(os.getenv("AGENT_TRAFFIC_ROOT_CONCURRENCY", "1"))
+# 请求指纹缓存 TTL（秒）。0 = 关闭复用（v023.1 默认关闭：复验请求必须真实
+# 发出，否则 v017.3 的「重复验证稳定性」语义会被缓存破坏；v023.4 再评估默认值）
+TRAFFIC_FP_TTL = float(os.getenv("AGENT_TRAFFIC_FP_TTL", "0"))
+# 测试模式：放预算/并发（跑回归套件用），生产不得开启。status 接口会公开该标志
+TRAFFIC_TEST_MODE = os.getenv("AGENT_TRAFFIC_TEST_MODE", "") == "1"
+TRAFFIC_TEST_MULTIPLIER = int(os.getenv("AGENT_TRAFFIC_TEST_MULTIPLIER", "50"))
+
 # ---- 远程访问（run.py 拒绝启动 + app/main.py 令牌中间件）----
 ALLOW_REMOTE = os.getenv("ALLOW_REMOTE", "0") == "1"
 ACCESS_TOKEN = os.getenv("SRC_AGENT_TOKEN", "")

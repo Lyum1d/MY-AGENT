@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import config, providers, report, scope, store, usage
-from . import graph, ratelimit, secretbox
+from . import graph, ratelimit, secretbox, traffic
 from . import difftest, flowtest
 from .importers import common as importers_common
 from .agent import agent, sessions
@@ -1102,8 +1102,11 @@ async def check_identity(pid: str, iid: str):
         store.update_identity_status(pid, iid, "invalid")
         raise HTTPException(409, "凭据解密失败（可能因换 Windows 用户或密文损坏），身份已标记 invalid")
     import time as _t
-    await ratelimit.acquire(urlsplit(check_url).netloc or "default",
-                            config.TOOL_MIN_INTERVAL, config.GLOBAL_MIN_INTERVAL)
+    try:
+        permit = await traffic.governor.acquire(
+            check_url, project_id=pid, tool_alias="identity_check", method="GET")
+    except traffic.TrafficError as e:
+        raise HTTPException(409, f"出网调度拒绝：{e}")
     merged_headers = {k: v for k, v in (headers or {}).items()}
     t0 = _t.monotonic()
     try:
@@ -1113,7 +1116,11 @@ async def check_identity(pid: str, iid: str):
                                  cookies=cookies or None)
         status_code = r.status_code
     except Exception as e:
+        await traffic.governor.release(permit, error_type=type(e).__name__,
+                                       os_error_code=getattr(e, "errno", 0) or 0)
         raise HTTPException(502, f"检查请求失败：{type(e).__name__}")
+    await traffic.governor.release(permit, status_code=status_code,
+                                  bytes_in=len(r.content))
     latency = round(_t.monotonic() - t0, 2)
     # 401/403 = 凭据失效；407（代理要求认证）也算失效信号
     ok = status_code not in (401, 403, 407)
@@ -1370,6 +1377,100 @@ async def list_flow_runs(pid: str, limit: int = 50):
     if not store.get_project(pid):
         raise HTTPException(404, "项目不存在")
     return {"items": store.list_flow_runs(pid, limit=limit)}
+
+
+# ---------- 流量安全（v023.1） ----------
+class TrafficPolicyRequest(BaseModel):
+    """根域名流量策略：只能比默认更保守或经用户显式确认后放宽（记审计）。
+
+    max_requests 是 10 分钟窗口内的请求上限；burst_limit 是 10 秒内的突发上限。
+    """
+    root_domain: str
+    window_seconds: int = 600
+    max_requests: int = 30
+    burst_limit: int = 5
+    host_concurrency: int = 1
+    root_concurrency: int = 1
+
+
+@app.get("/api/projects/{pid}/traffic/status")
+async def traffic_status(pid: str):
+    """各目标实时流量状态：预算用量、并发、排队、暂停原因与最后错误。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    roots = traffic.governor.roots_seen()
+    states = {s["root_domain"]: s for s in store.list_traffic_states(pid)}
+    items = []
+    for root in roots:
+        st = dict(traffic.governor.stats(root))
+        rec = states.get(root)
+        if rec:
+            st["state"] = rec.get("state", st["state"])
+            st["reason"] = rec.get("reason", st["reason"])
+        items.append(st)
+    return {"items": items, "test_mode": config.TRAFFIC_TEST_MODE,
+            "defaults": {"window_seconds": config.TRAFFIC_WINDOW_SECONDS,
+                         "max_requests": config.TRAFFIC_MAX_REQUESTS,
+                         "burst_limit": config.TRAFFIC_BURST}}
+
+
+@app.get("/api/projects/{pid}/traffic/events")
+async def traffic_events(pid: str, root_domain: str = "", limit: int = 100):
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return {"items": store.list_traffic_events(pid, root_domain=root_domain, limit=limit)}
+
+
+@app.get("/api/projects/{pid}/traffic/summary")
+async def traffic_summary(pid: str):
+    """流量摘要（v023.1 基础版：按根域名的发送/拒绝/错误计数）。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return store.traffic_summary(pid)
+
+
+@app.post("/api/projects/{pid}/traffic/pause")
+async def traffic_pause(pid: str, req: TrafficPolicyRequest):
+    """人工暂停某根域名（随时可调用）。暂停状态持久化，重启不清除。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    st = traffic.governor.pause(req.root_domain, "用户手动暂停", project_id=pid)
+    return st
+
+
+@app.post("/api/projects/{pid}/traffic/resume")
+async def traffic_resume(pid: str, req: TrafficPolicyRequest):
+    """人工恢复（v023.1 直接恢复；v023.3 起改为经 MANUAL_PROBE 单次只读探测）。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return traffic.governor.resume(req.root_domain, project_id=pid)
+
+
+@app.get("/api/projects/{pid}/traffic/policy")
+async def get_traffic_policy(pid: str, root_domain: str):
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    pol = store.get_traffic_policy(root_domain)
+    return pol or {"root_domain": root_domain, "window_seconds": config.TRAFFIC_WINDOW_SECONDS,
+                   "max_requests": config.TRAFFIC_MAX_REQUESTS,
+                   "burst_limit": config.TRAFFIC_BURST,
+                   "host_concurrency": config.TRAFFIC_HOST_CONCURRENCY,
+                   "root_concurrency": config.TRAFFIC_ROOT_CONCURRENCY,
+                   "source": "default"}
+
+
+@app.put("/api/projects/{pid}/traffic/policy")
+async def set_traffic_policy(pid: str, req: TrafficPolicyRequest):
+    """修改根域名策略（记审计）。放宽预算需用户显式操作——Agent 工具无法调用本接口。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    pol = store.set_traffic_policy(req.root_domain, req.model_dump())
+    traffic.governor._policy_cache.pop(req.root_domain, None)   # 立即生效
+    store.add_traffic_event({"project_id": pid, "root_domain": req.root_domain,
+                             "event_type": "policy_changed",
+                             "redaction_summary": (f"窗口 {req.window_seconds}s / "
+                                                   f"上限 {req.max_requests} / 突发 {req.burst_limit}")})
+    return pol
 
 
 # ---------- 五项复核清单（v017.4） ----------

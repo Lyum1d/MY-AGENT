@@ -146,6 +146,56 @@ CREATE TABLE IF NOT EXISTS flow_runs (
     created_at    REAL
 );
 CREATE INDEX IF NOT EXISTS idx_flow_runs_proj ON flow_runs(project_id);
+-- v023.1 流量安全：目标状态（持久化——服务重启不得清除 PAUSED/BLOCKED）、
+-- 流量事件（审计，含网络层错误）、根域名策略（预算/并发覆盖 config 默认）。
+CREATE TABLE IF NOT EXISTS traffic_states (
+    root_domain   TEXT PRIMARY KEY,
+    project_id    TEXT DEFAULT '',
+    state         TEXT DEFAULT 'NORMAL',
+    reason        TEXT DEFAULT '',
+    signal_count  INTEGER DEFAULT 0,
+    cooldown_until REAL DEFAULT 0,
+    last_success_at REAL,
+    last_error_at REAL,
+    last_error_type TEXT DEFAULT '',
+    last_error_code INTEGER DEFAULT 0,
+    updated_at    REAL
+);
+-- 事件量级大：自增主键 + 索引；按 created_at 定期清理（保留 7 天）
+CREATE TABLE IF NOT EXISTS traffic_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id    TEXT DEFAULT '',
+    session_id    TEXT DEFAULT '',
+    root_domain   TEXT DEFAULT '',
+    host          TEXT DEFAULT '',
+    resolved_ip   TEXT DEFAULT '',
+    port          INTEGER DEFAULT 0,
+    tool_alias    TEXT DEFAULT '',
+    identity_label TEXT DEFAULT '',
+    request_fingerprint TEXT DEFAULT '',
+    event_type    TEXT DEFAULT '',   -- sent | settled | rejected | paused | resumed | cancelled
+    status_code   INTEGER,
+    error_type    TEXT DEFAULT '',
+    os_error_code INTEGER DEFAULT 0,
+    started_at    REAL,
+    finished_at   REAL,
+    bytes_in      INTEGER DEFAULT 0,
+    redaction_summary TEXT DEFAULT '',
+    created_at    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_events_root ON traffic_events(root_domain, created_at);
+CREATE INDEX IF NOT EXISTS idx_traffic_events_proj ON traffic_events(project_id, created_at);
+-- 根域名策略覆盖：未配置的 root 用 config 默认（保守档）
+CREATE TABLE IF NOT EXISTS traffic_policies (
+    root_domain   TEXT PRIMARY KEY,
+    window_seconds INTEGER,
+    max_requests  INTEGER,
+    burst_limit   INTEGER,
+    host_concurrency INTEGER,
+    root_concurrency INTEGER,
+    manual_resume_required INTEGER DEFAULT 1,
+    updated_at    REAL
+);
 -- v017.4 五项复核清单（finding 一对一）。确认闸门：五项不全 → 拒绝 confirmed。
 CREATE TABLE IF NOT EXISTS finding_checks (
     finding_id  TEXT PRIMARY KEY,
@@ -1242,6 +1292,151 @@ def checks_complete(finding_id: str) -> bool:
     return all(ck[k] for k in ("c1_repeat", "c2_permission_delta",
                                "c3_minimal_chain", "c4_readonly_or_safe",
                                "c5_impact_proven"))
+
+
+# ---------- 流量安全（v023.1） ----------
+def upsert_traffic_state(project_id: str, st: dict) -> None:
+    """写入/更新目标状态（root_domain 为主键——跨项目共享同一目标的封禁状态）。"""
+    with _db() as c:
+        c.execute(
+            "INSERT INTO traffic_states (root_domain,project_id,state,reason,signal_count,"
+            "cooldown_until,last_success_at,last_error_at,last_error_type,last_error_code,"
+            "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(root_domain) DO UPDATE SET state=excluded.state,"
+            " reason=excluded.reason, signal_count=excluded.signal_count,"
+            " cooldown_until=excluded.cooldown_until,"
+            " last_success_at=COALESCE(excluded.last_success_at, traffic_states.last_success_at),"
+            " last_error_at=COALESCE(excluded.last_error_at, traffic_states.last_error_at),"
+            " last_error_type=excluded.last_error_type,"
+            " last_error_code=excluded.last_error_code,"
+            " project_id=excluded.project_id, updated_at=excluded.updated_at",
+            (st.get("root_domain", ""), project_id, st.get("state", "NORMAL"),
+             st.get("reason", ""), int(st.get("signal_count") or 0),
+             float(st.get("cooldown_until") or 0), st.get("last_success_at"),
+             st.get("last_error_at"), st.get("last_error_type", ""),
+             int(st.get("last_error_code") or 0), time.time()))
+
+
+def get_traffic_state(root_domain: str) -> dict | None:
+    with _db() as c:
+        row = c.execute("SELECT * FROM traffic_states WHERE root_domain=?",
+                        (root_domain,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_traffic_states(project_id: str = "") -> list[dict]:
+    with _db() as c:
+        if project_id:
+            rows = c.execute("SELECT * FROM traffic_states WHERE project_id=? OR project_id=''"
+                             " ORDER BY updated_at DESC", (project_id,)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM traffic_states ORDER BY updated_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_traffic_event(ev: dict) -> None:
+    with _db() as c:
+        c.execute(
+            "INSERT INTO traffic_events (project_id,session_id,root_domain,host,resolved_ip,"
+            "port,tool_alias,identity_label,request_fingerprint,event_type,status_code,"
+            "error_type,os_error_code,started_at,finished_at,bytes_in,redaction_summary,"
+            "created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ev.get("project_id", ""), ev.get("session_id", ""), ev.get("root_domain", ""),
+             ev.get("host", ""), ev.get("resolved_ip", ""), int(ev.get("port") or 0),
+             ev.get("tool_alias", ""), ev.get("identity_label", ""),
+             ev.get("request_fingerprint", ""), ev.get("event_type", ""),
+             ev.get("status_code"), ev.get("error_type", ""),
+             int(ev.get("os_error_code") or 0), ev.get("started_at"),
+             ev.get("finished_at"), int(ev.get("bytes_in") or 0),
+             ev.get("redaction_summary", ""), time.time()))
+
+
+def list_traffic_events(project_id: str = "", root_domain: str = "",
+                        limit: int = 100) -> list[dict]:
+    q = "SELECT * FROM traffic_events WHERE 1=1"
+    args: list = []
+    if project_id:
+        q += " AND project_id=?"
+        args.append(project_id)
+    if root_domain:
+        q += " AND root_domain=?"
+        args.append(root_domain)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(max(1, min(int(limit), 1000)))
+    with _db() as c:
+        rows = c.execute(q, args).fetchall()
+    return [dict(r) for r in rows]
+
+
+def recent_traffic_sends(root_domain: str, window_seconds: int) -> list[float]:
+    """窗口内所有已发送请求的时间戳（重启后重建滑动窗口用）。"""
+    since = time.time() - window_seconds
+    with _db() as c:
+        rows = c.execute(
+            "SELECT created_at FROM traffic_events WHERE root_domain=? AND event_type='sent'"
+            " AND created_at>=? ORDER BY created_at", (root_domain, since)).fetchall()
+    return [float(r["created_at"]) for r in rows if r["created_at"]]
+
+
+def distinct_traffic_roots() -> list[str]:
+    with _db() as c:
+        rows = c.execute("SELECT DISTINCT root_domain FROM traffic_events"
+                         " WHERE root_domain<>''").fetchall()
+    return [r["root_domain"] for r in rows]
+
+
+def get_traffic_policy(root_domain: str) -> dict | None:
+    with _db() as c:
+        row = c.execute("SELECT * FROM traffic_policies WHERE root_domain=?",
+                        (root_domain,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_traffic_policy(root_domain: str, policy: dict) -> dict:
+    with _db() as c:
+        c.execute(
+            "INSERT INTO traffic_policies (root_domain,window_seconds,max_requests,"
+            "burst_limit,host_concurrency,root_concurrency,manual_resume_required,updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(root_domain) DO UPDATE SET window_seconds=excluded.window_seconds,"
+            " max_requests=excluded.max_requests, burst_limit=excluded.burst_limit,"
+            " host_concurrency=excluded.host_concurrency,"
+            " root_concurrency=excluded.root_concurrency,"
+            " manual_resume_required=excluded.manual_resume_required,"
+            " updated_at=excluded.updated_at",
+            (root_domain, int(policy.get("window_seconds") or 600),
+             int(policy.get("max_requests") or 30), int(policy.get("burst_limit") or 5),
+             int(policy.get("host_concurrency") or 1), int(policy.get("root_concurrency") or 1),
+             1 if policy.get("manual_resume_required", True) else 0, time.time()))
+    return get_traffic_policy(root_domain)
+
+
+def traffic_summary(project_id: str) -> dict:
+    """目标流量摘要（v023.1 基础版；v023.5 扩展为审计报告）。"""
+    with _db() as c:
+        rows = c.execute(
+            "SELECT root_domain,event_type,status_code,error_type,COUNT(*) AS n"
+            " FROM traffic_events WHERE project_id=? GROUP BY root_domain,event_type,"
+            "status_code,error_type", (project_id,)).fetchall()
+        total = c.execute("SELECT COUNT(*) AS n FROM traffic_events WHERE project_id=?",
+                          (project_id,)).fetchone()
+    by_root: dict[str, dict] = {}
+    for r in rows:
+        d = by_root.setdefault(r["root_domain"], {"sent": 0, "settled": 0, "rejected": 0,
+                                                  "errors": 0, "paused": 0})
+        et = r["event_type"]
+        if et == "sent":
+            d["sent"] += r["n"]
+        elif et == "settled":
+            d["settled"] += r["n"]
+            if r["error_type"] or (r["status_code"] and r["status_code"] >= 400):
+                d["errors"] += r["n"]
+        elif et in ("rejected", "cancelled"):
+            d["rejected"] += r["n"]
+        elif et == "paused":
+            d["paused"] += r["n"]
+    return {"project_id": project_id, "total_events": int(total["n"] or 0),
+            "by_root": by_root}
 
 
 def delete_fact(project_id: str, fid: str) -> bool:
