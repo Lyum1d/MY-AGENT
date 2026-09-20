@@ -208,7 +208,10 @@ def compose_system_prompt(*extra: str) -> str:
 SYSTEM_PROMPT = compose_system_prompt()
 
 
-# 目标参数中出现这些特征，说明模型把说明文字当成了目标
+# 目标参数中出现这些特征，说明模型把说明文字当成了目标。
+# 注意（v023.6 修）：`?`/`？` 这类单字符模式**只对非 URL 目标**检查——
+# URL 的查询串天然含 `?`，此前带参 URL 一律被判「说明性文字」而无法执行
+# （实测 httpreplay 带 `?attguid=...` 的完整 URL 被拒，被误记为「长度上限」）。
 _BAD_TARGET_PATTERNS = ("请提供", "请用户", "请确认", "请输入", "未知", "待定", "？", "?", "示例")
 
 
@@ -336,11 +339,22 @@ def validate_target(target: str) -> str | None:
     """
     if not target:
         return "目标为空"
-    if len(target) > 120:
+    # v023.6（实战反馈）：带查询串的完整 URL 很容易超过 120 字符，被误判为
+    # 「目标过长」而无法执行（实测 httpreplay 被挡）。URL 形态放宽到 2000，
+    # 非 URL 目标保持 120 的严格上限（防小模型把自然语言当目标）。
+    if "://" in target:
+        if len(target) > 2000:
+            return (f"URL 过长（{len(target)} 字符 > 2000）。"
+                    "请把查询串拆到工具的 -d/--data 参数里，而不是塞进 target。")
+    elif len(target) > 120:
         return f"目标过长（{len(target)} 字符）"
     if target.count(" ") >= 2:
         return "目标包含多个空格，疑似自然语言句子"
-    if any(p in target for p in _BAD_TARGET_PATTERNS):
+    # URL 形态：跳过 `?`/`？` 与「示例」以外的单字符模式（查询串合法含 ?）
+    _is_url = "://" in target
+    _patterns = (("请提供", "请用户", "请确认", "请输入", "未知", "待定", "示例")
+                 if _is_url else _BAD_TARGET_PATTERNS)
+    if any(p in target for p in _patterns):
         return f"目标包含说明性文字「{target[:30]}」"
     # URL 形态的目标不允许任何空白（审计 P0-3）：'https://授权域/ evil.com' 这类
     # 夹带会绕过 target_host（空格落在 path 里）并在渲染后被 shlex 切成第二个目标。
@@ -361,6 +375,24 @@ _TARGET_FLAGS = {"-u", "--url", "-t", "--target"}
 
 # 上下文压缩标记：已压缩过的消息不再重复压缩（保证幂等）
 _COMPRESSED_PREFIX = "〔已压缩〕"
+
+# 关键命中行特征（v023.6）：压缩时优先保留这些行，而不是只留输出首行。
+# 背景（shhxqh 实战）：ehole 的指纹命中位于输出中后部，压缩只留首行后
+# **证据不可再引用**，模型只能把指纹记为「候选」。这里改成按特征挑行 +
+# 自动落一条**候选**事实（带 step_id 溯源），压缩后仍可回查。
+_KEY_LINE_PATTERNS = (
+    r"CVE-\d{4}-\d+",
+    r"\b(nginx|apache|iis|tomcat|jetty|spring|struts|shiro|weblogic|jboss|"
+    r"php|jsp|aspx|layui|jquery|vue|react|bootstrap|ace|jqgrid|ztree|"
+    r"bws|safedog|waf|cdn)\b",
+    r"(?i)(fingerprint|识别|指纹|命中|匹配|powered by|x-powered-by|server)",
+    r"<title>.{0,80}</title>",
+    r"HTTP[/ ]?\d\.\d|\b(200|301|302|403|404|500)\b",
+    r"\.(js|json|do|action|jsp|php|aspx|xml|txt)(\?|$|\s|')",
+    r"\b(v?\d+\.\d+(\.\d+)?)\b",
+)
+_COMPRESS_KEY_MAX = 3          # 每步最多保留的关键行数
+_COMPRESS_KEY_CAP = 220        # 单行最多字符
 
 # 失败归因分层用的特征词（借鉴 LuaN1ao 的 L0–L5 递进归因，此处只取 L1/L3/L4 三档）
 # L1 = 工具根本没跑起来（措辞取自 executor / pyexec / replayer 的实际报错文案）
@@ -1755,6 +1787,14 @@ class Agent:
         keep_from = max(0, len(msgs) - config.HISTORY_KEEP_RECENT)
         by_call = {st.id: st for st in session.steps if st.id}
         excerpt_cap = config.HISTORY_EXCERPT_CHARS
+        # 已有事实内容集合：压缩落事实前先查一次，避免重复落库
+        seen_facts: set[str] = set()
+        if session.project:
+            try:
+                seen_facts = {(f.get("content") or "").strip()
+                              for f in store.list_facts(session.project)}
+            except Exception:
+                seen_facts = set()
         changed = 0
         for m in msgs[:keep_from]:
             if m.get("role") != "tool":
@@ -1779,9 +1819,17 @@ class Agent:
             if d.get("target"):
                 parts.append(f"目标 {d['target']}")
             parts.append(mark)
-            brief = self._first_line(st.output or "", excerpt_cap)
+            # v023.6：优先保留**关键命中行**（指纹/版本/状态码/标题），
+            # 而不是只留首行——否则证据进压缩后无法再引用（实测痛点）
+            key = self._key_lines(st.output or "")
+            brief = key[0] if key else self._first_line(st.output or "", excerpt_cap)
             if brief:
                 parts.append(brief)
+            if len(key) > 1:
+                parts.append(" / ".join(key[1:]))
+            fid = self._save_compressed_evidence(session, st, key, seen_facts)
+            if fid:
+                parts.append(f"证据#{fid}（候选，可 search_history 回查原文）")
             m["content"] = "｜".join(parts)
             changed += 1
         if changed:
@@ -1790,6 +1838,52 @@ class Agent:
 
     # ---------- 防呆提醒 ----------
     # 压缩辅助：取首个非空行（确定性裁剪，零 token）
+    @staticmethod
+    def _key_lines(text: str, max_lines: int = 0, cap: int = 0) -> list[str]:
+        """从工具输出里挑「关键命中行」（确定性、零 token）。
+
+        只在输出中按特征扫描（指纹/版本/状态码/标题/接口路径），命中即收，
+        最多 max_lines 行。**不做任何概括**——摘出来的就是原文，因此不会
+        引入幻觉；模型拿到的是可核对的原始行。
+        """
+        max_lines = max_lines or _COMPRESS_KEY_MAX
+        cap = cap or _COMPRESS_KEY_CAP
+        out: list[str] = []
+        for line in (text or "").splitlines():
+            s = line.strip()
+            if len(s) < 6 or len(s) > 400:
+                continue
+            if any(re.search(p, s, re.IGNORECASE) for p in _KEY_LINE_PATTERNS):
+                if s not in out:
+                    out.append(s[:cap])
+            if len(out) >= max_lines:
+                break
+        return out
+
+    def _save_compressed_evidence(self, session: Session, step: Step,
+                                  key_lines: list[str],
+                                  seen: set[str]) -> str:
+        """把压缩时摘出的关键命中落成**候选**事实，保证压缩后仍可回查。
+
+        纪律：自动摘录一律 status=candidate（AI 只能产候选，不能自证已确认）；
+        带 session_id/step_id 以便因果图连边；内容去重（同一条只落一次）。
+        """
+        if not key_lines or not session.project or not step.id:
+            return ""
+        content = (f"[自动摘录·待确认] {step.tool_name or step.tool_alias} 对 "
+                   f"{step.target or '目标'} 的输出命中：" + "；".join(key_lines))[:500]
+        if content in seen:
+            return ""
+        try:
+            rec = store.add_fact(session.project, content, source="agent",
+                                 session_id=session.id, step_id=step.id,
+                                 status="candidate")
+            seen.add(content)
+            return str(rec.get("id") or "")
+        except Exception:
+            logger.debug("压缩落候选事实失败（不影响压缩）", exc_info=True)
+            return ""
+
     @staticmethod
     def _first_line(text: str, cap: int) -> str:
         """取首个非空行并截断——纯裁剪，不做任何概括，因此不会引入幻觉。"""

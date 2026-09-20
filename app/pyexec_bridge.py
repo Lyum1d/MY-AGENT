@@ -263,10 +263,12 @@ class ScriptBridge:
 def detect_direct_network(code: str) -> dict:
     """静态检测脚本里的直接网络访问。
 
-    返回 {"has_net_lib": bool, "has_loop": bool, "has_url": bool, "risky": bool}。
-    risky = 网络库 + 循环（事故模式：脚本循环直连目标，外层限速无效）。
+    返回 {"has_net_lib", "has_loop", "has_url", "risky", "single_shot"}：
+      risky       = 网络库 + 循环 + URL（事故模式：脚本循环直连，外层限速无效）
+      single_shot = 网络库 + URL 但**无循环**（v023.6 新增：这类请求同样绕过了
+                    调度器——不可审计、不受预算与暂停态约束，必须提示）
 
-    定位说明：这是**防误触**检查（阻止 Agent 写出外层管不住的循环脚本），
+    定位说明：这是**防误触**检查（阻止 Agent 写出外层管不住的脚本），
     可被刻意绕过（如 __import__ 动态导入）——不是对抗性安全边界。
     """
     import re
@@ -277,4 +279,5 @@ def detect_direct_network(code: str) -> dict:
     loop = bool(re.search(r"^\s*(for|while)\s", c, re.MULTILINE))
     url = bool(re.search(r"https?://[^\s\"']+", c))
     return {"has_net_lib": net_lib, "has_loop": loop, "has_url": url,
-            "risky": net_lib and loop and url}
+            "risky": net_lib and loop and url,
+            "single_shot": net_lib and url and not loop}

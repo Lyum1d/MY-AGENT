@@ -150,8 +150,8 @@ check("ehole 声明 target_type=url",
       _ov.get("ehole", {}).get("target_type") == "url")
 check("dirsearch 声明 target_type=url",
       _ov.get("dirsearch", {}).get("target_type") == "url")
-check("httpx 黑名单声明",
-      _ov.get("httpx", {}).get("disallowed_flags") == ["-l", "--list"])
+check("httpx 黑名单声明（v023.6 追加 -redirect：该旗标不存在）",
+      set(_ov.get("httpx", {}).get("disallowed_flags") or []) >= {"-l", "--list", "-redirect"})
 check("oneforall 声明 target_type=domain",
       _ov.get("oneforall", {}).get("target_type") == "domain")
 check("_说明 已更新使用文档", "target_type" in _ov.get("_说明", ""))

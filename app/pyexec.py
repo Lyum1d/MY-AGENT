@@ -283,12 +283,26 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None,
                "请改用受控接口：\n"
                "    from srcagent import safe_http_request\n"
                "    r = safe_http_request(\"https://授权目标/路径\")\n"
-               "该接口的每次请求都会经过统一调度器（scope/预算/并发/暂停态均生效）。")
+               "该接口的每次请求都会经过统一调度器（scope/预算/并发/暂停态均生效）。\n"
+               "**循环写法**：把 `for u in urls: get(u)` 直接展开为顺序调用"
+               "（safe_http_request 本身不限次数，只受单脚本预算约束），"
+               "例如：\n"
+               "    from srcagent import safe_http_request as H\n"
+               "    r1 = H(urls[0]); r2 = H(urls[1]); r3 = H(urls[2])\n"
+               "（展开后仍是受控请求；确实需要大量请求时请拆成多次 py_exec 调用。）")
         if policy == "safe":
             yield {"type": "error", "data": "已拒绝执行：" + msg}
             yield {"type": "exit", "code": 126}
             return
         yield {"type": "output", "data": "#（警告）" + msg}
+    elif policy != "legacy" and det["single_shot"]:
+        # v023.6：单次直连同样绕过调度器（不可审计、不受预算/暂停态约束）。
+        # 不拒绝（风险低于循环模式），但必须提示并留痕——此前是静默放行。
+        yield {"type": "output", "data": (
+            "（提示）脚本直接使用了网络库（单次请求）——该请求**不经过**流量调度器："
+            "不会计入预算、不受目标暂停态约束、也不会出现在流量审计里。"
+            "建议改用受控接口 `from srcagent import safe_http_request`；"
+            "若确需直连（例如访问本地文件或非 HTTP 协议），请忽略本提示。")}
 
     # 留档目录：data/scripts/exec/<目标>/exec_<毫秒时间戳>.py
     base = config.PY_EXEC_DIR / _sanitize(target or "default")
