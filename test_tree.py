@@ -510,7 +510,8 @@ class _FakeExec:
     def __init__(self, events):
         self.events = list(events)
 
-    async def run(self, tool, target, args="", cancel_event=None):
+    async def run(self, tool, target, args="", cancel_event=None,
+                  project_id="", session_id=""):
         for e in self.events:
             yield e
 

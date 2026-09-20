@@ -582,6 +582,12 @@ class ToolRegistry:
                 full += "target 必须是域名或 IP（不要带协议、路径或端口）。"
             if t.allowed_flags:
                 full += "合法参数（args 只允许使用这些旗标，其余会被自动丢弃）：" + ", ".join(sorted(set(t.allowed_flags))) + "。"
+            # v023.6：扫描器内部速率能力声明状态写进工具清单（一次可见），
+            # 不在每次执行前刷屏（实战发现刷屏污染上下文，见 v023.2 修正）
+            nc = t.network_control or {}
+            if t.risk_level in ("L2", "L3") and not nc.get("declared"):
+                full += ("⚠ 未声明内部速率能力（流量不可观测）：执行仅计一次出网配额，"
+                         "其内部并发不受调度器控制——请保守使用，避免长时间大范围扫描。")
             if t.disallowed_flags:
                 full += "禁止使用以下旗标（会被自动剔除）：" + ", ".join(t.disallowed_flags) + "。"
             schemas.append(
