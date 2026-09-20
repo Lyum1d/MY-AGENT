@@ -161,6 +161,7 @@
 
     <div class="report-bar">
       <button class="ghost" onclick="openBiz()">🧪 业务测试</button>
+      <button class="ghost" onclick="openTraffic()">🛡 流量安全</button>
       <button class="ghost" onclick="openGraph()">🗺 线索图</button>
       <button class="ghost" onclick="viewReport()">查看报告</button>
       <button class="primary" onclick="exportReport()">导出报告</button>
@@ -233,6 +234,34 @@
         <div id="bizResult" style="flex:1; overflow:auto; margin-top:8px; border:1px solid rgba(128,128,128,.25); border-radius:8px; padding:8px; font-size:12px;">
           <div class="empty">差分/流程结果将显示在这里</div>
         </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 流量安全面板（v023.5） ============ -->
+<div id="trafficModal" class="modal-mask">
+  <div class="modal" style="width:min(980px,94vw); height:min(700px,92vh); display:flex; flex-direction:column;">
+    <div class="modal-head">
+      <b>流量安全 · 目标状态与审计</b>
+      <div style="display:flex;gap:8px;">
+        <button class="sm" onclick="exportTrafficReport()">导出流量审计</button>
+        <button class="sm" onclick="closeTraffic()">关闭</button>
+      </div>
+    </div>
+    <div class="modal-tip" style="flex:none;">
+      检测到封禁迹象（连接重置/拒绝/连续超时/429/验证码）会立即停止对目标的自动请求，不自动重试、不换参数绕过。恢复需人工发起单次只读探测并确认。
+    </div>
+    <div style="flex:1; min-height:0; display:flex; flex-direction:column; gap:8px; overflow:hidden;">
+      <div id="trafficStateBar" style="flex:none; display:flex; gap:8px; flex-wrap:wrap;"></div>
+      <div style="display:flex; gap:6px; flex:none;">
+        <button class="sm" onclick="trafficPauseAll()">暂停本项目所有目标</button>
+        <button class="sm" onclick="loadTraffic()">刷新</button>
+      </div>
+      <div id="trafficList" style="flex:1; overflow:auto; border:1px solid rgba(128,128,128,.25); border-radius:8px; padding:6px;"></div>
+      <div style="flex:none;">
+        <b style="font-size:12px;">最近流量事件</b>
+        <div id="trafficEvents" style="max-height:150px; overflow:auto; font-size:11px; opacity:.85; margin-top:4px;"></div>
       </div>
     </div>
   </div>

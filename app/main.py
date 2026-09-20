@@ -1513,6 +1513,34 @@ async def traffic_clear_state(pid: str, req: TrafficPolicyRequest):
                                        reason="前端人工清除")
 
 
+@app.post("/api/projects/{pid}/traffic/pause-all")
+async def traffic_pause_all(pid: str):
+    """暂停本项目所有已见过的目标（v023.5 面板按钮）。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    paused = []
+    for root in traffic.governor.roots_seen():
+        traffic.governor.pause(root, "用户手动暂停全部目标", project_id=pid)
+        paused.append(root)
+    return {"paused": paused, "count": len(paused)}
+
+
+@app.post("/api/projects/{pid}/traffic/clear-queue")
+async def traffic_clear_queue(pid: str, req: TrafficPolicyRequest):
+    """清空某目标待发（排队）请求。已发出的请求无法撤回，但都已计入审计。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return traffic.governor.clear_queue(req.root_domain, project_id=pid)
+
+
+@app.get("/api/projects/{pid}/traffic/report")
+async def traffic_report(pid: str):
+    """流量审计报告（v023.5，对齐 v023 计划第 8 节字段）——只读聚合，不联网。"""
+    if not store.get_project(pid):
+        raise HTTPException(404, "项目不存在")
+    return store.traffic_audit(pid)
+
+
 @app.get("/api/projects/{pid}/traffic/policy")
 async def get_traffic_policy(pid: str, root_domain: str):
     if not store.get_project(pid):

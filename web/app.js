@@ -2133,4 +2133,163 @@ async function runFlowFromWorkbench() {
 
 $('bizModal').addEventListener('click', e => { if (e.target.id === 'bizModal') closeBiz(); });
 
+/* ---------- 流量安全面板（v023.5）---------- */
+const STATE_COLOR = {
+  NORMAL: '#16a34a', CAUTION: '#d97706', COOLDOWN: '#d97706',
+  BLOCKED: '#dc2626', PAUSED: '#dc2626', MANUAL_PROBE: '#2563eb',
+  RECOVERED: '#2563eb',
+};
+
+async function openTraffic() {
+  if (!state.currentProject) return log('先选择项目', 'c-warn');
+  $('trafficModal').style.display = 'flex';
+  loadTraffic();
+}
+
+function closeTraffic() { $('trafficModal').style.display = 'none'; }
+
+async function loadTraffic() {
+  if (!state.currentProject) return;
+  const el = $('trafficList');
+  el.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const [st, rep, ev] = await Promise.all([
+      api(`/api/projects/${state.currentProject}/traffic/status`),
+      api(`/api/projects/${state.currentProject}/traffic/report`),
+      api(`/api/projects/${state.currentProject}/traffic/events?limit=20`),
+    ]);
+    // 顶部摘要
+    const bar = $('trafficStateBar');
+    bar.innerHTML = `
+      <span class="badge">测试时长 ${esc(rep.span_text || '-')}</span>
+      <span class="badge">已发请求 ${rep.total_sent ?? 0}</span>
+      <span class="badge">被拒 ${rep.total_rejected ?? 0}</span>
+      <span class="badge">防护事件 ${rep.state_changes ?? 0}</span>
+      <span class="badge">自动暂停 ${rep.auto_pauses ?? 0}</span>
+      ${rep.avg_interval != null ? `<span class="badge">平均间隔 ${rep.avg_interval}s</span>` : ''}
+      <span class="badge">测试模式 ${st.test_mode ? '开' : '关'}</span>`;
+    // 目标列表
+    const items = st.items || [];
+    if (!items.length) {
+      el.innerHTML = '<div class="empty">暂无目标流量记录（发送过请求后这里会出现）</div>';
+    } else {
+      el.innerHTML = items.map(t => `
+        <div class="list-item" style="margin-bottom:4px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
+            <b>${esc(t.root_domain)}</b>
+            <span class="badge" style="color:${STATE_COLOR[t.state] || 'inherit'};">
+              ${esc(t.state)}</span>
+          </div>
+          <div style="font-size:11px; opacity:.8; margin-top:2px;">
+            IP ${esc(t.resolved_ip || '-')} · 预算 ${t.used}/${t.max_requests}（剩 ${t.remaining}）
+            · 近 10 分钟 ${t.requests_last_600s} · 并发 ${t.inflight} · 排队 ${t.queued}
+            ${t.last_error_label ? ' · 最后错误：' + esc(t.last_error_label) : ''}
+          </div>
+          ${t.reason ? `<div style="font-size:11px; color:#d97706; margin-top:2px;">${esc(t.reason)}</div>` : ''}
+          <div style="margin-top:4px; display:flex; gap:6px; flex-wrap:wrap;">
+            <button class="mini" onclick="trafficPause('${esc(t.root_domain)}')">暂停</button>
+            <button class="mini" onclick="trafficProbe('${esc(t.root_domain)}')">单次恢复探测</button>
+            <button class="mini" onclick="trafficConfirm('${esc(t.root_domain)}')">确认恢复</button>
+            <button class="mini" onclick="trafficClearQueue('${esc(t.root_domain)}')">清空排队</button>
+            <button class="mini" onclick="trafficClear('${esc(t.root_domain)}')">清除状态</button>
+          </div>
+        </div>`).join('');
+    }
+    // 事件
+    $('trafficEvents').innerHTML = (ev.items || []).map(e => {
+      const ts = new Date((e.created_at || 0) * 1000).toLocaleTimeString();
+      return `<div>${ts} · ${esc(e.event_type)} · ${esc(e.root_domain || '')} `
+        + `${e.status_code ? 'HTTP ' + e.status_code : ''} `
+        + `${esc(e.error_type || '')} ${esc((e.redaction_summary || '').slice(0, 60))}</div>`;
+    }).join('') || '<div class="empty">暂无事件</div>';
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message || e)}</div>`; }
+}
+
+async function trafficPause(root) {
+  await api(`/api/projects/${state.currentProject}/traffic/pause`, {
+    method: 'POST', body: JSON.stringify({ root_domain: root }),
+  });
+  log(`已暂停目标 ${root}`, 'c-warn'); loadTraffic();
+}
+
+async function trafficPauseAll() {
+  if (!confirm('暂停本项目所有目标？（所有自动请求将停止，需人工恢复）')) return;
+  const r = await api(`/api/projects/${state.currentProject}/traffic/pause-all`, { method: 'POST' });
+  log(`已暂停 ${r.count} 个目标`, 'c-warn'); loadTraffic();
+}
+
+async function trafficProbe(root) {
+  const url = prompt(`对 ${root} 发起【单次】低风险只读探测（URL 须在授权范围内）：`);
+  if (!url) return;
+  log('探测中…', 'c-dim');
+  try {
+    const r = await api(`/api/projects/${state.currentProject}/traffic/resume-probe`, {
+      method: 'POST', body: JSON.stringify({ root_domain: root, probe_url: url }),
+    });
+    if (r.ok) log(`探测成功（HTTP ${r.status_code}）——目标可能已恢复，请点「确认恢复」后才会恢复自动请求`, 'c-ok');
+    else log(`探测失败：${r.error || ('HTTP ' + (r.status_code || '?'))}——保持停止，不要连续探测`, 'c-warn');
+    loadTraffic();
+  } catch (e) { log('探测失败：' + (e.message || e), 'c-err'); }
+}
+
+async function trafficConfirm(root) {
+  if (!confirm(`确认恢复 ${root} 的自动请求？（仅在你的探测成功后执行）`)) return;
+  await api(`/api/projects/${state.currentProject}/traffic/confirm-resume`, {
+    method: 'POST', body: JSON.stringify({ root_domain: root }),
+  });
+  log(`已恢复 ${root}`, 'c-ok'); loadTraffic();
+}
+
+async function trafficClearQueue(root) {
+  const r = await api(`/api/projects/${state.currentProject}/traffic/clear-queue`, {
+    method: 'POST', body: JSON.stringify({ root_domain: root }),
+  });
+  log(`已清空 ${root} 排队请求（当时排队 ${r.queued_at_clear} 个；已发出的无法撤回）`, 'c-warn');
+  loadTraffic();
+}
+
+async function trafficClear(root) {
+  if (!confirm(`强制清除 ${root} 的防护状态？\n仅在确认目标确实正常（例如刚才是误判）时使用。`)) return;
+  await api(`/api/projects/${state.currentProject}/traffic/clear-state`, {
+    method: 'POST', body: JSON.stringify({ root_domain: root }),
+  });
+  log(`已清除 ${root} 状态`, 'c-warn'); loadTraffic();
+}
+
+async function exportTrafficReport() {
+  if (!state.currentProject) return;
+  const r = await api(`/api/projects/${state.currentProject}/traffic/report`);
+  const L = [];
+  L.push(`# 流量审计报告\n`);
+  L.push(`- 项目：${state.currentProject}`);
+  L.push(`- 测试时长：${r.span_text}`);
+  L.push(`- 实际发出请求：${r.total_sent}（被调度拒绝 ${r.total_rejected}）`);
+  L.push(`- 平均间隔：${r.avg_interval ?? '-'}s（最短 ${r.min_interval ?? '-'}s）`);
+  L.push(`- 防护事件：状态变更 ${r.state_changes}，自动暂停 ${r.auto_pauses}，人工探测 ${r.manual_probes}`);
+  L.push(`\n## 按通道\n` + (r.by_tool || []).map(t => `- ${t.tool}: ${t.sent}`).join('\n'));
+  L.push(`\n## 按目标\n` + (r.by_root || []).map(t => `- ${t.root_domain}: ${t.sent}`).join('\n'));
+  L.push(`\n## 状态码分布\n` + (r.by_status || []).map(t => `- ${t.status_code}: ${t.n}`).join('\n'));
+  if (r.errors && r.errors.length) {
+    L.push(`\n## 网络层/请求错误\n` + r.errors.map(t =>
+      `- ${t.error_type || '(未标注)'} ${t.os_error_code ? '(errno ' + t.os_error_code + ')' : ''}: ${t.n}`).join('\n'));
+  }
+  if (r.waf_events && r.waf_events.length) {
+    L.push(`\n## 防护/暂停事件\n` + r.waf_events.map(e =>
+      `- ${new Date(e.at * 1000).toLocaleString()} ${e.reason}`).join('\n'));
+  }
+  if (r.states && r.states.length) {
+    L.push(`\n## 目标最终状态\n` + r.states.map(s =>
+      `- ${s.root_domain} [${s.state}] ${(s.reason || '').slice(0, 60)} (IP ${s.resolved_ip || '-'})`).join('\n'));
+  }
+  const blob = new Blob([L.join('\n')], { type: 'text/markdown;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `traffic_audit_${state.currentProject}_${Date.now()}.md`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  log('流量审计报告已导出', 'c-ok');
+}
+
+$('trafficModal').addEventListener('click', e => { if (e.target.id === 'trafficModal') closeTraffic(); });
+
 init();

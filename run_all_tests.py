@@ -79,6 +79,7 @@ PY_TESTS = [
     ("py_exec 与扫描器治理（v023.2）", "test_pyexec_traffic.py", False),
     ("网络层 WAF 状态机（v023.3）", "test_waf.py", False),
     ("低流量测试策略（v023.4）", "test_lowtraffic.py", False),
+    ("流量审计与面板支撑（v023.5）", "test_traffic_audit.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

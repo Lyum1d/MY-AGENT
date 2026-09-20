@@ -183,6 +183,44 @@ def render_project_report(project_id: str) -> str:
         L.append("（无执行记录）")
     L.append("")
 
+    # ---- v023.5：测试流量摘要（含防护/暂停事件）----
+    # 目的（计划第 8 节）：事后能回答「是请求总量过大、短时突发、还是某工具内部
+    # 并发过高导致目标防护」——这对判断测试是否越界、以及向 SRC 平台说明测试
+    # 行为都很关键。
+    try:
+        aud = store.traffic_audit(project_id)
+    except Exception:
+        aud = None
+    if aud and aud.get("total_sent"):
+        L.append("\n## 四、测试流量摘要\n")
+        L.append(f"- **测试时长**：{aud.get('span_text')}")
+        L.append(f"- **实际发出请求**：{aud.get('total_sent')} 次"
+                 f"（未发出/被调度拒绝 {aud.get('total_rejected')} 次）")
+        if aud.get("avg_interval") is not None:
+            L.append(f"- **平均间隔**：{aud.get('avg_interval')} 秒"
+                     f"（最短 {aud.get('min_interval')} 秒）")
+        L.append(f"- **目标防护事件**：状态变更 {aud.get('state_changes')} 次，"
+                 f"自动暂停 {aud.get('auto_pauses')} 次，人工恢复探测 "
+                 f"{aud.get('manual_probes')} 次")
+        if aud.get("by_tool"):
+            L.append("- **按通道分布**：" + "；".join(
+                f"{t['tool']} {t['sent']} 次" for t in aud["by_tool"][:8]))
+        if aud.get("waf_events"):
+            L.append("\n**防护/暂停事件（最近）**\n")
+            for ev in aud["waf_events"][:8]:
+                ts = datetime.fromtimestamp(ev["at"]).strftime("%m-%d %H:%M:%S")
+                L.append(f"- {ts} {_esc_cell(ev.get('reason') or '')}")
+        if aud.get("states"):
+            L.append("\n**目标最终状态**\n")
+            L.append("| 根域名 | 状态 | 原因 | IP |")
+            L.append("|---|---|---|---|")
+            for st in aud["states"][:10]:
+                L.append(f"| {_esc_cell(st.get('root_domain') or '')} "
+                         f"| {_esc_cell(st.get('state') or '')} "
+                         f"| {_esc_cell((st.get('reason') or '')[:60])} "
+                         f"| {_esc_cell(st.get('resolved_ip') or '')} |")
+        L.append("")
+
     L.append("\n---\n")
     L.append("\n> 本报告由本地 SRC 渗透 Agent 生成。所有操作均应在获得书面授权的前提下进行。\n")
 
