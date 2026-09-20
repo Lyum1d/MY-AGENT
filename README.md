@@ -469,6 +469,20 @@ src-agent/
 5. **对象候选识别**：query/path/body 中语义键名（userId/orderId/fileId/tenantId…）标 high、纯数字参数标 medium；候选值脱敏展示，替换动作留给 v017.3 受控差分。
 6. 测试：`test_import.py`（36 项，覆盖解析/脱敏/去重/对象识别/项目隔离/scope 双闸门）。
 
+## 统一流量调度与目标熔断（v023.1）
+
+**背景**：实测（zueb.edu.cn）中 `py_exec` 脚本连发敏感后缀请求触发 **IP 级封禁**（连接重置 → 静默丢包，无任何 HTTP 层信号，封禁 >20 分钟）。v023 的核心原则是「检测到封禁迹象就停止，而不是绕过 WAF」。
+
+1. **唯一出网入口**：`app/traffic.py` 的 `TrafficGovernor`（进程内单例 `traffic.governor`）。重放、差分、流程、身份检查、executor 扫描器五类入口全部经 `governor.acquire(url, ...)` 取许可后才可发请求；`ratelimit.py` 保留为兼容层。
+2. **滑动窗口预算**：同一根域名 600 秒内最多 30 个请求、10 秒内最多 5 个突发（`AGENT_TRAFFIC_*` 可调）。**预算耗尽 = 暂停目标，绝不自动提高额度**。
+3. **并发限制**：同一主机同时 1 个请求、同一根域名同时 1 个；排队等待可取消（任务取消或目标暂停 → 排队请求不再发出）。
+4. **根域名级暂停**：暂停/封禁按 `root_domain` 聚合（实测封禁是 IP 级，同 IP 的兄弟 vhost 会一起不可达）。状态**持久化到 SQLite**——服务重启不清除，重启不能绕过。
+5. **审计**：`traffic_events` 记录每条请求的发送/结果/拒绝/暂停事件（含网络层错误类型与 OS 错误码），`traffic_states` 记录目标状态，`traffic_policies` 支持按根域名覆盖策略（PUT 接口记审计）。
+6. **API**：`GET traffic/status|events|summary`、`POST traffic/pause|resume`、`GET/PUT traffic/policy`。
+7. **测试模式**：跑回归或本地 fixture 时设 `AGENT_TRAFFIC_TEST_MODE=1`（`run_all_tests.py` 已自动设置）放大预算 50×；生产不得开启，status 接口会公开该标志。
+
+> 后续（v023.2-.5）：`py_exec` 受控网络接口、扫描器内部速率治理、网络层 WAF 状态机（CAUTION/COOLDOWN/BLOCKED）、低流量策略、流量面板与审计报告。
+
 ## 测试
 
 `test_*.py` 是自带的回归脚本（非 pytest 收集式，直接 `python test_xxx.py` 运行，退出码 0 表示全过）。
