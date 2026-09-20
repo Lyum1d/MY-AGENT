@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import AsyncIterator
 
-from . import config
+from . import config, pyexec_bridge
 from .scope import check_scope, find_hosts
 
 logger = logging.getLogger("src_agent")
@@ -271,6 +271,24 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None) -> AsyncIt
             yield {"type": "exit", "code": 126}
             return
 
+    # ---- v023.2 脚本网络访问治理（实测事故通道：脚本内部循环直连目标）----
+    # safe 模式拒绝「网络库 + 循环 + URL」的事故模式，并引导改用受控接口；
+    # warn 模式只提示；legacy 关闭治理（排障用）。
+    policy = config.PY_EXEC_NETWORK_POLICY
+    det = pyexec_bridge.detect_direct_network(code)
+    if policy != "legacy" and det["risky"]:
+        msg = ("检测到脚本直接使用网络库且含循环体——这类脚本在子进程里循环发包，"
+               "外层流量调度器管不住，正是导致目标 IP 被封的事故模式。\n"
+               "请改用受控接口：\n"
+               "    from srcagent import safe_http_request\n"
+               "    r = safe_http_request(\"https://授权目标/路径\")\n"
+               "该接口的每次请求都会经过统一调度器（scope/预算/并发/暂停态均生效）。")
+        if policy == "safe":
+            yield {"type": "error", "data": "已拒绝执行：" + msg}
+            yield {"type": "exit", "code": 126}
+            return
+        yield {"type": "output", "data": "#（警告）" + msg}
+
     # 留档目录：data/scripts/exec/<目标>/exec_<毫秒时间戳>.py
     base = config.PY_EXEC_DIR / _sanitize(target or "default")
     try:
@@ -295,6 +313,20 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None) -> AsyncIt
     config.PY_EXEC_TMP_ROOT.mkdir(parents=True, exist_ok=True)
     workdir = Path(tempfile.mkdtemp(prefix="pyexec_", dir=str(config.PY_EXEC_TMP_ROOT)))
     cwd = workdir
+    # v023.2：铺受控网络通道（脚本 `from srcagent import safe_http_request` 即用）
+    bridge = None
+    run_path = script          # 默认直接跑留档文件
+    if policy != "legacy":
+        try:
+            pyexec_bridge.prepare_workdir(workdir)
+            # Python 的 sys.path[0] 是**脚本所在目录**而不是 cwd——留档目录里
+            # 没有 srcagent.py，`import srcagent` 会失败。因此把执行副本放进
+            # workdir（留档仍在 data/scripts/exec/ 不动），让模块可被导入。
+            run_path = workdir / "_script.py"
+            run_path.write_text(code, encoding="utf-8")
+            bridge = pyexec_bridge.ScriptBridge(workdir, tool_alias="py_exec")
+        except Exception:
+            logger.warning("受控网络通道初始化失败（脚本仍可执行，但无受控通道）", exc_info=True)
     try:
         env = build_sandbox_env(workdir)
     except Exception as e:
@@ -305,7 +337,7 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None) -> AsyncIt
         return
 
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-u", str(script),
+        sys.executable, "-u", str(run_path),
         cwd=str(cwd), env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -318,6 +350,8 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None) -> AsyncIt
     deadline = time.monotonic() + config.PY_EXEC_TIMEOUT
     timed_out = False
     cancelled = False
+    bridge_task = asyncio.create_task(bridge.run()) if bridge else None
+    bridge_killed_reason = ""
     _buf = b""   # 审计 P2-2：定长 read 的行缓冲（替代 readline，避免 64KB 单行炸通道）
     try:
         # 逐行流式回传；超时则中断并保留已回传部分
@@ -335,6 +369,31 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None) -> AsyncIt
                 cancelled = True
                 yield {"type": "cancelled", "data": "已收到取消请求，代码执行已终止（整棵进程树）"}
                 break
+            # v023.2：受控通道事件与熔断——脚本请求被调度器拒绝（目标暂停/
+            # 预算耗尽/scope 外）或触发封禁迹象时，终止脚本与其子进程树，
+            # 不再让脚本继续尝试（计划 6.4：不能靠脚本自己"自觉"停下）。
+            if bridge is not None:
+                drain = []
+                while not bridge.notes.empty():
+                    try:
+                        drain.append(bridge.notes.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                for note in drain:
+                    yield {"type": "output", "data": note}
+                if bridge.blocked_reason:
+                    bridge_killed_reason = bridge.blocked_reason
+                    job.close()
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    if not tree_killed_by_job:
+                        _kill_tree_fallback(proc.pid)
+                    yield {"type": "error", "data": (
+                        f"受控通道已终止脚本：{bridge_killed_reason}。"
+                        "已发出的请求计入流量审计，后续请求一律未发出。")}
+                    break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
@@ -370,6 +429,14 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None) -> AsyncIt
     except Exception as e:
         yield {"type": "error", "data": f"执行通道异常：{e}"}
     finally:
+        # v023.2：先停受控通道（避免脚本退出后桥接任务空转），再收进程。
+        if bridge is not None:
+            bridge.stop()
+        if bridge_task is not None:
+            try:
+                await asyncio.wait_for(bridge_task, timeout=2)
+            except Exception:
+                bridge_task.cancel()
         # 无论哪条路径退出：先关 Job（整树终止，含孙进程），再兜 proc.kill，
         # 最后 taskkill 兜底——三层防御保证「取消/超时后不残留子进程」。
         job.close()

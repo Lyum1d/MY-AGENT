@@ -40,6 +40,10 @@ ST_BLOCKED = "BLOCKED"        # 预留：v023.3
 
 BLOCKING_STATES = {ST_PAUSED, ST_COOLDOWN, ST_BLOCKED}
 
+# 自动化业务测试的只读方法白名单（v023.2 起在此集中定义，供调度器与
+# py_exec 受控通道共用；写操作必须走 L2/L3 人工双闸门）
+READONLY_METHODS = ("GET", "HEAD", "OPTIONS")
+
 
 class TrafficError(Exception):
     """调度拒绝（统一基类，调用方按需细分处理）。"""
@@ -123,11 +127,25 @@ class TrafficGovernor:
     # ---------- 聚合键 ----------
     @staticmethod
     def root_domain_of(host: str) -> str:
-        """根域名（近似）：取末两段；两段式后缀（.com.cn 等）取末三段。"""
-        h = (host or "").split(":")[0].lower()
+        """聚合键：域名取根域名（近似），IP 原样返回。
+
+        取末两段；两段式后缀（.com.cn 等）取末三段。
+        **IP 地址必须原样返回**——末两段切分会把 127.0.0.1 变成 "0.1"，
+        造成 pause/acquire 的聚合键不一致（v023.2 自测踩坑：暂停后仍放行）。
+        """
+        raw = (host or "").strip().lower()
+        if raw.startswith("[") and "]" in raw:      # [::1]:8080
+            return raw[1:raw.index("]")]
+        if raw.count(":") >= 2:                     # 裸 IPv6（::1 / fe80::1）
+            return raw
+        h = raw.split(":")[0]                       # 去掉端口
         if not h:
             return ""
+        # IPv4：四段纯数字（**必须原样返回**——末两段切分会把 127.0.0.1
+        # 变成 "0.1"，造成 pause/acquire 聚合键不一致：v023.2 自测踩坑）
         parts = h.split(".")
+        if len(parts) == 4 and all(p.isdigit() for p in parts):
+            return h
         if len(parts) <= 2:
             return h
         two_level = {"com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "co.uk",
@@ -166,10 +184,16 @@ class TrafficGovernor:
         return st
 
     def state_of(self, root: str, project_id: str = "") -> dict:
+        root = self.root_domain_of(root) or root
         return self._load_state(root, project_id)
 
     def pause(self, root: str, reason: str, *, project_id: str = "") -> dict:
-        """暂停某根域名（人工操作或预算熔断）。持久化——重启不清除。"""
+        """暂停某根域名（人工操作或预算熔断）。持久化——重启不清除。
+
+        入参统一经 root_domain_of 归一化：调用方传 "127.0.0.1" 还是
+        "127.0.0.1:8080" 都落到同一个聚合键（v023.2 修）。
+        """
+        root = self.root_domain_of(root) or root
         st = self._load_state(root, project_id)
         st.update({"state": ST_PAUSED, "reason": reason, "cooldown_until": 0})
         self._persist_state(st, project_id)
@@ -178,6 +202,7 @@ class TrafficGovernor:
 
     def resume(self, root: str, *, project_id: str = "") -> dict:
         """恢复（人工操作）。v023.1 直接回 NORMAL；v023.3 起需经 MANUAL_PROBE。"""
+        root = self.root_domain_of(root) or root
         st = self._load_state(root, project_id)
         st.update({"state": ST_NORMAL, "reason": "人工恢复"})
         self._persist_state(st, project_id)

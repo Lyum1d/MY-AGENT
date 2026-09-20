@@ -76,6 +76,7 @@ PY_TESTS = [
     ("流程绕过检测（v017.5）", "test_flow.py", False),
     ("整改报告修复回归（v022）", "test_022_fixes.py", False),
     ("统一流量调度（v023.1）", "test_traffic.py", False),
+    ("py_exec 与扫描器治理（v023.2）", "test_pyexec_traffic.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

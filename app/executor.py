@@ -288,6 +288,42 @@ def _decode(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _apply_network_control(tool, args: str) -> tuple[str, list[str]]:
+    """按 network_control 声明注入保守速率/并发参数（v023.2）。
+
+    规则：工具已声明 supports_rate/supports_concurrency 且 args 里**未出现**
+    对应旗标时，追加系统默认保守值（SCANNER_DEFAULT_RATE/THREADS）。
+    用户或模型显式给出的旗标不覆盖——显式值仍会在 argv 复核与白名单清洗里
+    过一遍；要更强约束请把旗标写进 disallowed_flags。
+    """
+    nc = getattr(tool, "network_control", None) or {}
+    notes: list[str] = []
+    text = args or ""
+
+    def _inject(flag: str, value: int, label: str) -> None:
+        nonlocal text
+        if not flag or flag in text:
+            return
+        text = (text + f" {flag} {value}").strip()
+        note = f"（已注入{label} {flag} {value}）"
+        if tool.allowed_flags and flag not in tool.allowed_flags:
+            # 白名单会剔除不在册的旗标——不静默失败，明确提示补白名单
+            note += (f" 注意：{flag} 不在该工具 allowed_flags 白名单中，"
+                     f"可能被参数清洗剔除；请在 overrides 里把 {flag} 加入 allowed_flags")
+        notes.append(note)
+
+    if nc.get("supports_rate"):
+        for flag in (nc.get("rate_flags") or [])[:1]:
+            _inject(flag, config.SCANNER_DEFAULT_RATE, "速率限制")
+    if nc.get("supports_concurrency"):
+        for flag in (nc.get("concurrency_flags") or [])[:1]:
+            _inject(flag, config.SCANNER_DEFAULT_THREADS, "并发上限")
+    if not notes:
+        notes.append(f"（{tool.name} 已声明速率能力；本次未注入参数——"
+                     f"请确认 args 中已有速率/并发限制）")
+    return text, notes
+
+
 class Executor(ABC):
     """执行器抽象：子类需实现 run（取回输出）与 launch（仅启动）。"""
 
@@ -397,6 +433,26 @@ class LocalExecutor(Executor):
         if not tool.executable:
             yield {"type": "error", "data": f"工具文件不存在：{tool.name}（{tool.rel_path}）"}
             return
+
+        # v023.2：扫描器内部速率能力声明（network_control）——未声明者流量不可观测，
+        # 默认警告放行（过渡期），AGENT_SCANNER_REQUIRE_DECLARATION=1 时严格拒绝。
+        # 必须放在 build_command 之前：已声明能力的工具要注入保守速率参数。
+        nc = tool.network_control or {}
+        if not nc.get("declared"):
+            warn = (f"⚠「{tool.name}」未在 data/tool_overrides.json 的 network_control 中"
+                    f"声明内部速率/并发能力——其内部请求量不可观测，"
+                    f"调度器只能限制启动次数。请人工确认速率参数，"
+                    f"或补全声明（declared/supports_rate/rate_flags/traffic_class）。")
+            if config.SCANNER_REQUIRE_DECLARATION:
+                yield {"type": "error", "data": "已拒绝执行（严格模式）：" + warn}
+                yield {"type": "exit", "code": 126}
+                return
+            yield {"type": "output", "data": warn}
+        else:
+            # 已声明能力：自动注入保守速率/并发值（args 里用户已显式给出则不覆盖）
+            args, injected = _apply_network_control(tool, args)
+            for note in injected:
+                yield {"type": "output", "data": note}
 
         cmd = self.build_command(tool, target, args)
 

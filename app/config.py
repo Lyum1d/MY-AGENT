@@ -201,6 +201,25 @@ TRAFFIC_FP_TTL = float(os.getenv("AGENT_TRAFFIC_FP_TTL", "0"))
 TRAFFIC_TEST_MODE = os.getenv("AGENT_TRAFFIC_TEST_MODE", "") == "1"
 TRAFFIC_TEST_MULTIPLIER = int(os.getenv("AGENT_TRAFFIC_TEST_MULTIPLIER", "50"))
 
+# ---- py_exec 流量治理（v023.2）----
+# 脚本网络访问策略：
+#   safe（默认）——检测到「网络库 + 循环」的脚本直接拒绝，要求改用受控接口；
+#   warn         ——只警告不拒绝（过渡期）；
+#   legacy       ——完全关闭检测与受控通道（仅为排障保留，不推荐）。
+PY_EXEC_NETWORK_POLICY = os.getenv("AGENT_PY_EXEC_NETWORK_POLICY", "safe").strip().lower()
+# 单个脚本经受控通道的最大请求数（超出后 safe_http_request 返回预算错误，
+# 目标暂停则宿主直接终止脚本进程树）
+PY_EXEC_MAX_REQUESTS = int(os.getenv("AGENT_PY_EXEC_MAX_REQUESTS", "20"))
+PY_EXEC_REQUEST_TIMEOUT = float(os.getenv("AGENT_PY_EXEC_REQUEST_TIMEOUT", "25"))
+
+# ---- 扫描器速率治理（v023.2）----
+# 0（默认）= 未声明内部速率能力的工具在启动前显示「流量不可观测」警告但仍可运行；
+# 1 = 严格模式，未声明者直接拒绝自动运行（v023 计划 MUST 项，切到严格需用户确认，
+#     因为会一次性禁用大量可用工具——过渡期用警告模式，声明补齐后再切）
+SCANNER_REQUIRE_DECLARATION = os.getenv("AGENT_SCANNER_REQUIRE_DECLARATION", "0") == "1"
+SCANNER_DEFAULT_RATE = int(os.getenv("AGENT_SCANNER_DEFAULT_RATE", "5"))       # 每秒请求
+SCANNER_DEFAULT_THREADS = int(os.getenv("AGENT_SCANNER_DEFAULT_THREADS", "2"))  # 并发线程
+
 # ---- 远程访问（run.py 拒绝启动 + app/main.py 令牌中间件）----
 ALLOW_REMOTE = os.getenv("ALLOW_REMOTE", "0") == "1"
 ACCESS_TOKEN = os.getenv("SRC_AGENT_TOKEN", "")
