@@ -38,6 +38,12 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+# v023.1：统一流量调度器默认按「保守档」（10 分钟 30 请求）限流——回归套件里
+# 多个 fixture 套件会打到 127.0.0.1 的本地模拟服务，正常量级就会触顶。
+# 测试模式显式放大预算与并发（status 接口会公开该标志，生产不得开启）；
+# 单跑某个套件时也需带上该环境变量：
+#   PowerShell:  $env:AGENT_TRAFFIC_TEST_MODE="1"; python test_diff.py
+os.environ.setdefault("AGENT_TRAFFIC_TEST_MODE", "1")
 
 ROOT = Path(__file__).resolve().parent
 PORT = 8770
@@ -69,6 +75,7 @@ PY_TESTS = [
     ("证据链与复核闸门（v017.4）", "test_evidence_bundle.py", False),
     ("流程绕过检测（v017.5）", "test_flow.py", False),
     ("整改报告修复回归（v022）", "test_022_fixes.py", False),
+    ("统一流量调度（v023.1）", "test_traffic.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

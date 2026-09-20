@@ -30,10 +30,11 @@ _global_last = 0.0
 
 
 async def acquire(key: str, min_interval: float, global_interval: float = 0.0) -> None:
-    """在执行某个出网动作之前调用。
+    """兼容入口（v023.1 起推荐直接用 app/traffic.governor）。
 
-    key 建议传主机名（同一主机共享节流）；min_interval 为该 key 两次动作的最小间隔（秒）；
-    global_interval > 0 时额外限制整机出网动作间隔。
+    保留原因：历史调用点与测试按 (key, min_interval, global_interval) 签名断言。
+    实现仍是本地节流（按 key 串行 + 最小间隔 + 整机闸）——**预算/并发/暂停状态
+    等 v023 能力在 TrafficGovernor 里**，新代码请走 governor.acquire(url, ...)。
     """
     global _global_last
 
