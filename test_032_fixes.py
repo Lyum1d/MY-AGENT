@@ -123,11 +123,11 @@ check("D6 未截断但已落盘时也回传 saved_text_path",
 print()
 print("E. 落盘内容完整可回读")
 print("=" * 68)
-big = "HEAD" + ("m" * 12000) + "TAIL"
+big = ("HEAD" + ("m" * 12000) + "TAIL").encode("utf-8")
 p = pyexec_bridge._dump_full_text("rid032", big)
 check("E1 落盘成功", p is not None)
 if p:
-    back = Path(p).read_text(encoding="utf-8")
+    back = Path(p).read_bytes()
     check("E2 全文逐字节一致（崩溃后可据此找回）", back == big, f"{len(back)} vs {len(big)}")
 
 print()
