@@ -656,11 +656,16 @@ def search_history(project_id: str, keyword: str, limit: int = 8) -> list[dict]:
             d["kind"] = "step"
             text = d.get("output") or ""
             pos = text.find(kw)
+            # v031（第三轮实战）：片段从 220 字符提到 config.SEARCH_SNIPPET_CHARS
+            # （默认 800）。落库版本本身有 8KB（头 4000 + 尾 4000），只回 220 字符
+            # 等于把已经存下来的清单又切掉一刀 —— 实测导致「功能码全集」取不回来，
+            # 模型只能重新向目标发请求（6 次，占全局预算 1/3）。
+            width = config.SEARCH_SNIPPET_CHARS
             if pos >= 0:
-                start = max(0, pos - 120)
-                d["snippet"] = ("…" if start else "") + text[start:pos + 220].strip() + "…"
+                start = max(0, pos - width // 2)
+                d["snippet"] = ("…" if start else "") + text[start:start + width].strip() + "…"
             else:
-                d["snippet"] = text[:220].strip()
+                d["snippet"] = text[:width].strip() + ("…" if len(text) > width else "")
             out.append(d)
 
         for r in c.execute(
@@ -672,8 +677,11 @@ def search_history(project_id: str, keyword: str, limit: int = 8) -> list[dict]:
             d["kind"] = "fact"
             text = d.get("content") or ""
             pos = text.find(kw)
-            start = max(0, pos - 60) if pos >= 0 else 0
-            d["snippet"] = text[start:start + 300].strip()
+            # v031：事实片段同步提到 SEARCH_SNIPPET_CHARS（原 300），
+            # 让「已证事实」类记忆也能被完整回读，而不是只看到一句摘要。
+            width = config.SEARCH_SNIPPET_CHARS
+            start = max(0, pos - width // 4) if pos >= 0 else 0
+            d["snippet"] = text[start:start + width].strip()
             out.append(d)
 
         for r in c.execute(

@@ -55,12 +55,22 @@ SCRIPT_MODULE_SOURCE = '''# -*- coding: utf-8 -*-
 返回字段（成败都是同一个 dict，**先查 error**）：
     status_code : int | None    HTTP 状态码（请求未完成时为 None）
     headers     : dict          响应头（小写键）
-    text        : str           响应正文（超过 65536 字符会截断，
-                                此时另有 truncated=True 与 total_chars）
+    text        : str           响应正文（超过 AGENT_PY_EXEC_TEXT_LIMIT，默认
+                                131072 字符会截断，此时另有 truncated=True、
+                                total_chars 与 saved_text_path）
     error       : str           非空表示请求**没有完成**（超时/被调度拒绝等）
     elapsed     : float         耗时（秒）
     truncated   : bool          正文是否被截断（可选）
     total_chars : int           正文原始长度（被截断时提供）
+    total_bytes : int           正文原始字节数（被截断时提供）
+    saved_text_path : str       **被截断时提供：完整正文的本地文件路径。**
+
+取全文的正确姿势（v031，重要）：
+    看到 truncated=True 时，**不要**为了拿剩下的正文再向目标发请求
+    （Range 分片会额外消耗目标流量与预算）。直接读落盘文件：
+        if r.get("truncated"):
+            full = open(r["saved_text_path"], encoding="utf-8").read()
+    该文件与 tmpdir() 同目录，本次会话内稳定可读。
 
 判空纪律（重要）：
     不要用「text 为空」推断目标返回空内容——必须先看 error 与 status_code。
@@ -144,7 +154,8 @@ def safe_http_request(url, method="GET", headers=None, cookies=None,
                       body="", timeout=25):
     """受控 HTTP 请求（同步）。返回 Resp（dict 子类，属性/下标访问均可）：
 
-        status_code / headers / text / error / elapsed [truncated, total_chars]
+        status_code / headers / text / error / elapsed
+        [truncated, total_chars, total_bytes, saved_text_path]
 
     **先查 error**：error 非空表示请求未完成（超时/被调度拒绝/目标暂停），
     此时不要用 text 判空。字段名写错会抛 AttributeError（列出可用字段），
@@ -317,19 +328,36 @@ class ScriptBridge:
                                       bytes_in=len(r.content))
         # v023.6（实战反馈）：截断必须显式告知——否则脚本以为自己拿到了完整
         # 响应体，可能漏掉位于页尾的关键证据（实战中 serverPath 就在 64KB 之后）。
+        # v031（第三轮实战）：光是「告知」不够，还得**给得出全文**。原实现硬截断
+        # 65536 且无任何取回途径，脚本只能改用 Range 头再打一次目标（实测门户页
+        # 110762 字节被截掉 40%，直接导致「首页无外链 JS」的错误判定）。现在：
+        # ① 上限提高到 config.PY_EXEC_TEXT_LIMIT（默认 128KB，覆盖常见门户页）；
+        # ② 仍超限时把**完整正文落盘**并回 saved_text_path，脚本离线读取即可，
+        #    0 次额外目标请求。
         full_len = len(r.content)
         text = r.text
+        limit = config.PY_EXEC_TEXT_LIMIT
         resp = {"status_code": r.status_code,
                 "headers": {k: v for k, v in list(r.headers.items())[:20]},
-                "text": text[:65536],
+                "text": text[:limit],
                 "elapsed": round(time.monotonic() - t0, 3)}
-        if len(text) > 65536:
+        if len(text) > limit:
             resp["truncated"] = True
             resp["total_chars"] = len(text)
-            resp["truncation_note"] = (
-                f"响应体已截断：仅返回前 65536 字符（原始 {len(text)} 字符，"
-                f"{full_len} 字节）。如需页尾内容，请用 Range 头分片获取，"
-                "或把响应保存到本地文件后离线解析。")
+            resp["total_bytes"] = full_len
+            saved = _dump_full_text(rid, text)
+            if saved is not None:
+                resp["saved_text_path"] = str(saved)
+                resp["truncation_note"] = (
+                    f"响应体已截断：text 只含前 {limit} 字符（原始 {len(text)} 字符 / "
+                    f"{full_len} 字节）。**完整正文已落盘**，用 "
+                    "open(r['saved_text_path'], encoding='utf-8').read() 取全文即可 —— "
+                    "不要为了拿正文再向目标发请求（Range 分片会额外消耗目标流量）。")
+            else:
+                resp["truncation_note"] = (
+                    f"响应体已截断：仅返回前 {limit} 字符（原始 {len(text)} 字符 / "
+                    f"{full_len} 字节），且完整正文落盘失败。"
+                    "如需页尾内容，请用 Range 头分片获取。")
 
         await self._write_resp(rid, resp)
 
@@ -344,6 +372,28 @@ class ScriptBridge:
 
     def stop(self) -> None:
         self._stop.set()
+
+
+def _dump_full_text(rid: str, text: str) -> Path | None:
+    """把被截断的完整正文落盘到**会话级持久目录**（与脚本侧 `tmpdir()` 同一目录）。
+
+    为什么落盘而不是继续抬高上限：正文可能有数 MB，直接塞进桥接 JSON 既拖慢
+    文件轮询、又会顺带撑爆模型上下文。落盘 + 回路径让脚本「按需读全文」，
+    代价是 0 次额外目标请求 —— 这正是 v031 要解决的预算浪费。
+
+    目录口径必须与 `pyexec.persist_dir_for()` 保持一致（两处都取自
+    `config.PY_EXEC_TMP_ROOT`），否则脚本拿 `tmpdir()` 找不到文件。
+    """
+    try:
+        day = time.strftime("%Y%m%d")
+        d = Path(config.PY_EXEC_TMP_ROOT) / "persist" / day
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"resp_{rid}.txt"
+        p.write_text(text, encoding="utf-8")
+        return p
+    except OSError:
+        logger.debug("完整正文落盘失败", exc_info=True)
+        return None
 
 
 def detect_direct_network(code: str) -> dict:

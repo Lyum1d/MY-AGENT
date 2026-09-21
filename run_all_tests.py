@@ -84,6 +84,7 @@ PY_TESTS = [
     ("实战缺陷修复·第二批（v023.6）", "test_023_fixes2.py", False),
     ("受控脚本接口可用性（v023.7）", "test_023_fixes3.py", False),
     ("事实自动注入（v023.7）", "test_023_fixes4.py", False),
+    ("证据可取回性·截断落盘与检索片段（v031）", "test_031_fixes.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),
