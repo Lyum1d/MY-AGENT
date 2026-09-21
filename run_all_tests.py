@@ -89,6 +89,7 @@ PY_TESTS = [
     ("落盘换行污染修复·原始字节与同口径（v033）", "test_033_fixes.py", False),
     ("口径一致性·rb读法与短响应元数据（v034）", "test_034_fixes.py", False),
     ("公益SRC合规纪律与落盘数据即清（v035）", "test_035_fixes.py", False),
+    ("漏洞类型专项纪律与报告合规（v036）", "test_036_fixes.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

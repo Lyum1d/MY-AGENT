@@ -43,6 +43,21 @@ async def _cleanup_stale_persist_dirs() -> None:
     except Exception:
         logger.warning("清理过期落盘目录失败", exc_info=True)
 
+
+@app.post("/api/maintenance/cleanup-persist")
+async def cleanup_persist(keep_days: int | None = None):
+    """手动清理技术分析的落盘文件（v036 合规：测试完毕后立即清理）。
+
+    `AGENT_PY_EXEC_PERSIST_KEEP_DAYS` 默认 1 天，启动钩子只清「过期分桶」。
+    公益 SRC 另有「测试完毕后，已删除测试记录及产生的测试数据」的要求，因此提供
+    本接口供任务结束时**立即**清理：`keep_days=0` 表示全部清掉（含当天）。
+    """
+    from . import pyexec
+    days = config.PY_EXEC_PERSIST_KEEP_DAYS if keep_days is None else keep_days
+    n = pyexec.cleanup_persist_dirs(days)
+    logger.info("手动清理落盘文件：移除 %d 个分桶（keep_days=%s）", n, days)
+    return {"ok": True, "removed": n, "keep_days": days}
+
 logger = logging.getLogger(__name__)
 
 registry.load()
