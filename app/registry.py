@@ -304,6 +304,15 @@ class ToolRegistry:
                                "须用户确认并勾选书面授权",
                 "caveat": "target 填当前授权目标（仅用于留档归类）；args 填完整 Python 代码（多行）。"
                           "代码内 HTTP 请求只允许发往当前授权目标及其资产，禁止扫描/访问未授权主机或内网。"
+                          "**必读（v023.7）**：①脚本内发请求请用受控接口 "
+                          "`from srcagent import safe_http_request`（返回 dict，同时支持 "
+                          "`r[\"status_code\"]` 与 `r.status_code`；**先查 `r[\"error\"]` 判成败**，"
+                          "不要用 text 是否为空推断目标内容）；②不要写 `import httpx/requests/urllib` "
+                          "的循环发包脚本（会被拒绝执行）；③需要「上一步取数、下一步解析」时用 "
+                          "`from srcagent import tmpdir` 拿会话级持久目录落盘，"
+                          "**不要写 /tmp 或其它系统绝对路径**（本机 /tmp 会落到 C:\\tmp，不受管控）；"
+                          "④不确定接口用法时先 `print(safe_http_request.__doc__)` 再发请求，"
+                          "省一次目标流量。"
                           "每段代码保持小且聚焦（<30 行），超时就拆小重试，禁止在代码里 sleep 空转。"
                           "依赖仅限标准库与已装包（httpx/pydantic 等），需要其他包用 urllib 或说明原因。",
                 "executable": "builtin://py_exec",

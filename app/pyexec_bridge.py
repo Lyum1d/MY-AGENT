@@ -46,10 +46,33 @@ RESP_DIR = "resp"
 SCRIPT_MODULE_SOURCE = '''# -*- coding: utf-8 -*-
 """src-agent 受控网络接口（由宿主自动注入，勿手工修改）。
 
-用法：
+用法（**返回 dict 字段表见下，属性访问与下标访问都支持**）：
     from srcagent import safe_http_request
     r = safe_http_request("https://authorized.example/api", method="GET")
-    print(r["status_code"], r["text"][:200])
+    print(r["status_code"], r["text"][:200])     # 下标访问
+    print(r.status_code, r.headers)              # 属性访问（等价）
+
+返回字段（成败都是同一个 dict，**先查 error**）：
+    status_code : int | None    HTTP 状态码（请求未完成时为 None）
+    headers     : dict          响应头（小写键）
+    text        : str           响应正文（超过 65536 字符会截断，
+                                此时另有 truncated=True 与 total_chars）
+    error       : str           非空表示请求**没有完成**（超时/被调度拒绝等）
+    elapsed     : float         耗时（秒）
+    truncated   : bool          正文是否被截断（可选）
+    total_chars : int           正文原始长度（被截断时提供）
+
+判空纪律（重要）：
+    不要用「text 为空」推断目标返回空内容——必须先看 error 与 status_code。
+    访问不存在的字段会直接抛 AttributeError 并列出可用字段，
+    因此**不会**出现"属性名写错却静默拿到空值"的假阴性。
+
+跨脚本交换数据：
+    用 `from srcagent import tmpdir` 拿到**会话级持久目录**（多次 py_exec 之间
+    保持稳定），不要写 `/tmp` 或其它系统绝对路径（本机沙箱的 TEMP 是一次性的，
+    且写系统盘不受管控、不会清理）。
+        from srcagent import tmpdir
+        open(os.path.join(tmpdir(), "page.html"), "w", encoding="utf-8").write(r["text"])
 
 所有请求都由宿主进程的流量调度器发出：scope 白名单、滑动窗口预算、
 目标并发与暂停状态全部生效。脚本自身的循环不会绕过这些限制——
@@ -65,10 +88,73 @@ _REQ = _os.path.join(_BRIDGE, "req")
 _RESP = _os.path.join(_BRIDGE, "resp")
 
 
+class Resp(dict):
+    """响应对象：同时支持下标与属性访问。
+
+    为什么需要它：模型（和人）很容易把返回的 dict 当成响应对象来用
+    （写 `r.status_code` 而实际只有 `r["status_code"]`）。旧实现下这种误用
+    **不会报错**，只是静默返回空值——实测导致 3 次真实请求被误读成
+    「目标返回空内容」，差点写进结论。这里让属性访问等价于下标访问，
+    字段不存在时直接抛 AttributeError（并列出可用字段），把静默错误变成显式错误。
+    """
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(
+                "响应对象没有字段 %r。可用字段：%s" % (name, ", ".join(sorted(self.keys())))
+            ) from None
+
+    def __bool__(self):
+        # 空 dict 仍按 dict 语义（False）；这里显式写出避免误解
+        return bool(dict(self))
+
+
+def tmpdir():
+    """返回**会话级持久目录**（跨多次 py_exec 调用保持稳定，自动创建）。
+
+    用途：把大响应落盘后离线解析（避免灌进上下文），或在上一步取数、
+    下一步解析。宿主会在会话结束后按保留期清理。
+    """
+    d = _os.environ.get("SRC_AGENT_TMPDIR")
+    if not d:
+        d = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "script_tmp")
+    try:
+        _os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _wrap(data):
+    """包装宿主响应：加属性访问 + 空响应显式告警。"""
+    try:
+        r = Resp(data or {})
+    except (TypeError, ValueError):
+        return Resp({"error": "宿主响应格式异常", "raw": repr(data)[:200]})
+    if not r.get("error") and not r.get("status_code"):
+        # 宿主没报错、也没有状态码 → 这不是「目标返回空」，而是响应本身缺失
+        r["warning"] = ("宿主返回的响应缺少 status_code 与 error："
+                        "请勿据此判断目标内容为空；请检查调用参数或改用受控接口")
+    return r
+
+
 def safe_http_request(url, method="GET", headers=None, cookies=None,
                       body="", timeout=25):
-    """受控 HTTP 请求（同步）。返回 dict：
-    {status_code, headers, text, error, elapsed}。error 非空表示请求未完成。
+    """受控 HTTP 请求（同步）。返回 Resp（dict 子类，属性/下标访问均可）：
+
+        status_code / headers / text / error / elapsed [truncated, total_chars]
+
+    **先查 error**：error 非空表示请求未完成（超时/被调度拒绝/目标暂停），
+    此时不要用 text 判空。字段名写错会抛 AttributeError（列出可用字段），
+    不会静默返回空值。示例：
+
+        r = safe_http_request("https://目标/接口")
+        if r["error"]:
+            print("未完成：", r["error"], r.get("hint", ""))
+        else:
+            print(r.status_code, len(r.text), r.headers.get("content-type"))
     """
     rid = _uuid.uuid4().hex[:12]
     payload = {
@@ -94,10 +180,10 @@ def safe_http_request(url, method="GET", headers=None, cookies=None,
                 _os.remove(resp_path)
             except OSError:
                 pass
-            return data
+            return _wrap(data)
         _time.sleep(0.1)
-    return {"error": "TIMEOUT_WAITING_HOST_BRIDGE",
-            "hint": "宿主未在超时内响应；目标可能已暂停或预算耗尽"}
+    return _wrap({"error": "TIMEOUT_WAITING_HOST_BRIDGE",
+                  "hint": "宿主未在超时内响应；目标可能已暂停或预算耗尽"})
 
 
 def get(url, **kw):

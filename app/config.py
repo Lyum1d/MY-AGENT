@@ -226,6 +226,13 @@ SCANNER_DEFAULT_THREADS = int(os.getenv("AGENT_SCANNER_DEFAULT_THREADS", "2"))  
 # v023.4 拆分背压：目标剩余预算低于该值时拒绝 split_task 并发拆分
 SUBTASK_MIN_BUDGET = int(os.getenv("AGENT_SUBTASK_MIN_BUDGET", "6"))
 
+# v023.7：项目「已证实事实」自动注入（每轮提醒里带上，供后续线索复用）。
+# 背景（shhxqh 第二轮实战）：第一轮的已证实事实（后端入口、免权限控制器…）
+# 只能靠人工写进任务书复述给模型，否则模型会重新发现甚至重复验证。
+INJECT_FACTS = os.getenv("AGENT_INJECT_FACTS", "1") == "1"
+INJECT_FACTS_MAX = int(os.getenv("AGENT_INJECT_FACTS_MAX", "10"))       # 最多注入条数
+INJECT_FACTS_CHARS = int(os.getenv("AGENT_INJECT_FACTS_CHARS", "240"))  # 单条截断
+
 # ---- 远程访问（run.py 拒绝启动 + app/main.py 令牌中间件）----
 ALLOW_REMOTE = os.getenv("ALLOW_REMOTE", "0") == "1"
 ACCESS_TOKEN = os.getenv("SRC_AGENT_TOKEN", "")

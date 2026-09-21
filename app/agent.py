@@ -240,6 +240,42 @@ def _budget_note(budget: dict) -> str:
     return head + "预算充足，按最优顺序推进即可。"
 
 
+def _facts_note(session) -> str:
+    """v023.7：把项目**已证实事实**注入每轮上下文，供跨线索复用。
+
+    为什么必须有（shhxqh 实战）：第一轮已证实的事实（CMS 后端入口、免权限
+    控制器可达…）在第二轮只能靠**人工写进任务书**复述——平台不注入，模型要么
+    重新发现（浪费预算与流量），要么在压缩后彻底失忆。这里把 verified 事实
+    自动带上，candidate（未经确认）不注入，避免把猜测当既定前提。
+    """
+    if not config.INJECT_FACTS or not getattr(session, "project", ""):
+        return ""
+    try:
+        facts = store.list_facts(session.project)
+    except Exception:
+        logger.debug("注入事实失败", exc_info=True)
+        return ""
+    if not facts:
+        return ""
+    verified = [f for f in facts if (f.get("status") or "") == "verified"]
+    if not verified:
+        return ""
+    # 最近的在前（list_facts 已按时间倒序），限制条数与单条长度
+    items = verified[: config.INJECT_FACTS_MAX]
+    lines = []
+    for f in items:
+        c = (f.get("content") or "").strip().replace("\n", " ")
+        if not c:
+            continue
+        lines.append(f"- {c[:config.INJECT_FACTS_CHARS]}")
+    if not lines:
+        return ""
+    more = len(verified) - len(items)
+    tail = f"（另有 {more} 条见项目事实库）" if more > 0 else ""
+    return ("\n\n【项目已证实事实（前序线索产出，可直接采信，**不要重复验证**）】\n"
+            + "\n".join(lines) + tail)
+
+
 def _traffic_note(target: str) -> str:
     """v023.4 目标流量预算提示：把「目标还剩多少请求额度、是否被防护拦截」
     写进上下文。
@@ -1918,6 +1954,11 @@ class Agent:
                 f"\n\n【本次任务目标：{session.target}】\n{note}"
                 f"不要向用户索要目标，也不要把说明文字填进 target。"
             )
+        # v023.7：项目已证实事实注入（放在目标之后——模型先知道「打哪」，
+        # 再看到「已经确认过什么」，避免把预算重复花在已证实的结论上）
+        fnote = _facts_note(session)
+        if fnote:
+            parts.append(fnote)
         if session.steps:
             tried: dict[str, list[str]] = {}
             for st in session.steps:
