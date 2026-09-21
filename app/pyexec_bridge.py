@@ -73,16 +73,25 @@ SCRIPT_MODULE_SOURCE = '''# -*- coding: utf-8 -*-
     该文件与 tmpdir() 同目录，本次会话内稳定可读。
 
 判空纪律（重要）：
-    不要用「text 为空」推断目标返回空内容——必须先看 error 与 status_code。
-    访问不存在的字段会直接抛 AttributeError 并列出可用字段，
-    因此**不会**出现"属性名写错却静默拿到空值"的假阴性。
+    `error` **恒存在**（成功时为空串），所以 `if r["error"]:` 永远安全 —— 不会再
+    出现「文档教你查 error、成功路径却抛 KeyError」的崩溃（v032 修的就是这条）。
+    但**不要**用「text 为空」推断目标返回空内容：必须先看 error 与 status_code。
+    访问其它不存在的字段会抛 AttributeError 并列出可用字段，
+    因此不会出现"属性名写错却静默拿到空值"的假阴性。
 
 跨脚本交换数据：
-    用 `from srcagent import tmpdir` 拿到**会话级持久目录**（多次 py_exec 之间
-    保持稳定），不要写 `/tmp` 或其它系统绝对路径（本机沙箱的 TEMP 是一次性的，
-    且写系统盘不受管控、不会清理）。
-        from srcagent import tmpdir
-        open(os.path.join(tmpdir(), "page.html"), "w", encoding="utf-8").write(r["text"])
+    用 `from srcagent import tmpdir`（**是函数，要加括号**）或 `TMPDIR`（**是常量，
+    直接当路径用**）拿到**会话级持久目录**（多次 py_exec 之间保持稳定）。不要写
+    `/tmp` 或其它系统绝对路径（本机沙箱的 TEMP 是一次性的，且写系统盘不受管控、
+    不会清理）。两种写法示例：
+        from srcagent import TMPDIR      # 常量：os.path.join(TMPDIR, "a.txt")
+        from srcagent import tmpdir      # 函数：os.path.join(tmpdir(), "a.txt")
+        open(os.path.join(TMPDIR, "page.html"), "w", encoding="utf-8").write(r["text"])
+
+大响应与脚本崩溃（v032）：
+    正文达到阈值（默认 8192 字符）就会**自动落盘**，响应里给出 `saved_text_path`。
+    这意味着即使脚本随后崩溃，已取回的正文仍留在磁盘上、可按路径找回 ——
+    **不要**为了重取内容再向目标发一次请求（那会白白消耗目标流量与预算）。
 
 所有请求都由宿主进程的流量调度器发出：scope 白名单、滑动窗口预算、
 目标并发与暂停状态全部生效。脚本自身的循环不会绕过这些限制——
@@ -137,15 +146,30 @@ def tmpdir():
     return d
 
 
+# v032（第四轮实战）：再导出一个**常量**形式的持久目录路径。
+# 实测踩坑：`from srcagent import tmpdir` 之后写成 `os.path.join(tmpdir, "x")`
+# 会抛 TypeError（tmpdir 是函数而非路径），白耗一步。给一个显然是路径的名字，
+# 两种用法都能work：tmpdir() 取值、TMPDIR 直接用。
+TMPDIR = tmpdir()
+
+
 def _wrap(data):
-    """包装宿主响应：加属性访问 + 空响应显式告警。"""
+    """包装宿主响应：加属性访问 + 空响应显式告警。
+
+    v032（第四轮实战）：**总是补齐 `error` 键**（默认空串）。
+    原实现只在失败时才有 `error`，于是文档推荐的 `if r["error"]:` 在成功路径上
+    直接抛 `KeyError: 'error'` —— 实测让脚本崩了两次、白烧 2 次真实目标请求。
+    「恒存在的键」比「按需出现的键」更不容易误用；判断失败仍应优先看 `error`
+    或 `status_code`，但**不会再因为键不存在而崩**。
+    """
     try:
         r = Resp(data or {})
     except (TypeError, ValueError):
         return Resp({"error": "宿主响应格式异常", "raw": repr(data)[:200]})
+    r.setdefault("error", "")
     if not r.get("error") and not r.get("status_code"):
         # 宿主没报错、也没有状态码 → 这不是「目标返回空」，而是响应本身缺失
-        r["warning"] = ("宿主返回的响应缺少 status_code 与 error："
+        r["warning"] = ("宿主返回的响应缺少 status_code："
                         "请勿据此判断目标内容为空；请检查调用参数或改用受控接口")
     return r
 
@@ -158,8 +182,8 @@ def safe_http_request(url, method="GET", headers=None, cookies=None,
         [truncated, total_chars, total_bytes, saved_text_path]
 
     **先查 error**：error 非空表示请求未完成（超时/被调度拒绝/目标暂停），
-    此时不要用 text 判空。字段名写错会抛 AttributeError（列出可用字段），
-    不会静默返回空值。示例：
+    此时不要用 text 判空。**error 恒存在**（成功时为空串），可直接 `if r["error"]:`。
+    字段名写错会抛 AttributeError（列出可用字段），不会静默返回空值。示例：
 
         r = safe_http_request("https://目标/接口")
         if r["error"]:
@@ -341,11 +365,21 @@ class ScriptBridge:
                 "headers": {k: v for k, v in list(r.headers.items())[:20]},
                 "text": text[:limit],
                 "elapsed": round(time.monotonic() - t0, 3)}
+        # v032（第四轮实战）：**大响应一律落盘**，不再只在截断时落。
+        # 理由：脚本崩溃时内存里的 Resp 会连同已成功取回的正文一起丢失 —— 实测
+        # 同一路径被迫重请（既违反「不重复请求」纪律，又白烧目标请求）。落盘后
+        # 即使脚本挂了，正文仍留在磁盘上，脚本可按 tmpdir()/TMPDIR 找回。
+        saved = None
+        if len(text) >= config.PY_EXEC_SAVE_THRESHOLD:
+            saved = _dump_full_text(rid, text)
+            if saved is not None:
+                resp["saved_text_path"] = str(saved)
+                resp["total_chars"] = len(text)
+                resp["total_bytes"] = full_len
         if len(text) > limit:
             resp["truncated"] = True
             resp["total_chars"] = len(text)
             resp["total_bytes"] = full_len
-            saved = _dump_full_text(rid, text)
             if saved is not None:
                 resp["saved_text_path"] = str(saved)
                 resp["truncation_note"] = (

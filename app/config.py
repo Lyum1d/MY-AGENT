@@ -141,6 +141,10 @@ SEARCH_SNIPPET_CHARS = int(os.getenv("AGENT_SEARCH_SNIPPET_CHARS", "800"))
 # 2 次目标请求）。现改为：上限提高到 128KB（覆盖常见门户页），仍超限时把**完整
 # 正文落盘**并回 saved_text_path，脚本可用 tmpdir() 离线读取，不必再打目标。
 PY_EXEC_TEXT_LIMIT = int(os.getenv("AGENT_PY_EXEC_TEXT_LIMIT", "131072"))
+# v032（第四轮实战）：正文达到该阈值就**无条件落盘**，不再只在截断时落。
+# 原因：脚本崩溃时内存里的 Resp 会连同已成功取回的正文一起丢失 → 同一路径被迫
+# 重请，实测白烧 2 次真实目标请求（违反「不重复请求」纪律）。落盘后正文可找回。
+PY_EXEC_SAVE_THRESHOLD = int(os.getenv("AGENT_PY_EXEC_SAVE_THRESHOLD", "8192"))
 
 # ---------- 记忆注入上限 ----------
 # 超过上限的条目会在注入块尾部写明「另有 N 条未展示」，不再是无声截断 ——
