@@ -193,7 +193,16 @@
       "-H",
       "-o"
     ],
-    "target_type": "url"
+    "target_type": "url",
+    "network_control": {
+      "declared": true,
+      "supports_rate": true,
+      "supports_concurrency": true,
+      "rate_flags": ["--max-rate"],
+      "concurrency_flags": ["-t"],
+      "traffic_class": "medium"
+    },
+    "_v038说明": "补天公益 SRC 明确允许「敏感目录扫描」为轻量测试。dirsearch 本身是 L1（目录探测、无破坏性），此前缺 network_control 声明会带「速率未声明」警告运行，容易让模型误判为越界而不跑 —— 这里补齐：限速用 --max-rate、并发用 -t。"
   },
   "tidefinger": {
     "disabled": true,
