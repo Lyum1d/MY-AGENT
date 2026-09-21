@@ -82,6 +82,31 @@
 | **禅道 / Jira** | 页面「ZenTao」/「Atlassian Jira」 | `/zentao/`、`/login.jsp`、`/secure/Dashboard.jspa` | 禅道历史 SQL 注入，**只验证状态码** |
 | **图书馆系统** | 页面「汇文」/「Folio」/「Interlib」 | `/opac/`、`/opac/search` | — |
 | **VPN / 网关** | 页面含 `Sangfor` / `iNode` / `Juniper` / `EasyConnect` | `/por/login_psw.csp`、`/dana-na/` | 记录型号与版本即可，**禁口令尝试** |
+| **联奕科技 认证平台**（lyuap） | 标题「统一身份认证平台」/「微服务认证管理平台」；路径 `/lyuapServer/`；TAG `lyasp`；页脚 `LIANYI TECHNOLOGY` | `/lyuapServer/login`、`/api/uap/unauthorize/pageInfo`、前端包 `assets/js/app.<hash>.js`；常伴生 `:4102`「安全中心」 | ⚠️ **前端包是重点**：实测该校前端 `app_config_names` 模块里**明文发布了 RSA 私钥**（`private_exponent` + `modulus` + `public_exponent`）。拿到前端包先 grep `private_exponent` |
+
+### ⭐ 已知泄露模式速查（**按产品直接定位"通常泄在哪"**）
+
+> 这张表比路径表更值钱：它把「该看什么」直接对应到「**历史上真的泄过什么**」。
+> 全部为只读验证点，**不涉及任何提交/口令动作**。
+
+| 产品 | 已知泄露模式（只读可验证） |
+| --- | --- |
+| **联奕 lyuap / lyasp**（认证平台） | ① 前端 JS 包内**明文 RSA 私钥指数**（`private_exponent`）；② `/api/uap/unauthorize/pageInfo` 未授权即可读；③ 常伴生 `:4102` 安全中心（**注意核对是否与主站共用同一 `modulus`**） |
+| **RainLoop** | `/?/Admin/` 管理面板入口可达；`/data/` 历史高危（**403/404 即已防护**）；版本号明文于 `rainloop/v/<版本>/` |
+| **KodExplorer / 可道云** | `/data/`（用户配置与会话，**403/404 即已防护**）；`/?user/checkCode` 等未授权接口 |
+| **TRS SiteBuilder 9** | 首页注释泄露 `CustomerNO:` 与 `Announced by Visual Site Builder 9`；404 双模板差分（应用层 vs Web 服务器原生） |
+| **Spring Boot Actuator** | `/actuator/env`、`/actuator/heapdump` 未授权可读即高危（**只验证状态码，不读内容**） |
+| **Swagger / Knife4j** | 区分「文档外壳可达」与「`/v2/api-docs` 接口定义可读」——**前者低危，后者严重** |
+
+### 🔑 跨资产密钥比对该怎么做（v042 固化为标准动作）
+
+拿到任何**密钥材料**（RSA `modulus`、token、AK/SK、Cookie 签名密钥）时，**多花一步做跨资产比对**：
+抽出该材料做 hash/前缀比对，看**同一目标的其他资产是否共用同一把**。
+**命中即升严重度** —— 实测（lsnu 第四轮）：正因比对发现 `rz` 主站与 `:4102` **共用同一 modulus**，
+而 `:4102` 只有公钥、主站却多了私钥，才把结论从「单点字符串可疑」**钉成「打包误发私钥、影响全部接入系统」**。
+
+**配套纪律**：拿到候选密钥后，**先在本地零出网验证其功能可用性**（如 RSA 验 `pow(pow(m,e,n),d,n)==m`），
+再决定是否需要申请更高风险等级的验证动作 —— 本轮靠这一条零请求即完成了定级跃升。
 
 ### ⭐ 指纹名 → 索引小节 的对照（**机械映射，别靠人工读表**）
 

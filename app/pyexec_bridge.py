@@ -389,7 +389,12 @@ class ScriptBridge:
                 # 本通道 `follow_redirects=False`，故 `final_url` 即请求 URL，
                 # 跳转目标请看 `location`（响应头 Location）。
                 "final_url": str(r.url),
-                "location": r.headers.get("location", "")}
+                "location": r.headers.get("location", ""),
+                # v042（lsnu 第四轮反馈）：`truncated` **恒存在**（未截断时为 False）。
+                # 原实现只在被截断时才加这个键，于是脚本不主动检查时**根本不知道有这回事** ——
+                # 实测出现在 128KB 截断的 JS 包上「靠长度巧合才发现」的情况，存在假阴性风险。
+                # 与 v032 给 `error` 补默认值同源：**恒存在的键比按需出现的键更不容易误用**。
+                "truncated": False}
         # v032（第四轮实战）：**大响应一律落盘**，不再只在截断时落。
         # 理由：脚本崩溃时内存里的 Resp 会连同已成功取回的正文一起丢失 —— 实测
         # 同一路径被迫重请（既违反「不重复请求」纪律，又白烧目标请求）。落盘后
