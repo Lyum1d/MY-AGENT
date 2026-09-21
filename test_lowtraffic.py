@@ -111,8 +111,11 @@ from app import agent as agent_mod                       # noqa: E402
 from app.agent import _traffic_note                      # noqa: E402
 traffic.governor.reset()
 # 目标处于防护状态 → 提示里必须明确「停止自动请求」
-traffic.governor.note_signal("127.0.0.1", traffic.wafsignal.SIG_NET_REFUSED)
-traffic.governor.note_signal("127.0.0.1", traffic.wafsignal.SIG_NET_REFUSED)
+# v040：改用**超时**构造 BLOCKED —— REFUSED 已不再触发熔断（属"TCP 层未建链"，
+# 多为端口未监听/协议选错，不应被当作目标封禁）
+traffic.governor.note_signal("127.0.0.1", traffic.wafsignal.SIG_NET_TIMEOUT)
+traffic.governor.note_signal("127.0.0.1", traffic.wafsignal.SIG_NET_TIMEOUT)
+traffic.governor.note_signal("127.0.0.1", traffic.wafsignal.SIG_NET_TIMEOUT)
 note_blocked = _traffic_note("127.0.0.1")
 check("防护状态注入提示（含状态名与停手指令）",
       "BLOCKED" in note_blocked and "不要换参数" in note_blocked, note_blocked[:120])
