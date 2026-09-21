@@ -144,7 +144,10 @@ PY_EXEC_TEXT_LIMIT = int(os.getenv("AGENT_PY_EXEC_TEXT_LIMIT", "131072"))
 # v032（第四轮实战）：正文达到该阈值就**无条件落盘**，不再只在截断时落。
 # 原因：脚本崩溃时内存里的 Resp 会连同已成功取回的正文一起丢失 → 同一路径被迫
 # 重请，实测白烧 2 次真实目标请求（违反「不重复请求」纪律）。落盘后正文可找回。
-PY_EXEC_SAVE_THRESHOLD = int(os.getenv("AGENT_PY_EXEC_SAVE_THRESHOLD", "8192"))
+# v034（第六轮实战）：8192 偏高 —— 实测 7692 字节的 common.js 因低于阈值未落盘，
+# 脚本崩溃后只能重取。降到 1024：覆盖「可能有取证价值」的响应，同时跳过 141 字节
+# 量级的 404 空页（那类内容在 r.text 里已完整，落盘无价值）。
+PY_EXEC_SAVE_THRESHOLD = int(os.getenv("AGENT_PY_EXEC_SAVE_THRESHOLD", "1024"))
 
 # ---------- 记忆注入上限 ----------
 # 超过上限的条目会在注入块尾部写明「另有 N 条未展示」，不再是无声截断 ——
