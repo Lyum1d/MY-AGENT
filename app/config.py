@@ -124,8 +124,23 @@ RESTORE_CHAT_CHARS = int(os.getenv("AGENT_RESTORE_CHAT_CHARS", "1200"))  # 单�
 # 此前只存尾部（output[-2000:]），导致工具开头的关键结果（命中统计、存活清单首页）
 # 永久丢失，而上下文压缩又提示模型「可用 search_history 检索」——提示与事实不符。
 # 改为头 + 尾都保留，中间以省略标记连接。
-STEP_OUTPUT_HEAD = int(os.getenv("AGENT_STEP_OUTPUT_HEAD", "1500"))
-STEP_OUTPUT_TAIL = int(os.getenv("AGENT_STEP_OUTPUT_TAIL", "2000"))
+# v031（第三轮 shhxqh 实战）：1500/2000 依然不够 —— 功能码全集、存活清单这类**中段**
+# 结果仍落进省略区，模型只能重新向目标发请求回捞（实测 6 次，占全局预算 1/3）。
+# 提到 4000/4000：单步落库上限 8KB，steps 表膨胀可控，换取「落库版本≈可用版本」。
+STEP_OUTPUT_HEAD = int(os.getenv("AGENT_STEP_OUTPUT_HEAD", "4000"))
+STEP_OUTPUT_TAIL = int(os.getenv("AGENT_STEP_OUTPUT_TAIL", "4000"))
+
+# ---------- 历史检索回传（v031） ----------
+# 原实现只回 220/300 字符片段，即使落库版本有 8KB 也拿不到中段清单。
+# 提高片段长度，让 search_history 真正能替代「重新向目标取数」。
+SEARCH_SNIPPET_CHARS = int(os.getenv("AGENT_SEARCH_SNIPPET_CHARS", "800"))
+
+# ---------- 受控脚本接口正文上限与落盘（v031） ----------
+# 原实现：text 硬截断 65536，且**无法取回完整正文** —— 脚本只能改用 Range 头再发
+# 请求（实测门户页 110762 字节被截掉 40%，导致「首页无外链 JS」的错误判定，多耗
+# 2 次目标请求）。现改为：上限提高到 128KB（覆盖常见门户页），仍超限时把**完整
+# 正文落盘**并回 saved_text_path，脚本可用 tmpdir() 离线读取，不必再打目标。
+PY_EXEC_TEXT_LIMIT = int(os.getenv("AGENT_PY_EXEC_TEXT_LIMIT", "131072"))
 
 # ---------- 记忆注入上限 ----------
 # 超过上限的条目会在注入块尾部写明「另有 N 条未展示」，不再是无声截断 ——
