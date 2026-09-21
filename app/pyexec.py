@@ -81,8 +81,15 @@ def persist_dir_for(workdir: str | Path) -> Path:
     return Path(config.PY_EXEC_TMP_ROOT) / "persist" / day
 
 
-def cleanup_persist_dirs(keep_days: int = 3) -> int:
-    """清理过期的持久脚本目录（按天分桶，保留最近 keep_days 天）。"""
+def cleanup_persist_dirs(keep_days: int | None = None) -> int:
+    """清理过期的持久脚本目录（按天分桶，保留最近 keep_days 天）。
+
+    v035：默认保留期改从 config 取（`AGENT_PY_EXEC_PERSIST_KEEP_DAYS`，默认 1 天）。
+    公益 SRC 要求「测试过程中获取的数据用完即清」—— 这些目录里存的是**响应正文副本**，
+    不能长期留存。调用点见 main.py 的启动钩子（此前本函数**从未被调用**）。
+    """
+    if keep_days is None:
+        keep_days = config.PY_EXEC_PERSIST_KEEP_DAYS
     root = Path(config.PY_EXEC_TMP_ROOT) / "persist"
     if not root.exists():
         return 0

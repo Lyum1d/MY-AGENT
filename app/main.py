@@ -26,6 +26,23 @@ from .registry import registry
 
 app = FastAPI(title="SRC 渗透 Agent", version="0.1.0")
 
+
+@app.on_event("startup")
+async def _cleanup_stale_persist_dirs() -> None:
+    """启动时清理过期的落盘文件（v035 合规要求：测试数据用完即清）。
+
+    修复点：`cleanup_persist_dirs()` 此前**从未被任何地方调用** —— 而落盘文件里存的
+    是响应正文副本，会永久留在磁盘上，与公益 SRC「严禁保存测试过程中获取的任何数据」
+    直接冲突。保留期由 AGENT_PY_EXEC_PERSIST_KEEP_DAYS 控制（默认只留 1 天）。
+    """
+    try:
+        from . import pyexec
+        n = pyexec.cleanup_persist_dirs(config.PY_EXEC_PERSIST_KEEP_DAYS)
+        if n:
+            logger.info("已清理 %d 个过期落盘目录（合规：测试数据用完即清）", n)
+    except Exception:
+        logger.warning("清理过期落盘目录失败", exc_info=True)
+
 logger = logging.getLogger(__name__)
 
 registry.load()

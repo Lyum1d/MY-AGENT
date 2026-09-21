@@ -148,6 +148,11 @@ PY_EXEC_TEXT_LIMIT = int(os.getenv("AGENT_PY_EXEC_TEXT_LIMIT", "131072"))
 # 脚本崩溃后只能重取。降到 1024：覆盖「可能有取证价值」的响应，同时跳过 141 字节
 # 量级的 404 空页（那类内容在 r.text 里已完整，落盘无价值）。
 PY_EXEC_SAVE_THRESHOLD = int(os.getenv("AGENT_PY_EXEC_SAVE_THRESHOLD", "1024"))
+# v035（公益 SRC 合规）：技术分析用的落盘文件保留期（天）。
+# 「严禁保存测试过程中获取的任何数据」是公益 SRC 的硬要求，因此落盘文件必须**用完即清**。
+# 修复点：`cleanup_persist_dirs()` 此前**从未被任何地方调用**，等于数据永久留存 ——
+# 现改为服务启动时按本保留期清理（默认只留 1 天）。
+PY_EXEC_PERSIST_KEEP_DAYS = int(os.getenv("AGENT_PY_EXEC_PERSIST_KEEP_DAYS", "1"))
 
 # ---------- 记忆注入上限 ----------
 # 超过上限的条目会在注入块尾部写明「另有 N 条未展示」，不再是无声截断 ——
