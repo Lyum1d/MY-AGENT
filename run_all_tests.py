@@ -94,6 +94,7 @@ PY_TESTS = [
     ("扫路径≠遍历接口·恢复敏感目录扫描（v038）", "test_038_fixes.py", False),
     ("产品指纹索引·内置字典·参数坑与判定口径（v039）", "test_039_fixes.py", False),
     ("ConnectRefused不误熔断·协议预筛（v040）", "test_040_fixes.py", False),
+    ("token预算预警与收尾·请求回显·续跑修复（v041）", "test_041_fixes.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),
