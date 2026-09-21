@@ -9,7 +9,7 @@
     "disabled": false,
     "ignore_exit_code": true,
     "timeout": 120,
-    "caveat": "必须传完整 URL（带 https://），传裸域名会静默返回空。注意：退出码 1 不代表失败，只是没命中 OA/VPN 等『重点资产』，指纹仍会正常打印——只要有输出就按成功解读。注意：本工具**不支持 `--random-agent`**（会被自身参数解析拒绝，报未知参数）；常用参数为 `-u <完整URL>`。指纹命中会打印在输出中后部——如遇上下文压缩，关键命中已自动落为「候选事实」可回查。",
+    "caveat": "必须传完整 URL（带 https://），传裸域名会静默返回空。注意：退出码 1 不代表失败，只是没命中 OA/VPN 等『重点资产』，指纹仍会正常打印——只要有输出就按成功解读。注意：本工具**不支持 `--random-agent`**（会被自身参数解析拒绝，报未知参数）；常用参数为 `-u <完整URL>`。【参数坑·v039】① **不支持 `-timeout`**（实测会把 `imeout` 当成 `-t` 的值，报 strconv 解析错并整次调用报废）；② **多个 `-u` 只回传 1 条结果** —— 想批量识别请**分开逐次调用**，每次一个 `-u`；③ 限并发用 `-t <数字>`（线程数，默认 100，建议 5）。",
     "target_type": "url",
     "network_control": {
       "declared": true,
@@ -21,7 +21,7 @@
     }
   },
   "dirsearch": {
-    "caveat": "target 由系统自动以 -u 注入，不要在 args 里重复写 -u（重复会导致崩溃）。不要臆造本工具不支持的旗标（如 --depth 会触发 'no such option' 报错退出）；如需限定扩展名请用 -e（例如 -e php,html）。",
+    "caveat": "target 由系统自动以 -u 注入，不要在 args 里重复写 -u（重复会导致崩溃）。不要臆造本工具不支持的旗标（如 --depth 会触发 'no such option' 报错退出）；如需限定扩展名请用 -e（例如 -e php,html）。【字典用法·v039】本工具的默认字典在**工具箱自己的目录**里（E:\\...\\tools\\gui_scan\\dirsearch\\db\\），而 py_exec 的会话目录与它是**两套执行环境**，历史上有过传 py_exec 落盘字典报 'wordlist does not exist' 的实测失败。**推荐做法**：① 用平台内置小字典，传绝对路径 `-w \\\"C:\\\\Users\\\\Lianaxber\\\\WorkBuddy\\\\2026-08-29-08-01-25\\\\src-agent\\\\data\\\\wordlists\\\\common-small.txt\\\"`（约 60 条，敏感后缀已分散排布）；② 或不传 -w 用其自带字典（但条数多、耗时不可控）。**低配额目标建议改用 py_exec + safe_http_request 逐点探测**（串行、配额精确、每步可解释）。",
     "allowed_flags": [
       "--url",
       "--bypass",

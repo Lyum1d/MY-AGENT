@@ -19,6 +19,7 @@
 | 文件 | 说明 |
 |------|------|
 | `打穿短表.md` | 挖洞手法索引（一行/指针；正文仍在各模块） |
+| `product-fingerprint-index.md` | **产品指纹 → 敏感路径基线**（TRS/RainLoop/KodExplorer/Actuator/Swagger + 通用敏感路径；含 404 双模板差分法） |
 | `401-403-bypass.md` | **禁开磨登录 HTML**（已收成一行）；业务 API 401 现场自己打 |
 | `api-gateway-test.md` | API 网关 |
 | `agent-tool-exec-test.md` | 对话口工具真执行（不是越狱、不是云 IDE RPC） |
