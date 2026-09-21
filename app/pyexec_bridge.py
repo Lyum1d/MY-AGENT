@@ -381,12 +381,15 @@ class ScriptBridge:
                 "headers": {k: v for k, v in list(r.headers.items())[:20]},
                 "text": text[:limit],
                 "elapsed": round(time.monotonic() - t0, 3),
-                # v034（第六轮实战）：字节/字符元数据**总是给出**，不再只在截断或
-                # 落盘时才有。这样任何响应（含 141 字节的 404）都能用
-                # 「len(r.text) / total_chars / total_bytes」做口径自洽核验 ——
-                # 第六轮正是因为小响应没有这些字段，「三方自洽」无法实测。
+                # v034：字节/字符元数据**总是给出**，不再只在截断或落盘时才有。
                 "total_chars": len(text),
-                "total_bytes": full_len}
+                "total_bytes": full_len,
+                # v040（lsnu 第三轮反馈）：补跳转相关字段。此前脚本想取跳转时访问
+                # `r.history` / `r.redirect_url` 都会 AttributeError 报废一步（实测发生）。
+                # 本通道 `follow_redirects=False`，故 `final_url` 即请求 URL，
+                # 跳转目标请看 `location`（响应头 Location）。
+                "final_url": str(r.url),
+                "location": r.headers.get("location", "")}
         # v032（第四轮实战）：**大响应一律落盘**，不再只在截断时落。
         # 理由：脚本崩溃时内存里的 Resp 会连同已成功取回的正文一起丢失 —— 实测
         # 同一路径被迫重请（既违反「不重复请求」纪律，又白烧目标请求）。落盘后

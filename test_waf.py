@@ -90,11 +90,17 @@ check("窗口内 2×RST → COOLDOWN", st["state"] == traffic.ST_COOLDOWN, st["s
 st = g.note_signal("waf-test.com", wafsignal.SIG_NET_RST, detail="第三次 RST")
 check("COOLDOWN 中再 RST → BLOCKED", st["state"] == traffic.ST_BLOCKED, st["state"])
 
+# v040 修正：ConnectRefused（10061）= TCP 层没建链（端口未监听 / 协议选错），
+# **不再触发熔断**。旧实现「2 次即 BLOCKED」曾导致一次协议选错就熔断整个根域名
+# （lsnu 第三轮实测：对两个未开 HTTPS 的子域各打一次 https，其余 7 个子域全被误伤）。
 g2 = fresh()
 g2.note_signal("refuse-test.com", wafsignal.SIG_NET_REFUSED, os_error_code=10061)
 st2 = g2.note_signal("refuse-test.com", wafsignal.SIG_NET_REFUSED, os_error_code=10061)
-check("窗口内 2×连接拒绝 → BLOCKED（静默丢包特征）",
-      st2["state"] == traffic.ST_BLOCKED, st2["state"])
+check("2×连接拒绝不再熔断（v040：与「被封禁」语义区分）",
+      st2["state"] != traffic.ST_BLOCKED, st2["state"])
+st2b = g2.note_signal("refuse-test.com", wafsignal.SIG_NET_REFUSED, os_error_code=10061)
+check("多次连接拒绝仍不熔断（最多 CAUTION）",
+      st2b["state"] in (traffic.ST_NORMAL, traffic.ST_CAUTION), st2b["state"])
 
 g3 = fresh()
 for i in range(3):
@@ -107,8 +113,9 @@ check("HTTP 429 → 直接 COOLDOWN", st4["state"] == traffic.ST_COOLDOWN, st4["
 
 print("== C. 状态拒绝自动请求 / 重启不清除 ==")
 fresh()
-gov.note_signal("blocked-x.com", wafsignal.SIG_NET_REFUSED)
-gov.note_signal("blocked-x.com", wafsignal.SIG_NET_REFUSED)
+# v040：用**超时**（封禁的典型特征）构造 BLOCKED；REFUSED 已不再触发熔断
+for _ in range(3):
+    gov.note_signal("blocked-x.com", wafsignal.SIG_NET_TIMEOUT)
 check("BLOCKED 状态已落库",
       (store.get_traffic_state("blocked-x.com") or {}).get("state") == traffic.ST_BLOCKED)
 gov.reset()          # 模拟重启
@@ -128,8 +135,9 @@ gov._load_state("127.0.0.1", "")
 store.upsert_traffic_state("", {"root_domain": "sibling.test", "state": "NORMAL",
                                 "reason": "", "resolved_ip": "127.0.0.1"})
 gov._load_state("sibling.test", "")
-gov.note_signal("127.0.0.1", wafsignal.SIG_NET_REFUSED)
-st_peer = gov.note_signal("127.0.0.1", wafsignal.SIG_NET_REFUSED)
+# v040：用**超时**构造 BLOCKED（REFUSED 不再触发熔断）
+for _ in range(3):
+    st_peer = gov.note_signal("127.0.0.1", wafsignal.SIG_NET_TIMEOUT)
 check("主目标进入 BLOCKED", st_peer["state"] == traffic.ST_BLOCKED, st_peer["state"])
 peer = gov.state_of("sibling.test")
 check("同 IP 兄弟主机一并暂停", peer["state"] == traffic.ST_BLOCKED, peer.get("state"))
@@ -165,8 +173,9 @@ BASE = f"http://127.0.0.1:{srv.server_address[1]}"
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 fresh()
-gov.note_signal("127.0.0.1", wafsignal.SIG_NET_REFUSED)
-gov.note_signal("127.0.0.1", wafsignal.SIG_NET_REFUSED)
+# v040：用**超时**构造 BLOCKED（REFUSED 不再触发熔断）
+for _ in range(3):
+    gov.note_signal("127.0.0.1", wafsignal.SIG_NET_TIMEOUT)
 check("前置：目标已 BLOCKED", gov.state_of("127.0.0.1")["state"] == traffic.ST_BLOCKED)
 
 Fixture.mode = "blocked"

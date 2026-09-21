@@ -66,7 +66,38 @@
 | **优先验证** | `/doc.html`、`/swagger-resources`、`/swagger-resources/configuration/security`、`/swagger-resources/configuration/ui`、`/v2/api-docs`、`/v3/api-docs` |
 | **要点** | ⚠️ **必须区分「文档外壳可达」与「接口定义可读」**：前者只是 UI 页面（**低危**），后者才暴露全部接口与参数模型（**严重**）。实测（cread.com）：`/doc.html` 与 `/swagger-resources` 均 200，但 `/v2/api-docs` **403** —— 属于「门开着、数据源关着」，**不得写成接口泄露** |
 
-## 四、通用敏感路径（任何目标都可小步验证）
+## 四、高校 / 政企常见业务系统（**二级系统的真正入口**）
+
+> 补充动机（v040，lsnu 第三轮实测反馈）：原表只有 5 个条目，**对高校二级系统最常见的教务与 OA
+> 厂商完全没有覆盖** —— 就算测到了 `jwgl`（教务管理），仍要凭记忆猜路径。以下按「指纹 → 路径」补齐。
+
+| 系统 | 识别特征（指纹） | 优先验证路径 | 要点 |
+| --- | --- | --- | --- |
+| **强智教务**（QFPU） | 路径含 `jsxsd` / `qf` / `Logintype`；页面「强智科技」 | `/jsxsd/`、`/jsxsd/framework/main.jsp`、`/jsxsd/Logintype` | 老版本有未授权访问与 SQL 注入；**只验证状态码，不做参数遍历** |
+| **正方教务** | 路径含 `jwglxt`；页面「正方软件」 | `/jwglxt/`、`/jwglxt/xtgl/login_slogin.html` | 默认口令是历史问题，**禁试口令**，只记入口存在性 |
+| **金智教务** | 路径含 `eams` / `urp`；页面「金智教育」 | `/eams/`、`/urp/` | 同上 |
+| **泛微 OA**（e-cology） | 路径含 `/wui/` `/weaver/`；`ecology_JSessionid` Cookie | `/wui/index.html`、`/weaver/bsh.servlet.BshServlet`、`/mobile/plugin/1/` | 历史高危（BshServlet 命令执行、未授权读文件）——**只验证端点存在性（状态码），绝不执行命令** |
+| **致远 OA**（A8） | 路径含 `/seeyon/`；`JSESSIONID` + `loginPage.do` | `/seeyon/index.jsp`、`/seeyon/htmlofficeservlet` | 同上，只记存在性 |
+| **蓝凌 OA**（EKP） | 路径含 `/ekp/` `/sys/` | `/ekp/`、`/sys/ui/` | 同上 |
+| **禅道 / Jira** | 页面「ZenTao」/「Atlassian Jira」 | `/zentao/`、`/login.jsp`、`/secure/Dashboard.jspa` | 禅道历史 SQL 注入，**只验证状态码** |
+| **图书馆系统** | 页面「汇文」/「Folio」/「Interlib」 | `/opac/`、`/opac/search` | — |
+| **VPN / 网关** | 页面含 `Sangfor` / `iNode` / `Juniper` / `EasyConnect` | `/por/login_psw.csp`、`/dana-na/` | 记录型号与版本即可，**禁口令尝试** |
+
+### ⭐ 指纹名 → 索引小节 的对照（**机械映射，别靠人工读表**）
+
+| 工具输出的指纹名 | 对应本表小节 |
+| --- | --- |
+| `Kodcloud-System` | KodExplorer（可道云） |
+| `RainLoop` | RainLoop WebMail |
+| `VAppServer` / `VWebServer` / `Visual SiteBuilder` | 拓尔思 TRS SiteBuilder |
+| `Spring Boot` / JSON 404 页 | Spring Boot Actuator |
+| `Swagger` / `Knife4j` / `doc.html` | Swagger / Knife4j |
+| `Weaver` / `ecology` | 泛微 OA |
+| `Seeyon` | 致远 OA |
+
+> 用法：`ehole` 的输出指纹名 → 查上表 → 定位到对应小节 → 取该产品的优先验证路径。
+
+## 五、通用敏感路径（任何目标都可小步验证）
 
 | 类别 | 路径 |
 | --- | --- |
@@ -80,7 +111,7 @@
 > ⚠️ **敏感后缀必须分散**（`.zip`/`.sql`/`.env`/`.git` 不要连续请求）——实测会触发目标 IPS
 > **直接封禁源 IP**。要探这类路径时，与普通路径**交错着打**、带间隔、少量。
 
-## 五、这套基线的实际战绩（可参考的期望值）
+## 六、这套基线的实际战绩（可参考的期望值）
 
 - **cread.com**：靠 Swagger 基线判出「文档外壳 200 / 接口定义 403」，避免把低危写成高危
 - **lsnu.edu.cn**：靠 404 双模板基准确认「站群后台与上传面未公网暴露」；

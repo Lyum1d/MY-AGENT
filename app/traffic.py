@@ -242,12 +242,19 @@ class TrafficGovernor:
         """登记一个防护信号并推进状态机。返回更新后的状态记录。
 
         转移规则（时间窗内计数，窗口见 SIGNAL_WINDOW）：
-          NORMAL + 1×RST/超时          → CAUTION（降速，不算封禁）
-          NORMAL/CAUTION + 2×RST       → COOLDOWN（停止自动请求）
-          窗口内 2×REFUSED / 3×TIMEOUT → BLOCKED（人工恢复）
-          429/挑战页                   → COOLDOWN
-          2×WAF 页                     → COOLDOWN
-          成功响应（无新信号）         → CAUTION 回 NORMAL
+          NORMAL + 1×RST/超时/拒绝      → CAUTION（降速，不算封禁）
+          NORMAL/CAUTION + 2×RST        → COOLDOWN（停止自动请求）
+          窗口内 3×TIMEOUT              → BLOCKED（人工恢复）
+          429/挑战页                    → COOLDOWN
+          2×WAF 页                      → COOLDOWN
+          成功响应（无新信号）          → CAUTION 回 NORMAL
+
+        ⚠️ v040 修正 —— **ConnectRefused（10061）不再升级到任何阻断态**：
+        它表示 **TCP 层根本没建链**（端口未监听 / 协议选错），目标零负载，
+        与「被 WAF 封禁」语义不同（后者表现为 **RST(10054) 或静默丢包**，即"能连上但被打断"）。
+        实测教训（lsnu 第三轮）：对两个未开 HTTPS 的子域各打一次 `https://`，
+        2 次 10061 就把**整个根域名**判为 BLOCKED，**连累其余 7 个子域（含最有价值的那个）
+        全部无法测绘** —— 一次协议选错被放大成全目标停摆。
         """
         if not sig:
             return self._load_state(root, project_id)
@@ -264,9 +271,16 @@ class TrafficGovernor:
         st = self._load_state(root, project_id)
         cur = st.get("state", ST_NORMAL)
         new = cur
-        if sig == wafsignal.SIG_NET_REFUSED and counts.get(sig, 0) >= REFUSED_TO_BLOCK:
-            new = ST_BLOCKED
-        elif sig == wafsignal.SIG_NET_TIMEOUT and counts.get(sig, 0) >= TIMEOUT_TO_BLOCK:
+        # v040（lsnu 第三轮实测）：**ConnectRefused（10061）不再触发熔断**。
+        #
+        # 语义区分（这是本次修正的核心）：
+        #   · RST（10054）/ 静默丢包（timeout）→ 说明「**能连上但被打断**」，是封禁的典型特征；
+        #   · ConnectionRefused（10061）→ 说明「**TCP 层根本没建链**」，目标零负载，
+        #     通常是**协议/端口选错**（例如对没开 HTTPS 的站打 https），**与封禁无关**。
+        # 实测代价：对两个未开 HTTPS 的子域各打一次 https，2 次 10061 就把**整个根域名**
+        # 判为 BLOCKED，**连累其余 7 个子域（含最有价值的那个）全部无法测绘** ——
+        # 一次探测错误被放大成全目标停摆。故降级为 CAUTION（**只提示、不阻断**）。
+        if sig == wafsignal.SIG_NET_TIMEOUT and counts.get(sig, 0) >= TIMEOUT_TO_BLOCK:
             new = ST_BLOCKED
         elif sig == wafsignal.SIG_NET_RST and counts.get(sig, 0) >= RST_TO_COOLDOWN:
             new = ST_BLOCKED if cur == ST_COOLDOWN else ST_COOLDOWN
@@ -276,6 +290,10 @@ class TrafficGovernor:
         elif sig == wafsignal.SIG_HTTP_WAF_PAGE and \
                 counts.get(sig, 0) >= WAF_PAGE_TO_COOLDOWN:
             new = ST_COOLDOWN
+        elif sig == wafsignal.SIG_NET_REFUSED:
+            # 仅提示「可能是协议/端口不对」，不升级为阻断态
+            if cur == ST_NORMAL:
+                new = ST_CAUTION
         elif sig == wafsignal.SIG_NET_RST and cur == ST_NORMAL:
             new = ST_CAUTION
         elif sig == wafsignal.SIG_NET_TIMEOUT and cur == ST_NORMAL:
