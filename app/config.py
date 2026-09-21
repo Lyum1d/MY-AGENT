@@ -168,7 +168,12 @@ FAILURE_STOP_THRESHOLD = int(os.getenv("AGENT_FAILURE_STOP", "6"))
 
 # ---- 单次任务 token 预算（成本熔断）----
 # 本地 Ollama 不返回 usage，因此不会触发；云端供应商超限即停止，避免无声烧钱。
-RUN_TOKEN_BUDGET = int(os.getenv("AGENT_RUN_TOKEN_BUDGET", "800000"))
+RUN_TOKEN_BUDGET = int(os.getenv("AGENT_RUN_TOKEN_BUDGET", "2500000"))
+# v041：token 预算的**预警比例** —— 达到该比例即注入「强制收敛、先出结论」提示。
+# 为什么必须有：原实现只有「步数」预警（BUDGET_REMIND_AT），token 仅在**超限瞬间**
+# 硬熔断。实测（lsnu 第三轮）出现「步数还有余、token 先超」：811,983/800,000 被直接截断，
+# 测绘做完了却没输出任何结论，报告只能靠人工从事实库回捞 —— 交付层面的缺口。
+TOKEN_BUDGET_WARN_RATIO = float(os.getenv("AGENT_TOKEN_WARN_RATIO", "0.8"))
 
 # ---- 任务分片并行（split_task：拆小份 → 并发跑 → 合并）----
 # 子任务并发上限。**不要调太高**：并行意味着对目标同时发起更多请求，

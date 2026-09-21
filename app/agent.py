@@ -299,11 +299,22 @@ def _budget_note(budget: dict) -> str:
             f"本轮已运行 {elapsed}。")
     tok = int(budget.get("tokens") or 0)
     tok_cap = int(budget.get("token_budget") or 0)
+    tok_warn = False
     if tok and tok_cap:
         head += f"累计 token {tok:,}/{tok_cap:,}。"
-    if total and left <= config.BUDGET_REMIND_AT:
+        # v041：**token 预算也要预警**（原实现只按步数预警）。
+        # 实测教训（lsnu 第三轮）：步数还有余（17/30）但 token 先超（811,983/800,000），
+        # 预警根本没触发 → 直接硬熔断 → **测绘做完了却没输出任何结论**。
+        # 现在达到预警比例就先要求收敛，给模型一个"先把结论写出来"的机会。
+        tok_warn = tok >= tok_cap * config.TOKEN_BUDGET_WARN_RATIO
+    # v041：给出「已发目标请求数」的确数（目标流量是合规纪律里最敏感的额度）
+    req = int(budget.get("requests") or 0)
+    if req:
+        head += f"本轮已发出目标请求 {req} 次。"
+    if (total and left <= config.BUDGET_REMIND_AT) or tok_warn:
+        why = "步数" if (total and left <= config.BUDGET_REMIND_AT) else "token"
         return head + (
-            "预算即将耗尽，必须立刻收敛：优先把手上已有证据整理成结论并调用 halt_task 收尾；"
+            f"预算即将耗尽（{why}口径），必须立刻收敛：优先把手上已有证据整理成结论并调用 halt_task 收尾；"
             "不要再开启新的扫描面，也不要再发起长耗时的工具调用。"
             "若确有未完成的关键动作，只保留最重要的一个，做完立即给结论。"
         )
@@ -947,12 +958,22 @@ class Agent:
             self._compress_history(session)
             # 每轮重建提醒：小模型在工具失败后容易「忘记」目标并反问用户，
             # 而且会反复调用同一个刚失败的工具，必须显式告诉它试过了什么。
+            # v041：把「本轮已发目标请求数」也带进上下文 —— 模型原本不知道自己花了
+            # 几次目标请求，只能靠估算自我约束（实测自述"贴近上限是估的"）。
+            # 目标流量是合规纪律里最敏感的额度，应当给出确数而非估算。
+            try:
+                _sent_total = int(
+                    (store.traffic_summary(session.project) or {}).get("total_sent") or 0
+                ) if session.project else 0
+            except Exception:
+                _sent_total = 0
             reminder = self._build_reminder(session, budget={
                 "step_no": step_no,
                 "total": step_budget,
                 "elapsed": time.time() - run_started,
                 "tokens": tokens_used,
                 "token_budget": config.RUN_TOKEN_BUDGET,
+                "requests": _sent_total,
             })
             messages = [{"role": "system", "content": system + reminder}] + session.messages
 
