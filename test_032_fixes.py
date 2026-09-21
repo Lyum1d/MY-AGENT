@@ -101,8 +101,8 @@ check("C5 tmpdir() 函数仍可用且与 TMPDIR 一致",
 print()
 print("D. 大响应落盘阈值（崩溃后能找回正文的前提）")
 print("=" * 68)
-check("D1 PY_EXEC_SAVE_THRESHOLD 默认 8192",
-      config.PY_EXEC_SAVE_THRESHOLD == 8192, str(config.PY_EXEC_SAVE_THRESHOLD))
+check("D1 PY_EXEC_SAVE_THRESHOLD 默认 1024（v034 下调，覆盖短响应取证）",
+      config.PY_EXEC_SAVE_THRESHOLD == 1024, str(config.PY_EXEC_SAVE_THRESHOLD))
 check("D2 阈值小于 TEXT_LIMIT（截断前就已落盘）",
       config.PY_EXEC_SAVE_THRESHOLD < config.PY_EXEC_TEXT_LIMIT)
 os.environ["AGENT_PY_EXEC_SAVE_THRESHOLD"] = "16384"

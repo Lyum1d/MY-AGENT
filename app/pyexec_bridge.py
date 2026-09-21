@@ -65,12 +65,20 @@ SCRIPT_MODULE_SOURCE = '''# -*- coding: utf-8 -*-
     total_bytes : int           正文原始字节数（被截断时提供）
     saved_text_path : str       **被截断时提供：完整正文的本地文件路径。**
 
-取全文的正确姿势（v031，重要）：
-    看到 truncated=True 时，**不要**为了拿剩下的正文再向目标发请求
-    （Range 分片会额外消耗目标流量与预算）。直接读落盘文件：
-        if r.get("truncated"):
-            full = open(r["saved_text_path"], encoding="utf-8").read()
+取全文的正确姿势（v031/v034，重要）：
+    看到 `saved_text_path` 时，**不要**为了拿正文再向目标发请求（Range 分片会额外
+    消耗目标流量与预算）。直接读落盘文件 —— 注意它是**原始字节**：
+        if r.get("saved_text_path"):
+            raw  = open(r["saved_text_path"], "rb").read()    # 逐字节可信
+            full = raw.decode("utf-8", "replace")             # 需要文本时再解码
     该文件与 tmpdir() 同目录，本次会话内稳定可读。
+    **切勿**用 `open(path, encoding=...)` 文本模式读回来再与 `r.text` 比长度或算
+    md5 —— 文本模式会把 `\r\n` 归一化成 `\n`，两者不是同一个东西（v033 修的正是
+    这类口径混用造成的伪差异）。
+
+字节口径自检（v034）：
+    每个响应都带 `total_chars`（正文原始字符数）与 `total_bytes`（原始字节数），
+    可与 `len(r.text)` 及响应头 `content-length` 交叉核验，判断有无截断/异常。
 
 判空纪律（重要）：
     `error` **恒存在**（成功时为空串），所以 `if r["error"]:` 永远安全 —— 不会再
@@ -372,7 +380,13 @@ class ScriptBridge:
         resp = {"status_code": r.status_code,
                 "headers": {k: v for k, v in list(r.headers.items())[:20]},
                 "text": text[:limit],
-                "elapsed": round(time.monotonic() - t0, 3)}
+                "elapsed": round(time.monotonic() - t0, 3),
+                # v034（第六轮实战）：字节/字符元数据**总是给出**，不再只在截断或
+                # 落盘时才有。这样任何响应（含 141 字节的 404）都能用
+                # 「len(r.text) / total_chars / total_bytes」做口径自洽核验 ——
+                # 第六轮正是因为小响应没有这些字段，「三方自洽」无法实测。
+                "total_chars": len(text),
+                "total_bytes": full_len}
         # v032（第四轮实战）：**大响应一律落盘**，不再只在截断时落。
         # 理由：脚本崩溃时内存里的 Resp 会连同已成功取回的正文一起丢失 —— 实测
         # 同一路径被迫重请（既违反「不重复请求」纪律，又白烧目标请求）。落盘后
@@ -394,8 +408,8 @@ class ScriptBridge:
                 resp["saved_text_path"] = str(saved)
                 resp["truncation_note"] = (
                     f"响应体已截断：text 只含前 {limit} 字符（原始 {len(text)} 字符 / "
-                    f"{full_len} 字节）。**完整正文已落盘**，用 "
-                    "open(r['saved_text_path'], encoding='utf-8').read() 取全文即可 —— "
+                    f"{full_len} 字节）。**完整正文已落盘（原始字节）**，用 "
+                    "open(r['saved_text_path'], 'rb').read() 取全文即可 —— "
                     "不要为了拿正文再向目标发请求（Range 分片会额外消耗目标流量）。")
             else:
                 resp["truncation_note"] = (
