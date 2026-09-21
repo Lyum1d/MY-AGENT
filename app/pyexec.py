@@ -70,6 +70,34 @@ def _load_env_allow_extra() -> set[str]:
     return {str(x).strip() for x in data if isinstance(x, str) and str(x).strip()}
 
 
+def persist_dir_for(workdir: str | Path) -> Path:
+    """会话级持久脚本目录（跨多次 py_exec 稳定）。
+
+    与一次性 workdir 的区别：本目录**不随调用删除**，用于「取数→落盘→离线解析」
+    这类跨步骤协作（大响应落盘可避免把 100KB 正文灌进模型上下文）。
+    按天分桶，超过保留期由 cleanup_persist_dirs() 清理。
+    """
+    day = time.strftime("%Y%m%d")
+    return Path(config.PY_EXEC_TMP_ROOT) / "persist" / day
+
+
+def cleanup_persist_dirs(keep_days: int = 3) -> int:
+    """清理过期的持久脚本目录（按天分桶，保留最近 keep_days 天）。"""
+    root = Path(config.PY_EXEC_TMP_ROOT) / "persist"
+    if not root.exists():
+        return 0
+    removed = 0
+    cutoff = time.time() - keep_days * 86400
+    for d in root.iterdir():
+        try:
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def build_sandbox_env(workdir: str | Path) -> dict:
     """构造 py_exec 子进程环境：白名单内置项 + 用户扩展项 + 指向临时目录的 TEMP/TMP。
 
@@ -90,6 +118,16 @@ def build_sandbox_env(workdir: str | Path) -> dict:
     wd = str(workdir)
     env["TEMP"] = wd
     env["TMP"] = wd
+    # v023.7：会话级**持久**脚本目录——沙箱 workdir 是一次性的（结束即删），
+    # 但真实任务需要「上一步取数、下一步解析」（实测模型只能写 /tmp 绕过，
+    # 而 Windows 下 /tmp 会落到 C:\tmp：不受管控、不清理、破坏隔离）。
+    # 这里显式给一个受管目录，脚本通过 srcagent.tmpdir() 取用。
+    try:
+        persist = persist_dir_for(workdir)
+        persist.mkdir(parents=True, exist_ok=True)
+        env["SRC_AGENT_TMPDIR"] = str(persist)
+    except Exception:
+        pass
     return env
 
 
@@ -275,6 +313,11 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None,
     # ---- v023.2 脚本网络访问治理（实测事故通道：脚本内部循环直连目标）----
     # safe 模式拒绝「网络库 + 循环 + URL」的事故模式，并引导改用受控接口；
     # warn 模式只提示；legacy 关闭治理（排障用）。
+    # v023.7：顺手清理过期的会话级脚本目录（按天分桶，开销极小）
+    try:
+        cleanup_persist_dirs()
+    except Exception:
+        logger.debug("清理持久脚本目录失败", exc_info=True)
     policy = config.PY_EXEC_NETWORK_POLICY
     det = pyexec_bridge.detect_direct_network(code)
     if policy != "legacy" and det["risky"]:
