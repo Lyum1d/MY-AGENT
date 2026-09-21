@@ -55,12 +55,12 @@ def check(name, cond, detail=""):
 print("=" * 68)
 print("A. 受控接口超限落盘：_dump_full_text 真实落盘且内容一致")
 print("=" * 68)
-big = "HEAD-" + ("x" * 200000) + "-TAIL"
+big = ("HEAD-" + ("x" * 200000) + "-TAIL").encode("utf-8")
 p = pyexec_bridge._dump_full_text("rid123", big)
 check("A1 落盘返回路径非空", p is not None, repr(p))
 if p:
     check("A2 文件存在", Path(p).exists())
-    read_back = Path(p).read_text(encoding="utf-8")
+    read_back = Path(p).read_bytes()
     check("A3 内容逐字节一致（完整正文，未截断）", read_back == big,
           f"len={len(read_back)} vs {len(big)}")
     check("A4 文件名含请求 id，可区分多次响应", "rid123" in Path(p).name)

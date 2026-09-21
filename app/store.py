@@ -1829,7 +1829,9 @@ def artifact_dir(project_id: str) -> Path:
 def save_artifact(project_id: str, filename: str, content: str) -> str:
     d = artifact_dir(project_id)
     path = d / filename
-    path.write_text(content, encoding="utf-8")
+    # newline=""：产物按写入内容原样落盘（v033）。Windows 默认会把 \n 改写成
+    # \r\n，使产物与工具输出/证据原文不再逐字节一致 —— 证据类文件必须可复核。
+    path.write_text(content, encoding="utf-8", newline="")
     return str(path)
 
 

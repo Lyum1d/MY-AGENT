@@ -356,7 +356,10 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None,
         base.mkdir(parents=True, exist_ok=True)
     script = base / f"exec_{int(time.time() * 1000)}.py"
     try:
-        script.write_text(code, encoding="utf-8")
+        # newline=""：不做平台换行转换（v033）。Windows 上默认会把代码里的真实
+        # 换行改写成 \r\n，从而改变**三引号字符串字面量的内容**，让脚本里基于
+        # 字符串相等/包含的判断产生假阴性。行尾换行虽不影响解析，但语义必须原样。
+        script.write_text(code, encoding="utf-8", newline="")
     except Exception as e:
         yield {"type": "error", "data": f"代码写入失败：{e}"}
         yield {"type": "exit", "code": 1}
@@ -381,7 +384,8 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None,
             # 没有 srcagent.py，`import srcagent` 会失败。因此把执行副本放进
             # workdir（留档仍在 data/scripts/exec/ 不动），让模块可被导入。
             run_path = workdir / "_script.py"
-            run_path.write_text(code, encoding="utf-8")
+            # newline=""：同 script 一处，避免平台换行转换改变代码语义（v033）
+            run_path.write_text(code, encoding="utf-8", newline="")
             bridge = pyexec_bridge.ScriptBridge(workdir, tool_alias="py_exec",
                                                 project_id=project_id,
                                                 session_id=session_id)

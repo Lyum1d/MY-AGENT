@@ -88,10 +88,18 @@ SCRIPT_MODULE_SOURCE = '''# -*- coding: utf-8 -*-
         from srcagent import tmpdir      # 函数：os.path.join(tmpdir(), "a.txt")
         open(os.path.join(TMPDIR, "page.html"), "w", encoding="utf-8").write(r["text"])
 
-大响应与脚本崩溃（v032）：
+大响应与脚本崩溃（v032/v033）：
     正文达到阈值（默认 8192 字符）就会**自动落盘**，响应里给出 `saved_text_path`。
     这意味着即使脚本随后崩溃，已取回的正文仍留在磁盘上、可按路径找回 ——
     **不要**为了重取内容再向目标发一次请求（那会白白消耗目标流量与预算）。
+
+    落盘文件是**原始响应字节**（`.bin`），与网络层收到的逐字节一致。请这样读：
+        raw  = open(r["saved_text_path"], "rb").read()   # 逐字节可信，md5/差分用这个
+        text = raw.decode("utf-8", "replace")            # 需要文本时再解码
+    做**差分或指纹比对**时，务必两边用同一口径：拿 `r.text` 比就都拿 `r.text`，
+    拿落盘字节比就都拿落盘字节。**不要**把文本模式读出来（`\r\n` 已被归一化成
+    `\n`）的内容去和 `r.text` 比 —— 那是两个东西，会产生伪差异（v033 修的正是
+    这类「口径混用」）。
 
 所有请求都由宿主进程的流量调度器发出：scope 白名单、滑动窗口预算、
 目标并发与暂停状态全部生效。脚本自身的循环不会绕过这些限制——
@@ -371,7 +379,9 @@ class ScriptBridge:
         # 即使脚本挂了，正文仍留在磁盘上，脚本可按 tmpdir()/TMPDIR 找回。
         saved = None
         if len(text) >= config.PY_EXEC_SAVE_THRESHOLD:
-            saved = _dump_full_text(rid, text)
+            # 落盘**原始字节**（r.content 而不是 text）：保证与响应体逐字节一致，
+            # 避免 Windows 文本模式把 \n 改写成 \r\n 污染差分基线（v033）
+            saved = _dump_full_text(rid, r.content)
             if saved is not None:
                 resp["saved_text_path"] = str(saved)
                 resp["total_chars"] = len(text)
@@ -408,12 +418,24 @@ class ScriptBridge:
         self._stop.set()
 
 
-def _dump_full_text(rid: str, text: str) -> Path | None:
-    """把被截断的完整正文落盘到**会话级持久目录**（与脚本侧 `tmpdir()` 同一目录）。
+def _dump_full_text(rid: str, data: bytes) -> Path | None:
+    """把完整响应体（**原始字节**）落盘到会话级持久目录（与脚本侧 `tmpdir()` 同目录）。
 
     为什么落盘而不是继续抬高上限：正文可能有数 MB，直接塞进桥接 JSON 既拖慢
     文件轮询、又会顺带撑爆模型上下文。落盘 + 回路径让脚本「按需读全文」，
-    代价是 0 次额外目标请求 —— 这正是 v031 要解决的预算浪费。
+    代价是 0 次额外目标请求。
+
+    v033（第五轮实战）：**必须写原始字节，不能用 `write_text()`。**
+    Windows 上 `Path.write_text()`（newline=None）会把正文里的每个 `\\n` 改写成
+    `\\r\\n`，且**落盘文件本身看不出任何异常** —— 实测把 10741 字节的响应写成
+    11046 字节，脚本读回来凭空多出 305 个 `\\r`，与 `r.text` 对不上。而 Agent 恰
+    恰被要求「基于落盘全文做差分」，**差点把这种换行污染伪差异当成 IDOR 差分写进
+    结论**。写原始字节后：落盘文件与响应体逐字节一致，还能直接与流量审计的
+    `bytes_in` 对照核验。
+
+    读取方式（脚本侧）：
+        raw  = open(r["saved_text_path"], "rb").read()   # 原始字节，逐字节可信
+        text = raw.decode("utf-8", "replace")            # 需要文本时再解码
 
     目录口径必须与 `pyexec.persist_dir_for()` 保持一致（两处都取自
     `config.PY_EXEC_TMP_ROOT`），否则脚本拿 `tmpdir()` 找不到文件。
@@ -422,8 +444,8 @@ def _dump_full_text(rid: str, text: str) -> Path | None:
         day = time.strftime("%Y%m%d")
         d = Path(config.PY_EXEC_TMP_ROOT) / "persist" / day
         d.mkdir(parents=True, exist_ok=True)
-        p = d / f"resp_{rid}.txt"
-        p.write_text(text, encoding="utf-8")
+        p = d / f"resp_{rid}.bin"
+        p.write_bytes(data)
         return p
     except OSError:
         logger.debug("完整正文落盘失败", exc_info=True)
