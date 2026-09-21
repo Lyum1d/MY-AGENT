@@ -81,27 +81,69 @@ def persist_dir_for(workdir: str | Path) -> Path:
     return Path(config.PY_EXEC_TMP_ROOT) / "persist" / day
 
 
+def _safe_rmtree(path) -> bool:
+    """删除临时目录 —— **绝不让异常穿透**（v037：实测曾把整个服务搞崩）。
+
+    现场：本机在 WorkBuddy 沙箱里运行时，`shutil.rmtree` 被 sitecustomize 劫持为
+    「移入回收站」实现，且带**批量删除守卫**（一次 ≥50 个文件需要确认）——触发守卫时
+    它会 `raise SystemExit(1)`。而 `ignore_errors=True` **只吞 OSError**，SystemExit
+    会直接穿透，于是一次普通的临时目录清理就把 uvicorn 主进程干掉了（实测：某轮
+    py_exec 清理 54 个文件即崩，SSE 断流、编排脚本随之报 RemoteProtocolError）。
+
+    取舍：清理失败完全可以接受（目录留着，由后续清理或系统 TEMP 回收），
+    服务崩掉不可接受。所以这里显式吞掉 SystemExit 与全部异常。
+
+    返回是否删除成功（失败时不抛异常，供调用方决定是否计数）。
+    """
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+        return True
+    except SystemExit:
+        logger.warning("清理目录被沙箱批量删除守卫拦截，已跳过：%s", path)
+        return False
+    except Exception:
+        logger.debug("清理目录失败（忽略）：%s", path, exc_info=True)
+        return False
+
+
 def cleanup_persist_dirs(keep_days: int | None = None) -> int:
     """清理过期的持久脚本目录（按天分桶，保留最近 keep_days 天）。
 
     v035：默认保留期改从 config 取（`AGENT_PY_EXEC_PERSIST_KEEP_DAYS`，默认 1 天）。
     公益 SRC 要求「测试过程中获取的数据用完即清」—— 这些目录里存的是**响应正文副本**，
     不能长期留存。调用点见 main.py 的启动钩子（此前本函数**从未被调用**）。
+
+    v037：顺带兜底回收 `pyexec_*` 一次性工作目录 —— 沙箱的批量删除守卫会让 py_exec
+    结束时的即时清理失败（见 _safe_rmtree），这些目录会积压，必须有人收尾。
     """
     if keep_days is None:
         keep_days = config.PY_EXEC_PERSIST_KEEP_DAYS
-    root = Path(config.PY_EXEC_TMP_ROOT) / "persist"
-    if not root.exists():
-        return 0
     removed = 0
     cutoff = time.time() - keep_days * 86400
-    for d in root.iterdir():
-        try:
-            if d.is_dir() and d.stat().st_mtime < cutoff:
-                shutil.rmtree(d, ignore_errors=True)
-                removed += 1
-        except OSError:
-            continue
+
+    root = Path(config.PY_EXEC_TMP_ROOT)
+    persist = root / "persist"
+    if persist.exists():
+        for d in persist.iterdir():
+            try:
+                if d.is_dir() and d.stat().st_mtime < cutoff:
+                    if _safe_rmtree(d):
+                        removed += 1
+            except OSError:
+                continue
+
+    # v037 兜底：一次性工作目录（pyexec_*）本应在 py_exec 结束时删除，
+    # 但可能被沙箱批量删除守卫拦下；按同一保留期回收，避免无限积压。
+    try:
+        for d in root.glob("pyexec_*"):
+            try:
+                if d.is_dir() and d.stat().st_mtime < cutoff:
+                    if _safe_rmtree(d):
+                        removed += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
     return removed
 
 
@@ -404,7 +446,7 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None,
         # env 构造失败 = 白名单机制不可用：按 fail-closed 拒绝执行
         yield {"type": "error", "data": f"沙箱环境构造失败，已拒绝执行：{e}"}
         yield {"type": "exit", "code": 1}
-        shutil.rmtree(workdir, ignore_errors=True)
+        _safe_rmtree(workdir)
         return
 
     proc = await asyncio.create_subprocess_exec(
@@ -522,7 +564,7 @@ async def run_py_exec(code: str, target: str = "", cancel_event=None,
             rc = -1
             if os.name == "nt":
                 _kill_tree_fallback(proc.pid)
-        shutil.rmtree(workdir, ignore_errors=True)
+        _safe_rmtree(workdir)
     if cancelled:
         yield {"type": "exit", "code": 130}   # 130 = SIGINT 语义，区别于超时 124 / 越权 126
     elif not timed_out:
