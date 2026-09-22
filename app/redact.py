@@ -55,6 +55,25 @@ _REDACT_RULES: list[tuple[re.Pattern, str]] = [
      r"[REDACTED_EMAIL]@\1"),
     # 中国大陆手机号（1 开头 11 位，前后不能是数字，避免误伤端口/时间戳）
     (re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"), "[REDACTED_PHONE]"),
+    # v043 —— 加密**密钥材料**（真实的合规缺口，实测踩过）：
+    # 现场：目标前端 JS 里明文硬编码了 RSA 私钥。该材料被写进本地事实库，
+    # 而事实库会**注入每轮上下文**、上下文会**外发到云端模型**（model-studio）——
+    # 原有 `_SECRET_RE` 只认 `private_key` 这类关键词，**不匹配 `private_exponent`**，
+    # 于是私钥会原样出网。违反「不得外传测试中获取的任何数据」。
+    # ① PEM 私钥块整体打码
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?"
+                r"-----END [A-Z ]*PRIVATE KEY-----"),
+     "[REDACTED_PEM_PRIVATE_KEY]"),
+    # ② 密钥字段的键值形态（私钥指数 / 模数 / 各类 key 字段）
+    (re.compile(r"(?i)\b(private[_-]?exponent|modulus|private[_-]?key|"
+                r"secret[_-]?key|signing[_-]?key|encryption[_-]?key)\b"
+                r"[\"']?(\s*[:=]\s*)[\"']?[0-9a-fA-F]{16,}[\"']?"),
+     r"\1\2[REDACTED_KEY_MATERIAL]"),
+    # ③ 超长 hex 串：**阈值取 128 字符**是刻意的 ——
+    #    md5(32) / sha1(40) / sha256(64) 这些**取证用摘要值必须原样保留**（否则证据链断），
+    #    而 RSA 1024 的私钥指数为 256 字符、模数 258 字符，全都远在阈值之上。
+    (re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{128,}(?![0-9a-fA-F])"),
+     "[REDACTED_LONG_HEX]"),
 ]
 
 # 键值对形态的凭据：password=xxx / "api_key": "xxx" / access_token: xxx 等。
