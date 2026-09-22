@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from . import config, providers, report, scope, store, usage
 from . import graph, ratelimit, secretbox, traffic
 from . import difftest, flowtest
+from . import mcp_client
 from .importers import common as importers_common
 from .agent import agent, sessions
 from .executor import executor
@@ -327,7 +328,38 @@ async def health():
         "enforce_scope": bool(config.ENFORCE_SCOPE),
         "scope_domains": scope_domains,
         "scope_warning": scope_warn,
+        # v044：MCP 外部工具服务状态。为什么放进 health 而不是等用户撞到才报错：
+        # Burp 没开 / 扩展没加载 / 没点 Start 都表现为「burp_replay 工具不见了」，
+        # 而工具清单是模型看的、用户在界面上看不到——于是现象是「Agent 好像变笨了，
+        # 不会用 Burp」，排查方向全错。这里显式暴露状态与可操作提示。
+        "mcp": await _mcp_health(),
     }
+
+
+async def _mcp_health() -> dict:
+    """MCP 状态汇总（供 /api/health）。任何异常都不得影响 health 本身。"""
+    info: dict = {
+        "enabled": config.MCP_ENABLED,
+        "endpoint": config.MCP_BURP_URL,
+        "available": False,
+        "note": "",
+        "tools": [],
+        "proxy_warnings": [],
+        "require_approval": config.MCP_REQUIRE_APPROVAL,
+    }
+    if not config.MCP_ENABLED:
+        info["note"] = "已通过 AGENT_MCP_ENABLED=0 关闭"
+        return info
+    try:
+        ok, note, tools = await mcp_client.availability()
+        info["available"] = ok
+        info["note"] = note
+        info["tools"] = tools
+        if ok:
+            info["proxy_warnings"] = await mcp_client.check_proxy_sanity()
+    except Exception as e:      # noqa: BLE001 - health 必须永远返回
+        info["note"] = f"MCP 状态检查异常（已降级）：{type(e).__name__}: {e}"
+    return info
 
 
 # ---------- 模型切换 ----------

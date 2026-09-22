@@ -22,6 +22,8 @@ from . import graph
 from . import kb, fofa
 from . import pyexec
 from . import replayer
+from . import burp_tools
+from . import mcp_client
 from .executor import executor
 from .intel import format_intel, update_intel_from_steps
 from .llm import (auto_route_candidate, failover_backend, get_backend,
@@ -191,6 +193,17 @@ _P_REDLINES = """【绝对不能碰的合规红线（必背）】（优先级高
 六、报告与收尾
 23. 报告必须**脱敏**（凭据 / Token / 个人数据 / 内部地址），且不得包含任何违规操作的截图或数据。
 24. 测试完毕删除测试记录与产生的数据，不保存、不传播敏感信息（平台落盘文件默认 1 天自动清理）。
+
+六、经 Burp 出网的专用纪律（v044；用 burp_replay / burp_history 前先看）
+25. `burp_replay` 能发 POST/PUT/PATCH（`httpreplay` 只能只读），**能力更大所以要求更严**：
+    未经用户明确同意，不得用它发送任何会改变服务端状态的方法；验证越权优先用 GET。
+26. 它的请求也会进 Burp 的 Proxy history 并被 `burp_history` 读到 —— 这意味着**误发的请求
+    会留在记录里**。发之前想清楚，不要靠「发错了再用 history 找回来」。
+27. 返回「用户在 Burp 侧拒绝了本次请求」时，那是**人工闸门行使否决权**，不是技术故障：
+    **禁止重复尝试同一请求**，也不要换工具绕开同一个人工决定 —— 那是绕过授权流程。
+    正确做法是说明原因、换思路，或请用户确认后再来。
+28. `burp_history` 读到的历史里含目标站点的**真实凭据与会话信息**（Cookie / Token / 登录包）。
+    引用到任何地方前必须脱敏；禁止把原始历史记录整段贴进报告或外部工具。
 
 工具「能做到」不等于授权允许越线。若某一步会踩线，改用更保守的做法，或停下来说明原因；
 需要展开说明（含越线时的处理方式）时，用 kb_read 读 compliance-redlines。"""
@@ -785,6 +798,9 @@ class Agent:
         # 不在初始化时钉死后端：留 None，run() 时取运行时当前后端，
         # 这样前端切换模型后无需重启服务即对新任务生效。
         self.backend_name = backend_name
+        # v044：MCP（Burp）可用性探测时间戳。0 表示「还没探过」——不能用
+        # 默认的「很久以前」来初始化，否则第一次会被 20 秒缓存窗口挡掉。
+        self._mcp_probe_at: float = 0.0
 
     # ---------- 主循环 ----------
     async def run(self, session: Session, user_message: str,
@@ -982,6 +998,10 @@ class Agent:
                 "token_budget": config.RUN_TOKEN_BUDGET,
                 "requests": _sent_total,
             })
+            # v044：每轮刷新「依赖外部服务的工具」可用性 —— Burp 可能中途被关掉
+            # 或刚被启动。失败即视为不可用（build_schemas 会把它们摘掉），
+            # 避免模型在必然失败的工具上空转掉步数。
+            await self._refresh_external_tools()
             messages = [{"role": "system", "content": system + reminder}] + session.messages
 
             await session.emit({"type": "thinking", "step": step_no,
@@ -2259,6 +2279,30 @@ class Agent:
                       "先换一个测试思路或换一个攻击面，不要在原假设上继续加码。")
 
     # ---------- 执行并收集输出 ----------
+    async def _refresh_external_tools(self) -> None:
+        """刷新依赖外部服务的工具可用性（v044，当前仅 Burp MCP）。
+
+        设计要点：
+          · **探测失败不抛异常、不中断任务**。Burp 没开是常态，不是故障。
+          · 探测结果缓存 20 秒，避免每轮都去连一次（MCP 连不上时 TCP 拒绝很快，
+            但仍是无谓开销；更关键的是避免「每轮都刷一条同样的日志」）。
+          · 任何异常都吞掉——这个函数的唯一副作用是「让工具清单更准」，
+            绝不能因为它自己出错而把任务带偏。
+        """
+        if not config.MCP_ENABLED:
+            registry.unavailable_aliases = {"burp_replay", "burp_history"}
+            return
+        now = time.time()
+        if now - self._mcp_probe_at < 20 and self._mcp_probe_at > 0:
+            return
+        self._mcp_probe_at = now
+        try:
+            ok, _note, _tools = await mcp_client.availability()
+        except Exception:       # noqa: BLE001
+            ok = False
+        registry.unavailable_aliases = (
+            set() if ok else {"burp_replay", "burp_history"})
+
     async def _execute(self, session: Session, step: Step, tool_call_id: str) -> None:
         tool = registry.get_by_alias(step.tool_alias)
         if tool is None:
@@ -2287,6 +2331,14 @@ class Agent:
         elif tool.alias == "py_exec":
             gen = pyexec.run_py_exec(step.args, step.target,
                                      cancel_event=session.cancel_event, **_ctx)
+        elif tool.alias == "burp_replay":
+            # v044：经 Burp MCP 发包。出网前会过 TrafficGovernor + scope（见
+            # app/burp_tools.py），与 httpreplay 同一套治理，不是绕过闸门的后门。
+            gen = burp_tools.run_burp_replay(step.target, step.args,
+                                             cancel_event=session.cancel_event, **_ctx)
+        elif tool.alias == "burp_history":
+            # v044：读 Burp Proxy history。纯本地读取，不出网，故不接流量治理。
+            gen = burp_tools.run_burp_history(step.args, **_ctx)
         else:
             gen = executor.run(tool, step.target, step.args,
                                cancel_event=session.cancel_event, **_ctx)

@@ -166,6 +166,9 @@ class ToolRegistry:
         self.loaded = False
         self.errors: list[str] = []
         self.last_omitted_aliases: list[str] = []   # v022：上次 build_schemas 因配额省略的工具
+        # v044：依赖外部服务（当前仅 Burp MCP）且当前不可用的工具别名。
+        # 由 Agent 每轮探测后写入；build_schemas 据此把它们从清单里摘掉。
+        self.unavailable_aliases: set[str] = set()
 
     # ---------- 加载 ----------
     def load(self) -> "ToolRegistry":
@@ -266,6 +269,47 @@ class ToolRegistry:
                           "-d 参数=值（追加查询串）、-X 方法（仅 GET/HEAD/OPTIONS）、"
                           "--timeout 秒（上限 20）。无凭据直接请求即可验证未授权访问。",
                 "executable": "builtin://httpreplay",
+                "exists": True,
+            },
+            {
+                "name": "Burp重放器",
+                "alias": "burp_replay",
+                "description": "把一段完整 raw HTTP 请求交给 Burp Suite 发出并回传响应（经 Burp 的 "
+                               "MCP 服务）。与 HTTP重放器的区别：请求走 Burp 的网络栈与上游代理链，"
+                               "并自动落进 Burp 的 Proxy history（后续可用 burp_history 回读，形成"
+                               "闭环证据链）。适合：复现 Burp 里手工抓到的会话、需要保留完整原始"
+                               "请求/响应留档、需要走 Burp 上游代理的场景。**不依赖 Burp 时用 HTTP重放器。**",
+                "risk_level": "L2",
+                "risk_reason": "主动向授权目标发送构造请求。两条独立闸门：① 目标必须在 "
+                               "data/scope.json 授权范围内；② Burp 侧默认弹窗人工批准"
+                               "（可在 Burp MCP 标签页配 auto-approve 免打扰）。"
+                               "同时计入 TrafficGovernor 的限速与预算。",
+                "caveat": "**target** 填完整 URL（如 https://example.com/api/x），"
+                          "**args 整段填 raw HTTP 请求文本**（不做旗标解析）——必须包含起始行"
+                          "（如 `GET /api/x HTTP/1.1`）、Host 头、以及末尾空行；换行用 CRLF 最稳。"
+                          "允许方法：GET/HEAD/OPTIONS/POST/PUT/PATCH（DELETE 禁用：SRC 场景无验证"
+                          "价值且具破坏性）。改哪个头就直接改 raw 文本里那一行。"
+                          "若返回「用户在 Burp 侧拒绝了本次请求」，说明人工闸门行使了否决权，"
+                          "**不要重复尝试同一请求**，改用 HTTP重放器或换验证思路。",
+                "executable": "builtin://burp_replay",
+                "exists": True,
+            },
+            {
+                "name": "读取Burp抓包历史",
+                "alias": "burp_history",
+                "description": "读取 Burp Suite 的 Proxy HTTP history（支持正则过滤），回传历史请求/响应"
+                               "记录。用途：把你在 Burp 里手工浏览、登录、点击产生的请求拿进来做分析"
+                               "——尤其适合带登录态或复杂签名的请求（Agent 自己构造不出来，但可以直接读"
+                               "到 Burp 已抓到的原文）。**纯本地读取，不向目标发任何请求。**",
+                "risk_level": "L0",
+                "risk_reason": "只读 Burp 本地历史记录，不产生任何出网请求；"
+                               "数据访问由 Burp 侧一次性授权（requireDataAccessApproval）",
+                "caveat": "args 填查询参数，支持两种形态：① 留空 = 取最近记录；"
+                          "② `regex=<正则>` 按内容过滤（如 regex=login|token|admin）；"
+                          "③ `count=50 offset=0` 翻页。返回「Reached end of items」表示已到末尾"
+                          "（**不是错误、也不是没有数据**，要往前翻 offset）。"
+                          "历史里有敏感凭据，引用到报告时注意脱敏。",
+                "executable": "builtin://burp_history",
                 "exists": True,
             },
             {
@@ -457,6 +501,18 @@ class ToolRegistry:
         """Agent 实际可用的可编排工具：排除禁用项与文件缺失项。"""
         return [t for t in self.scriptable_tools() if not t.disabled and t.executable]
 
+    @staticmethod
+    def external_service_of(alias: str) -> str:
+        """工具依赖的外部服务名（当前仅 "mcp"）；不依赖外部服务的返回空串。
+
+        用**显式清单**而不是「executable 以 builtin:// 开头就…」这类推断：
+        推断规则在新增工具时会静默给出错误答案（把不需要外部服务的工具也标成
+        需要，或者反过来），而这种错误只会表现为「工具莫名消失」，极难排查。
+        """
+        if alias in ("burp_replay", "burp_history"):
+            return "mcp"
+        return ""
+
     def _resolve_executable(self, tool: Tool) -> None:
         """把相对路径解析为绝对路径，并记录工作目录。"""
         if not tool.rel_path:
@@ -567,6 +623,13 @@ class ToolRegistry:
             max_tools = config.MAX_TOOL_SCHEMAS
         order = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
         tools = sorted(self.usable_scriptable(), key=lambda t: order.get(t.risk_level, 2))
+        # v044：依赖外部服务的工具，在服务不可用时**整条摘掉**。
+        # 为什么必须摘而不是「留着让模型试」：模型看到 schema 就会去调，调一次
+        # 报一次「Burp 连不上」，把有限的步数与 token 预算烧在必然失败的动作上
+        # （本项目 MAX_STEPS 与 token 预算都卡得很紧，实测这类空转很致命）。
+        # 判定由 agent 每轮刷新（见 Agent._refresh_external_tools），失败即视为不可用。
+        if self.unavailable_aliases:
+            tools = [t for t in tools if t.alias not in self.unavailable_aliases]
         builtins = [t for t in tools if t.type == "内置"]
         rest_all = [t for t in tools if t.type != "内置"]
         rest = rest_all[: max(0, max_tools - len(builtins))]

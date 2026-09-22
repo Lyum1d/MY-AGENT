@@ -42,9 +42,20 @@ def check(name, cond, extra=""):
 
 print("== A. 出网入口的 project/session 透传（源码断言） ==")
 agent_src = (ROOT / "app" / "agent.py").read_text(encoding="utf-8")
-check("agent 构造上下文 _ctx 并透传四个通道",
+# v044 起通道数会随新出网入口增长（Burp MCP 加了 burp_replay / burp_history）。
+# 原断言写死 ==4，加一条通道就红——那是「测试记住了实现细节」而不是在守护不变量。
+# 真正的不变量是：**_execute 的每个分派分支都透传 _ctx**（含兜底的 else 分支，
+# 它也走 executor.run 出网）。
+# 注意不能用 `if tool.alias ==` 计数：`elif tool.alias ==` 里含该子串，会重复计。
+_ext = agent_src.split("# ---------- 执行并收集输出 ----------", 1)[-1]
+_arm_if = _ext.count("        if tool.alias ==")
+_arm_elif = _ext.count("        elif tool.alias ==")
+_arm_else = _ext.count("        else:\n            gen = executor.run")
+_arms = _arm_if + _arm_elif + _arm_else
+check("agent 构造上下文 _ctx 并透传全部分支（含 else 兜底）",
       '_ctx = {"project_id": session.project or "", "session_id": session.id}' in agent_src
-      and agent_src.count("**_ctx") == 4, agent_src.count("**_ctx"))
+      and agent_src.count("**_ctx") == _arms and _arms >= 6,
+      f"透传 {agent_src.count('**_ctx')} / 分支 {_arms}")
 exec_src = (ROOT / "app" / "executor.py").read_text(encoding="utf-8")
 check("executor.run 接受 project_id/session_id",
       'cancel_event=None, project_id: str = "", session_id: str = ""' in exec_src)

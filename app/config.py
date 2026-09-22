@@ -314,3 +314,35 @@ LLM_RETRY_MAX = int(os.getenv("AGENT_LLM_RETRY_MAX", "3"))
 LLM_RETRY_BASE_DELAY = float(os.getenv("AGENT_LLM_RETRY_BASE_DELAY", "1.0"))
 LLM_FAILOVER_MAX = int(os.getenv("AGENT_LLM_FAILOVER_MAX", "2"))
 RUN_TIME_BUDGET = int(os.getenv("AGENT_RUN_TIME_BUDGET", "1800"))
+
+# ---------- MCP 外部工具服务（v044） ----------
+# 背景：Burp Suite 官方 MCP Server 扩展（PortSwigger/mcp-server）在 Burp 进程内
+#   起一个 SSE 服务，暴露 send_http1_request 等工具。接上它以后，Agent 发的请求
+#   会经 Burp 出网并自动落进 Proxy history，Agent 又能回读 history（闭环证据链）。
+#
+# 设计纪律（与项目既有安全边界一致，逐条都有原因）：
+#   ① 只连回环地址（MCP_ALLOW_REMOTE=0）：MCP 是「本机工具服务」，允许远程等于
+#      把 Agent 的出网能力交给第三方主机。想连远程必须显式改配置，不改就拒。
+#   ② 不跟随环境代理：Burp 自己就是代理（本机 8080）。若 MCP 连接走了环境代理
+#      （本机 62063），会出现「代理连代理」，极端情况成环。这条同 httpreplay
+#      的 httpx 必须 trust_env=False。
+#   ③ 经 MCP 的**主动发包**（send_http*_request）必须过 TrafficGovernor + scope，
+#      与 httpreplay / py_exec 同一套治理，不允许出现「绕过限速的第二条出网通道」。
+#   ④ 只读类 MCP 工具（读 Proxy history / 编码解码）不出网，不占流量预算。
+#
+# MCP_ENABLED：总开关。关掉后 Agent 工具清单里不会出现任何 burp_* 工具。
+# MCP_BURP_URL：SSE 端点基址（官方扩展默认 host/port 见其 McpConfig.kt）。
+# MCP_CALL_TIMEOUT：单次 MCP 调用超时（秒）。Burp 弹窗等人工批准会吃掉时间，
+#   所以这个值要显著大于普通 HTTP 工具，否则「等用户点 Allow」会被误判成超时。
+# MCP_REQUIRE_APPROVAL：是否要求 Burp 侧弹窗人工批准（仅作为给模型的提示文本，
+#   真正的闸门在 Burp 扩展配置里，Agent 无法也**不应该**替用户关掉它）。
+MCP_ENABLED = os.getenv("AGENT_MCP_ENABLED", "1") == "1"
+MCP_ALLOW_REMOTE = os.getenv("AGENT_MCP_ALLOW_REMOTE", "0") == "1"
+MCP_BURP_URL = os.getenv("AGENT_MCP_BURP_URL", "http://127.0.0.1:9876").rstrip("/")
+MCP_CALL_TIMEOUT = float(os.getenv("AGENT_MCP_CALL_TIMEOUT", "120"))
+MCP_REQUIRE_APPROVAL = os.getenv("AGENT_MCP_REQUIRE_APPROVAL", "1") == "1"
+# Proxy history 读取的分页默认值/上限。官方扩展返回的记录含完整请求+响应原文，
+# 单条动辄数十 KB，一次拉太多会直接把上下文塞满（第 3 轮实战「上下文压缩丢证据」
+# 就是这么来的）。默认 20 条、上限 100 条，配合 offset 翻页。
+MCP_HISTORY_PAGE = int(os.getenv("AGENT_MCP_HISTORY_PAGE", "20"))
+MCP_HISTORY_MAX = int(os.getenv("AGENT_MCP_HISTORY_MAX", "100"))
