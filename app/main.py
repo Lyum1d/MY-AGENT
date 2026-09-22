@@ -1817,11 +1817,29 @@ async def session_state(sid: str):
                     pending = {"step": agent._step_dict(st),
                                "risk": st.risk or registry.risk_of(st.tool_alias) or {},
                                "token": pend.get("token", ""),
-                               "second": bool(pend.get("double_confirm"))}
+                               # `second` 这个老名字含义是「该步需要双轮确认」，
+                               # **不是**「当前是第几轮」——而 SSE 的 need_confirm 事件里
+                               # 同名字段表达的恰恰是轮次。同名不同义，消费方极易搞混
+                               # （本机实测：自己的看板脚本就拿它当风险等级用，把 L3 印成 L2）。
+                               # 保留 `second` 不破坏既有前端，新增语义明确的名字。
+                               "second": bool(pend.get("double_confirm")),
+                               "requires_double_confirm": bool(pend.get("double_confirm"))}
                     break
         return {
             "id": s.id,
             "state": s.state,
+            # v045：把「在等人确认」提升为一等状态。
+            # 此前只有 pending_confirm 非空能间接表达，而外部消费者（脚本/看板/
+            # 无人值守编排）往往只看 state —— 看到的是 "awaiting_confirm" 这个字符串，
+            # 却不知道是谁在等、等哪一步，表现为「Agent 好像卡死了」。
+            # 实测：自写的 SSE 监控脚本因事件名写错（confirm vs need_confirm）
+            # 而完全静默，排查了好几分钟才定位到是等待人工。
+            "awaiting_confirmation": bool(pending),
+            "awaiting_summary": (
+                f"{pending['step'].get('tool_alias')} → "
+                f"{pending['step'].get('target')} "
+                f"（风险 {pending['risk'].get('level')}）"
+                if pending else ""),
             "target": s.target,
             "steps": [agent._step_dict(x) for x in s.steps],
             "parent_id": s.parent_id,
@@ -1850,4 +1868,10 @@ async def session_state(sid: str):
         "records": records if isinstance(records, list) else [],
         "summary": sess.get("summary") or "",
         "chat": chat,
+        # 持久化层没有内存会话，因此拿不到 pending_confirm。但这两个键要**无条件存在**：
+        # 消费方（脚本/看板）若只在内存分支有这个键，重启后会突然 KeyError。
+        # 「键恒存在、值为空」比「按情况出现」更不容易误用（v032 的既有教训）。
+        "awaiting_confirmation": False,
+        "awaiting_summary": "",
+        "pending_confirm": None,
     }

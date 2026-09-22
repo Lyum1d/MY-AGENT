@@ -98,6 +98,7 @@ PY_TESTS = [
     ("截断标志恒存在·已知泄露模式·密钥处置（v042）", "test_042_fixes.py", False),
     ("云端外发脱敏·密钥材料与摘要值边界（v043）", "test_043_fixes.py", False),
     ("Burp MCP 接入·治理闸门与优雅降级（v044）", "test_044_mcp.py", False),
+    ("确认闸门前置与口径修复（v045）", "test_045_fixes.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),
