@@ -434,6 +434,60 @@ def test_no_real_targets_in_tracked_sources():
             print(f"         {h}")
 
 
+def test_load_bytes_and_hash():
+    """原始字节读取接口：平台的落盘是二进制，必须有受控读法。
+
+    为什么（第三轮实测）：模块 docstring 教人用 `open(path,"rb").read()` 读落盘的
+    `.bin`，而本版引入的能力分档器把 `open()` 判为非只读 —— **文档推荐的标准动作
+    过不了自己的闸门**。实测 Agent 要算「服务端 key 是否等于图片字节的 md5」，
+    被 `open()` 连卡两次，退而用工具箱的交互式 md5_tool（非交互只打印菜单），
+    白烧三步。补 `load_bytes` / `file_md5` / `file_info` 把这条路打通。
+    """
+    print("\n[I] 原始字节读取与哈希（受控接口）")
+    import hashlib as _hl
+    ns, tmp = load_sandbox_module()
+    raw = b"\xff\xd8\xff\xe0" + b"X" * 1000          # 假 JPEG
+    p = os.path.join(tmp, "resp_probe.bin")
+    with open(p, "wb") as f:
+        f.write(raw)
+
+    check("load_bytes 支持文件名", ns["load_bytes"]("resp_probe.bin") == raw)
+    check("load_bytes 支持绝对路径（落盘给的 saved_text_path 形态）",
+          ns["load_bytes"](p) == raw)
+    check("file_md5 与本地计算一致（**字节口径**，不能是有损文本）",
+          ns["file_md5"]("resp_probe.bin") == _hl.md5(raw).hexdigest())
+    check("file_md5 支持 sha256",
+          ns["file_md5"]("resp_probe.bin", "sha256") == _hl.sha256(raw).hexdigest())
+    size, head = ns["file_info"]("resp_probe.bin")
+    check("file_info 给出字节数", size == len(raw))
+    check("file_info 给出头部 hex（可判 JPEG/PNG/gzip）",
+          head.startswith("ffd8ff"), head)
+
+    # 口径对比：证明「有损文本口径」算出的哈希与字节口径不同（这正是要害）
+    lossy = raw.decode("utf-8", "replace").encode("utf-8")
+    check("字节口径 ≠ 有损文本口径（说明为什么必须走 load_bytes）",
+          _hl.md5(lossy).hexdigest() != _hl.md5(raw).hexdigest())
+
+    for bad in ("../escape.bin", "../../win.ini", "C:/Windows/win.ini",
+                os.path.join(os.path.dirname(tmp), "outside.bin")):
+        try:
+            ns["load_bytes"](bad)
+            check(f"load_bytes({bad!r}) 被拦", False, "未拦截")
+        except ValueError:
+            check(f"load_bytes({bad!r}) 被拦", True)
+
+    # 分档器白名单要跟着放宽，否则受控接口自己也会被判非只读
+    from _classify_step import classify_py_exec
+    ok, why = classify_py_exec(
+        "from srcagent import safe_http_request, load_bytes, file_md5, file_info\n"
+        "r = safe_http_request('https://a.example/i?k=1')\n"
+        "raw = load_bytes(r['saved_text_path'])\n"
+        "print(file_md5(r['saved_text_path']), file_info('x.bin'))")
+    check("用受控字节接口的脚本判为只读", ok, why)
+    ok2, _ = classify_py_exec("raw = open('x.bin','rb').read()")
+    check("裸 open() 仍判非只读（改为用受控接口）", not ok2)
+
+
 def main():
     print("=" * 68)
     print("v045 优化回归：确认闸门前置与口径修复")
@@ -448,6 +502,7 @@ def main():
     test_readme_defaults_in_sync()
     test_session_detail_confirm_visibility()
     test_no_real_targets_in_tracked_sources()
+    test_load_bytes_and_hash()
     print("\n" + "=" * 68)
     print(f"结果：{PASS} 通过 / {FAIL} 失败")
     print("=" * 68)

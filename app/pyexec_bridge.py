@@ -65,16 +65,18 @@ SCRIPT_MODULE_SOURCE = '''# -*- coding: utf-8 -*-
     total_bytes : int           正文原始字节数（被截断时提供）
     saved_text_path : str       **被截断时提供：完整正文的本地文件路径。**
 
-取全文的正确姿势（v031/v034，重要）：
+取全文的正确姿势（v031/v034/v045.2，重要）：
     看到 `saved_text_path` 时，**不要**为了拿正文再向目标发请求（Range 分片会额外
     消耗目标流量与预算）。直接读落盘文件 —— 注意它是**原始字节**：
-        if r.get("saved_text_path"):
-            raw  = open(r["saved_text_path"], "rb").read()    # 逐字节可信
-            full = raw.decode("utf-8", "replace")             # 需要文本时再解码
-    该文件与 tmpdir() 同目录，本次会话内稳定可读。
-    **切勿**用 `open(path, encoding=...)` 文本模式读回来再与 `r.text` 比长度或算
-    md5 —— 文本模式会把 `\r\n` 归一化成 `\n`，两者不是同一个东西（v033 修的正是
-    这类口径混用造成的伪差异）。
+        from srcagent import load_bytes, load_text     # 受控接口，本地读、不出网
+        raw = load_bytes(r["saved_text_path"])         # 逐字节可信（绝对路径可直接用）
+        full = raw.decode("utf-8", "replace")          # 需要文本时再解码
+    需要摘要（md5/sha）时用 `file_md5(path)`；只要判断是不是图片/压缩流用
+    `file_info(path)`（返回 (字节数, 前 8 字节 hex)）。
+    **不要**用 `open()` —— 那会被判定为具备文件读写能力，反而需要额外人工确认；
+    受控接口同样是本地读，但属白名单内。
+    **切勿**用文本模式读回来再与 `r.text` 比长度或算 md5 —— 文本模式会把 `\r\n`
+    归一化成 `\n`，两者不是同一个东西（v033 修的正是这类口径混用造成的伪差异）。
 
 字节口径自检（v034）：
     每个响应都带 `total_chars`（正文原始字符数）与 `total_bytes`（原始字节数），
@@ -119,8 +121,10 @@ SCRIPT_MODULE_SOURCE = '''# -*- coding: utf-8 -*-
     **不要**为了重取内容再向目标发一次请求（那会白白消耗目标流量与预算）。
 
     落盘文件是**原始响应字节**（`.bin`），与网络层收到的逐字节一致。请这样读：
-        raw  = open(r["saved_text_path"], "rb").read()   # 逐字节可信，md5/差分用这个
-        text = raw.decode("utf-8", "replace")            # 需要文本时再解码
+        from srcagent import load_bytes, file_md5, file_info
+        raw  = load_bytes(r["saved_text_path"])   # 逐字节可信，md5/差分用这个
+        text = raw.decode("utf-8", "replace")     # 需要文本时再解码
+        file_md5(r["saved_text_path"])            # 直接拿摘要，省得自己 import hashlib
     做**差分或指纹比对**时，务必两边用同一口径：拿 `r.text` 比就都拿 `r.text`，
     拿落盘字节比就都拿落盘字节。**不要**把文本模式读出来（`\r\n` 已被归一化成
     `\n`）的内容去和 `r.text` 比 —— 那是两个东西，会产生伪差异（v033 修的正是
@@ -332,6 +336,69 @@ def load_text(name, encoding="utf-8"):
     """读回 save_text 落盘的文本。"""
     with open(_in_tmpdir(name), "r", encoding=encoding, newline="") as f:
         return f.read()
+
+
+# ---------- 原始字节读取（v045.2） ----------
+# 为什么必须有（实战实测的**文档与判定自相矛盾**）：
+#   平台把大响应落盘成 `.bin`（**原始字节**，见 v033 的换行污染教训），
+#   而模块 docstring 与 saved_text_path 的说明都写着「用 open(path,"rb").read() 读回来」。
+#   但 v045 引入的能力分档器把 `open()` 判为「非只读」——于是**文档推荐的标准动作
+#   被判定器拦掉**。实测第三轮：Agent 要算「key 是否等于图片字节的 md5」，
+#   被 `open()` 卡了两次，退而用工具箱的交互式 md5_tool（非交互调用只打印菜单），
+#   一连白烧三步。
+#   补一对受控接口把这条路打通，判定的白名单也跟着放宽（见 _classify_step.py）。
+def _resolve_in_tmpdir(name_or_path):
+    """把「文件名」或「tmpdir 内的绝对路径」解析成可读路径。
+
+    两种入参都要支持：`save_text` 返回的是绝对路径，而 `list_tmpdir()` 给的是文件名，
+    Agent 两种都会传给下游。绝对路径只放行 tmpdir 内的，越界一律拒绝。
+    """
+    s = str(name_or_path)
+    base = _os.path.abspath(tmpdir())
+    if _os.path.isabs(s):
+        p = _os.path.abspath(s)
+        if p == base or p.startswith(base + _os.sep):
+            return p
+        raise ValueError("只允许读取 tmpdir() 内的文件：%r" % (s,))
+    return _in_tmpdir(s)
+
+
+def load_bytes(name_or_path):
+    """读回**原始字节**（`.bin` 落盘文件、图片、任意二进制）。纯本地读，不出网。
+
+        raw = load_bytes(r["saved_text_path"])     # 落盘文件给的绝对路径可直接用
+        raw = load_bytes("resp_ab12cd34.bin")      # 或 tmpdir 里的文件名
+    """
+    with open(_resolve_in_tmpdir(name_or_path), "rb") as f:
+        return f.read()
+
+
+def file_md5(name_or_path, algo="md5"):
+    """对文件的**原始字节**算摘要，返回十六进制串。
+
+    为什么单独给一个函数而不是让脚本 import hashlib 自己算：
+    算摘要**必须走字节口径** —— 用 `r["text"]`（有损解码，二进制里会出现 U+FFFD）
+    算出来的哈希是无意义的。这个函数把它固化成「读原始字节 → 算摘要」，
+    省得每次都要先解释一遍口径（v033/v034 就是被这类口径混用坑过的）。
+
+        file_md5(r["saved_text_path"])        # 与响应头/服务端 key 比对
+        file_md5("logo.png", algo="sha256")
+    """
+    import hashlib as _hashlib
+    h = _hashlib.new(algo)
+    h.update(load_bytes(name_or_path))
+    return h.hexdigest()
+
+
+def file_info(name_or_path):
+    """返回 (size_bytes, 前 8 字节的 hex)，用于快速判断落盘文件是不是二进制/是否为图片。
+
+    实测痛处：分不清 `.bin` 里到底是「gzip 解压后的 JPEG 原文」还是「压缩流」，
+    导致 Agent 白花一步去猜编码。给个只看头部的轻量探针，一眼定性：
+        JPEG 以 ffd8ff 开头、PNG 以 89504e47 开头、gzip 以 1f8b 开头。
+    """
+    raw = load_bytes(name_or_path)
+    return len(raw), raw[:8].hex()
 
 
 def list_tmpdir():
