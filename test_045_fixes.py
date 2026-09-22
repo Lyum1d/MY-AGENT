@@ -360,15 +360,27 @@ def test_session_detail_confirm_visibility():
     check("等待中会给出人可读摘要", "风险 " in src and "awaiting_summary" in src)
 
 
+# 词干豁免表：这些词干**既是目标域名的词干、也是公开产品/品牌名**，
+# 仓库里正当讨论该产品是合理的，不能一律禁。
+# 例：`discuz` 对应的目标域名是某个开源论坛产品的官网 —— 而该产品本身是公开项目，
+# 知识库里谈论它的指纹特征是必要的。豁免的代价是「该目标名可被推断」，
+# 但那条信息本来就是公开的（产品官网地址写在开源协议的版权页上）。
+_STEM_ALLOW = {"discuz"}
+
+
 def test_no_real_targets_in_tracked_sources():
-    """已跟踪文件里不得出现本机授权靶标域名。
+    """已跟踪文件里不得出现本机授权靶标域名（含**缩写词干**）。
 
     为什么（2026-09-22 实测踩到）：`data/scope.json` 被 gitignore 的理由就是
     「含真实授权靶标，严禁入库」，但源码注释与测试示例里**很容易顺手写进去** ——
     本文件的第一版就在 docstring 里写了 5 处靶标名，随 v045 一起推到了
     **public 仓库**，事后才发现。项目自己的纪律被绕过的方式，往往不是
     刻意提交 scope.json，而是「写注释时顺手带上」。
-    仓库里另有若干历史遗留（数处靶标名散在多个 test_* 与 app/* 注释里）。
+
+    检查键从「完整域名」改为「**词干**」，因为缩写同样是泄露：
+    实测把某个完整域名换成占位之后，它的**词干**（缩写）仍散在 14 个文件里 ——
+    而且这一批是**打包脚本的包内抽查**发现的，本测试当时报的是 PASS。
+    两个教训叠在一起说明：**只查单一形态的防线，价值远低于它的存在感。**
 
     实现要点：靶标列表**从 data/scope.json 动态读取**，测试文件本身不含任何
     靶标名 —— 否则这个防泄露测试自己就成了新的泄露源。
@@ -385,11 +397,20 @@ def test_no_real_targets_in_tracked_sources():
     except Exception as e:                      # noqa: BLE001
         check("scope.json 可解析", False, str(e))
         return
-    # 只查「有辨识度的真实域名」，排除泛化后缀（example.com 之类模板值）
-    targets = [d for d in domains
-               if isinstance(d, str) and "." in d
-               and not d.endswith(("example.com", "example.org"))
-               and d.count(".") >= 1 and len(d) > 8]
+    # 只查「有辨识度的真实域名」，排除泛化后缀（example.com 之类模板值）。
+    # 用**词干**而不是完整域名做主键：完整域名的写法会被缩写绕过 ——
+    # 实测某个域名的**词干**（缩写）散在 14 个文件里，只查完整域名抓不到。
+    # 缩写同样能定位到在测目标。**只查单一形态的防线是个假阳性很高的防线。**
+    brands = [d for d in domains
+              if isinstance(d, str) and "." in d
+              and not d.endswith(("example.com", "example.org"))]
+    targets = []
+    for d in brands:
+        stem = d.split(".")[0].lower()
+        if stem in _STEM_ALLOW:
+            continue                     # 产品名，允许出现（见 _STEM_ALLOW 说明）
+        if len(stem) >= 4 and stem not in targets:
+            targets.append(stem)
     if not targets:
         check("scope.json 无可查靶标 → 跳过", True)
         return
@@ -418,7 +439,7 @@ def test_no_real_targets_in_tracked_sources():
         except Exception:                       # noqa: BLE001
             continue
         for d in targets:
-            if d in text:
+            if re.search(re.escape(d), text, re.I):
                 hits.append(f"{rel}⊃{d}")
     hits = sorted(set(hits))
 
