@@ -174,10 +174,26 @@ async def run_replay(url: str, args: str = "", cancel_event=None,
                                   bytes_in=len(r.content))
 
     # 4. 结构化回传
+    # 长度口径（v045）：**必须以实际解码后的正文为准**。
+    # 原实现写的是 r.headers.get('content-length', len(r.content)) —— 优先取头里的
+    # 声明值，但 gzip 下那只是**压缩后**长度。实测 www.discuz.vip 首页：
+    #   Content-Length 头 18182  /  解码后 90482 字符  /  105723 字节（差 5 倍）
+    # 模型看到一个 18182 会判断「页面很小、没什么内容」，或与 py_exec 报的 90482
+    # 对比后误判「响应变了」。同一文件 174 行的审计字段用的是 len(r.content)——
+    # 也就是说修之前同一个模块对外报一个数、对内记另一个数。
+    # 现在统一报解码后长度，头部值只在**与正文不一致时**作为附注给出并说明原因。
+    n_chars, n_bytes = len(r.text), len(r.content)
+    hdr_cl = r.headers.get("content-length") or ""
+    length_txt = f"{n_chars} chars / {n_bytes} bytes"
+    if hdr_cl.isdigit() and int(hdr_cl) != n_bytes:
+        enc = r.headers.get("content-encoding", "")
+        length_txt += (f"  (Content-Length 头 {hdr_cl}"
+                       + (f"，Content-Encoding: {enc}" if enc else "")
+                       + "，为传输态长度，不是正文长度)")
     lines = [
         f"HTTP {r.status_code} {r.reason_phrase}",
         f"Content-Type: {r.headers.get('content-type', '-')}  "
-        f"Length: {r.headers.get('content-length', len(r.content))}  "
+        f"Length: {length_txt}  "
         f"Server: {r.headers.get('server', '-')}",
     ]
     interesting = ("location", "www-authenticate", "allow", "access-control-allow-origin",

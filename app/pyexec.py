@@ -17,6 +17,7 @@ requests/httpx），而不是把它圈在「选工具→解析输出」的串行
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import logging
 import os
@@ -332,6 +333,42 @@ def _scope_check_target(target: str) -> str | None:
         if denied:
             return denied
     return None
+
+
+def syntax_error(code: str) -> str:
+    """py_exec 语法预检。返回空串表示可编译，否则返回「可操作」的错误说明。
+
+    为什么要有它（v045，discuz.vip 实战实测）：
+      py_exec 是 L3，每个步骤要人工**两轮**确认。而实测 Agent 连续 3 次产出
+      无法编译的代码（`unmatched ')'`、`unterminated string literal`）。原流程下
+      每一步都先弹确认、人工放行后才在子进程里报 SyntaxError。后果有两层：
+        ① 白占两次人工确认（L3 双轮），而这本可以完全避免；
+        ② 失败归因把「语法错误」混进「用户拒绝 / 连续失败」，掩盖真实原因
+           —— 归因错了，后续的熔断与降级判断跟着错。
+      把检查提到确认**之前**，语法错误就退化成一条普通工具反馈：模型立刻重写，
+      人工一次都不用点。
+
+    边界说明：这里**只做语法检查**（`ast.parse`），不做能力判定。
+    「这段代码会不会写文件/起进程/裸连网络」是另一回事，由风险分级、沙箱
+    与流量调度器负责 —— 别把两件事混在一个函数里，否则两边都说不清。
+    """
+    src = (code or "").strip()
+    if not src:
+        return "代码为空"
+    try:
+        ast.parse(src)
+    except SyntaxError as e:
+        loc = f"第 {e.lineno} 行第 {e.offset} 列" if e.lineno else "位置未知"
+        snippet = ""
+        if e.lineno and e.text:
+            snippet = "\n    " + e.text.rstrip()
+        return (f"Python 语法错误（{loc}）：{e.msg}{snippet}\n"
+                "请修正后重新提交。常见原因：括号或引号不配对、"
+                "正则字符串里的引号未转义、多行字符串未闭合。")
+    except ValueError as e:
+        # ast.parse 对含 NUL 字节等异常输入会抛 ValueError
+        return f"代码无法解析：{e}"
+    return ""
 
 
 async def run_py_exec(code: str, target: str = "", cancel_event=None,

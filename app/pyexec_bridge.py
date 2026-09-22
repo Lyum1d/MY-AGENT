@@ -84,8 +84,10 @@ SCRIPT_MODULE_SOURCE = '''# -*- coding: utf-8 -*-
     `error` **恒存在**（成功时为空串），所以 `if r["error"]:` 永远安全 —— 不会再
     出现「文档教你查 error、成功路径却抛 KeyError」的崩溃（v032 修的就是这条）。
     但**不要**用「text 为空」推断目标返回空内容：必须先看 error 与 status_code。
-    访问其它不存在的字段会抛 AttributeError 并列出可用字段，
-    因此不会出现"属性名写错却静默拿到空值"的假阴性。
+    写错字段名（属性或下标都一样）会抛出**带可用字段列表**的错误，并把常见误用
+    直接指向正确键名（如 `body` → 提示 `text`、`status` → 提示 `status_code`）。
+    因此不会出现「字段名写错却静默拿到空值」的假阴性，也不会出现「只报一个
+    KeyError('body') 却不知道正确名字是什么」的死胡同（v045 补的下标报错）。
 
 跨脚本交换数据：
     用 `from srcagent import tmpdir`（**是函数，要加括号**）或 `TMPDIR`（**是常量，
@@ -94,7 +96,22 @@ SCRIPT_MODULE_SOURCE = '''# -*- coding: utf-8 -*-
     不会清理）。两种写法示例：
         from srcagent import TMPDIR      # 常量：os.path.join(TMPDIR, "a.txt")
         from srcagent import tmpdir      # 函数：os.path.join(tmpdir(), "a.txt")
-        open(os.path.join(TMPDIR, "page.html"), "w", encoding="utf-8").write(r["text"])
+
+    **推荐直接用下面这对受控接口**（v045 新增）——它们把路径锁在 tmpdir() 内，
+    不需要 import os、也不需要自己 open：
+        from srcagent import save_text, load_text, list_tmpdir
+        save_text("home.html", r["text"])     # 落盘，返回完整路径
+        html = load_text("home.html")         # 下次 py_exec 里读回来
+        print(list_tmpdir())                  # 确认上一步落了什么
+    （落盘/读盘都用原始字节口径，不做换行归一，可与 r.text 直接比长度。）
+
+流量调度的**硬约束（写脚本前必看）**：
+    所有请求都经宿主调度器，除了 scope / 预算 / 并发 / 暂停态，还有**突发上限**：
+    **10 秒窗口内只放行 1 个请求**（防脚本爆发式请求）。所以
+        for u in urls: safe_http_request(u)          # ✗ 第 2 个请求就会被拒
+    会拿到 {"error": "TRAFFICBUDGETEXCEEDED"} 并在脚本级终止。
+    正确做法是把请求**展开为顺序调用并接受节流**，或分成多次 py_exec 调用；
+    不要试图用循环「多打几个」—— 那正是这条限制要防的行为。
 
 大响应与脚本崩溃（v032/v033）：
     正文达到阈值（默认 8192 字符）就会**自动落盘**，响应里给出 `saved_text_path`。
@@ -130,16 +147,45 @@ class Resp(dict):
     （写 `r.status_code` 而实际只有 `r["status_code"]`）。旧实现下这种误用
     **不会报错**，只是静默返回空值——实测导致 3 次真实请求被误读成
     「目标返回空内容」，差点写进结论。这里让属性访问等价于下标访问，
-    字段不存在时直接抛 AttributeError（并列出可用字段），把静默错误变成显式错误。
+    字段不存在时直接抛错（并列出可用字段），把静默错误变成显式错误。
+
+    v045（discuz.vip 实战）：补上 `__getitem__`。原先只有 `__getattr__` 做了解释性
+    报错，下标访问走 dict 原生的 `__getitem__`，未知键只抛裸的 `KeyError('body')`
+    —— **没有任何线索指向正确字段名**。而模型恰恰更常用下标（`r["text"]`）：
+    实测 Agent 用 `r["body"]` 读正文，拿到 KeyError 后只能白烧一步去内省 API
+    才发现字段叫 `text`。两个访问方式必须给同等质量的错误。
     """
 
-    def __getattr__(self, name):
+    # 常见误用 → 正确字段名。这张表就是「省掉一次白烧步数」的全部成本，
+    # 加的每一对都来自实测踩过的坑。
+    _FIELD_HINT = {
+        "body": "text", "content": "text", "data": "text", "resp": "text",
+        "raw": "text", "html": "text", "response": "text", "json": "text",
+        "status": "status_code", "code": "status_code", "statuscode": "status_code",
+        "header": "headers", "hdr": "headers", "time": "elapsed",
+        "len": "total_chars", "length": "total_chars", "size": "total_bytes",
+    }
+
+    def _explain(self, key):
+        hint = self._FIELD_HINT.get(str(key).lower())
+        tip = "（是否想取 %r？）" % hint if hint else ""
+        return ("响应对象没有字段 %r%s。可用字段：%s"
+                % (key, tip, ", ".join(sorted(self.keys()))))
+
+    def __getitem__(self, key):
         try:
-            return self[name]
+            return dict.__getitem__(self, key)
         except KeyError:
-            raise AttributeError(
-                "响应对象没有字段 %r。可用字段：%s" % (name, ", ".join(sorted(self.keys())))
-            ) from None
+            raise KeyError(self._explain(key)) from None
+
+    def __getattr__(self, name):
+        # 注意用 dict.__getitem__ 而不是 self[name]：虽然本类已定义
+        # __getitem__，但显式走基类可以保证「属性/下标」两条错误路径
+        # 不会互相调用成环（__getattr__ → __getitem__ → ...）。
+        try:
+            return dict.__getitem__(self, name)
+        except KeyError:
+            raise AttributeError(self._explain(name)) from None
 
     def __bool__(self):
         # 空 dict 仍按 dict 语义（False）；这里显式写出避免误解
@@ -245,6 +291,55 @@ def get(url, **kw):
 def post(url, body="", **kw):
     """便捷封装：POST（写方法需人工确认闸门放行后才会由宿主执行）。"""
     return safe_http_request(url, method="POST", body=body, **kw)
+
+
+# ---------- 会话内落盘（v045） ----------
+# 为什么要有这两个函数（discuz.vip 实战实测）：
+#   模块 docstring 一直推荐「大响应落盘后离线解析（避免灌进上下文）」，
+#   但**落盘只能用裸 `open()`** —— 而 `open()` 是文件写入，与「只读脚本」的
+#   静态判定直接冲突。实测 Agent 因此连续写了 3 次带 `open()` 的落盘脚本，
+#   每一步都要 L3 双轮人工确认，卡在闸门上推不动。
+#   一个被文档推荐的标准动作，不该需要走后门。这里给一对受控读写接口：
+#   路径强制锁在 `tmpdir()` 内（防目录穿越），读写都显式 `newline=""`
+#   （v033 的换行污染教训：不指定时 Windows 上会把 LF 写成 CRLF）。
+#   【注意】本模块源码是**三引号字符串**，注释里不要出现反斜杠转义
+#   （写 \\n 会被解释成真换行，直接把源码撕成两半 —— 这个坑本次已经踩过一次）。
+def _in_tmpdir(name):
+    base = _os.path.abspath(tmpdir())
+    p = _os.path.abspath(_os.path.join(base, str(name)))
+    if p != base and not p.startswith(base + _os.sep):
+        raise ValueError(
+            "name 必须是 tmpdir() 内的相对路径，禁止越出目录：%r" % (name,))
+    d = _os.path.dirname(p)
+    if d:
+        _os.makedirs(d, exist_ok=True)
+    return p
+
+
+def save_text(name, text):
+    """把文本写入会话持久目录，返回落盘路径。
+
+        p = save_text("home.html", r["text"])
+        print(p)          # 下次 py_exec 可以直接 load_text("home.html")
+    """
+    p = _in_tmpdir(name)
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(text if isinstance(text, str) else str(text))
+    return p
+
+
+def load_text(name, encoding="utf-8"):
+    """读回 save_text 落盘的文本。"""
+    with open(_in_tmpdir(name), "r", encoding=encoding, newline="") as f:
+        return f.read()
+
+
+def list_tmpdir():
+    """列出会话持久目录里的文件名（便于确认上一步落盘成功）。"""
+    try:
+        return sorted(_os.listdir(tmpdir()))
+    except OSError:
+        return []
 '''
 
 

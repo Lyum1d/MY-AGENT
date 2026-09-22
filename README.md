@@ -398,7 +398,7 @@ src-agent/
 
 | 配置 | 含义 | 默认 | 环境变量 |
 |---|---|---|---|
-| `MAX_STEPS` | 单轮最大步数 | 12 | `AGENT_MAX_STEPS` |
+| `MAX_STEPS` | 单轮最大步数 | 30 | `AGENT_MAX_STEPS` |
 | `TOOL_TIMEOUT` | 单工具总时长(秒) | 600 | `TOOL_TIMEOUT` |
 | `TOOL_IDLE_TIMEOUT` | 无输出判卡死(秒) | 120 | `TOOL_IDLE_TIMEOUT` |
 | `CONFIRM_TIMEOUT` | L2/L3 等用户确认上限(秒) | 600 | `AGENT_CONFIRM_TIMEOUT` |
@@ -406,7 +406,7 @@ src-agent/
 | `INTEL_CAP` | 情报库每类条目上限 | 150 | `INTEL_CAP` |
 | `FAILURE_SWITCH_THRESHOLD` | 连续失败到几次改为要求「换策略」 | 3 | `AGENT_FAILURE_SWITCH` |
 | `FAILURE_STOP_THRESHOLD` | 连续失败到几次才停止 | 6 | `AGENT_FAILURE_STOP` |
-| `RUN_TOKEN_BUDGET` | 单次任务 token 预算（成本熔断） | 800000 | `AGENT_RUN_TOKEN_BUDGET` |
+| `RUN_TOKEN_BUDGET` | 单次任务 token 预算（成本熔断） | 2500000 | `AGENT_RUN_TOKEN_BUDGET` |
 | `PREFERRED_PROVIDER` | 首选供应商（云端优先的解析首位） | deepseek | `AGENT_PREFERRED_PROVIDER` |
 | `SUBTASK_MAX_CONCURRENCY` | 子任务并发上限 | 3 | `SUBTASK_MAX_CONCURRENCY` |
 | `SUBTASK_MAX_STEPS` | 单个子任务步数上限 | 8 | `SUBTASK_MAX_STEPS` |
@@ -417,7 +417,7 @@ src-agent/
 | `HISTORY_SUMMARY_CHARS` | 压缩后每条保留多少字 | 300 | `HISTORY_SUMMARY_CHARS` |
 | `RESTORE_CHAT_MAX` | 续聊时最多还原多少条历史对话 | 24 | `AGENT_RESTORE_CHAT_MAX` |
 | `RESTORE_CHAT_CHARS` | 续聊还原时单条截断字符 | 1200 | `AGENT_RESTORE_CHAT_CHARS` |
-| `STEP_OUTPUT_HEAD` / `_TAIL` | 步骤输出落库保留的首/尾字符数 | 1500 / 2000 | `AGENT_STEP_OUTPUT_HEAD` / `_TAIL` |
+| `STEP_OUTPUT_HEAD` / `_TAIL` | 步骤输出落库保留的首/尾字符数 | 4000 / 4000 | `AGENT_STEP_OUTPUT_HEAD` / `_TAIL` |
 | `FACT_INJECT_MAX` | 系统提示最多注入多少条已证事实 | 20 | `AGENT_FACT_INJECT_MAX` |
 | `RECORD_INJECT_MAX` | 最多注入多少条开局打包记录 | 20 | `AGENT_RECORD_INJECT_MAX` |
 | `BRANCH_INJECT_MAX` | 最多注入多少条其他线索摘要 | 8 | `AGENT_BRANCH_INJECT_MAX` |

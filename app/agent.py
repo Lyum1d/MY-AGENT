@@ -1327,6 +1327,38 @@ class Agent:
                         pass
                     continue
 
+                # ---- py_exec 语法预检（v045）----
+                # 位置很关键：必须在风险闸门**之前**。
+                # py_exec 是 L3，人工要连续确认两轮；而实测 Agent 会连续产出
+                # 无法编译的代码（`unmatched ')'`、`unterminated string literal`）。
+                # 原流程下每一条都先弹确认、人工放行后才在子进程里报 SyntaxError，
+                # 于是：① 白耗两轮人工确认；② 归因把「语法错误」混进「用户拒绝 /
+                # 连续失败」里，掩盖真实原因，连带影响熔断与降级判断。
+                # 提到闸门前，语法错误就退化成一条普通工具反馈——模型立刻重写，
+                # 人工一次都不用点。
+                if tool.alias == "py_exec":
+                    syn = pyexec.syntax_error(args)
+                    if syn:
+                        step.status = "error"
+                        step.output = syn
+                        session.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": ("未提交人工确认（语法预检不通过）：" + syn +
+                                        "\n说明：语法错误在执行前就地拦下，"
+                                        "不消耗确认次数，也无需用户处理。"),
+                        })
+                        # 用 step_done 而不是新造事件类型：前端与落库已经处理
+                        # step_done + status=error 这条路径（见 _run_step 收尾），
+                        # 新增事件类型只会让消费方漏处理。
+                        await session.emit({"type": "step_done",
+                                            "step": self._step_dict(step)})
+                        try:
+                            store.save_step(session.id, self._step_dict(step))
+                        except Exception:
+                            pass
+                        continue
+
                 # ---- 风险闸门 ----
                 if not risk.get("auto", False):
                     approved, edited_args = await self._await_confirm(session, step)
