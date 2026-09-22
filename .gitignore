@@ -26,6 +26,10 @@ probe_result.txt
 api_auth_test_results.json
 *.tmp
 
+# 真机联调脚本（临时）：内部硬编码真实授权靶标，属交战数据，严禁入库。
+# 命名约定以 _live_ 开头，做一次性联调后即弃。
+_live_*.py
+
 # 本机个人配置 / 密钥模板 / 运行时状态 / 备份（不要入库）
 config.yaml
 data/runtime.json
