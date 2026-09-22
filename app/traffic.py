@@ -252,7 +252,7 @@ class TrafficGovernor:
         ⚠️ v040 修正 —— **ConnectRefused（10061）不再升级到任何阻断态**：
         它表示 **TCP 层根本没建链**（端口未监听 / 协议选错），目标零负载，
         与「被 WAF 封禁」语义不同（后者表现为 **RST(10054) 或静默丢包**，即"能连上但被打断"）。
-        实测教训（lsnu 第三轮）：对两个未开 HTTPS 的子域各打一次 `https://`，
+        实测教训（某高校 第三轮）：对两个未开 HTTPS 的子域各打一次 `https://`，
         2 次 10061 就把**整个根域名**判为 BLOCKED，**连累其余 7 个子域（含最有价值的那个）
         全部无法测绘** —— 一次协议选错被放大成全目标停摆。
         """
@@ -271,7 +271,7 @@ class TrafficGovernor:
         st = self._load_state(root, project_id)
         cur = st.get("state", ST_NORMAL)
         new = cur
-        # v040（lsnu 第三轮实测）：**ConnectRefused（10061）不再触发熔断**。
+        # v040（某高校 第三轮实测）：**ConnectRefused（10061）不再触发熔断**。
         #
         # 语义区分（这是本次修正的核心）：
         #   · RST（10054）/ 静默丢包（timeout）→ 说明「**能连上但被打断**」，是封禁的典型特征；

@@ -92,7 +92,7 @@ check("COOLDOWN 中再 RST → BLOCKED", st["state"] == traffic.ST_BLOCKED, st["
 
 # v040 修正：ConnectRefused（10061）= TCP 层没建链（端口未监听 / 协议选错），
 # **不再触发熔断**。旧实现「2 次即 BLOCKED」曾导致一次协议选错就熔断整个根域名
-# （lsnu 第三轮实测：对两个未开 HTTPS 的子域各打一次 https，其余 7 个子域全被误伤）。
+# （某高校 第三轮实测：对两个未开 HTTPS 的子域各打一次 https，其余 7 个子域全被误伤）。
 g2 = fresh()
 g2.note_signal("refuse-test.com", wafsignal.SIG_NET_REFUSED, os_error_code=10061)
 st2 = g2.note_signal("refuse-test.com", wafsignal.SIG_NET_REFUSED, os_error_code=10061)

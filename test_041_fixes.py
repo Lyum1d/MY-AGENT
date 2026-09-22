@@ -3,7 +3,7 @@
 
     python test_041_fixes.py
 
-现场（lsnu 第三轮）：任务因 **token 预算耗尽（811,983 / 上限 800,000）** 被平台主动停止，
+现场（某高校 第三轮）：任务因 **token 预算耗尽（811,983 / 上限 800,000）** 被平台主动停止，
 **一句最终结论都没输出** —— 测绘做完了大半，报告只能靠人工从事实库回捞，属交付层面的缺口。
 
 复盘出三个问题（本次全部落地）：
@@ -50,6 +50,11 @@ def check(name, cond, detail=""):
     print(("  ✅ " if cond else "  ❌ ") + name + (f"  [{detail}]" if detail and not cond else ""))
 
 
+def skip(name, why=""):
+    """环境性跳过：既不计通过也不计失败，保持 `结果：N 通过 / M 失败` 格式。"""
+    print(f"  ⏭ {name}" + (f"  [{why}]" if why else ""))
+
+
 print("=" * 68)
 print("A. token 预算默认值与预警比例")
 print("=" * 68)
@@ -91,9 +96,17 @@ check("C3 无该字段时不报错、不显示（兼容旧调用）",
 print()
 print("D. 编排脚本：续跑用「事件基线」游标")
 print("=" * 68)
-runner = Path(r"C:\Users\Lianaxber\WorkBuddy\2026-09-21-10-32-43\.workbuddy\tools_run_lsnu.py")
-check("D1 脚本存在", runner.exists(), str(runner))
-if runner.exists():
+# 这段校验的是「编排脚本的续跑游标」实现，而那个脚本**不在本仓库内**
+# （它在某个工作区的 .workbuddy/ 下，随项目走）。
+# 原实现把**带用户名的绝对路径**写死在源码里 —— 既泄露本机路径与在测目标，
+# 也让这个测试在别人的机器上必然失败（路径根本不存在）。
+# 改为从环境变量取路径；没设就 SKIP，而不是判失败。
+_runner_env = os.environ.get("SRC_AGENT_RUNNER", "")
+runner = Path(_runner_env) if _runner_env else None
+if not runner or not runner.exists():
+    skip("D1-D5 编排脚本续跑游标（未设 SRC_AGENT_RUNNER 或文件不存在）")
+else:
+    check("D1 脚本存在", runner.exists(), str(runner.name))
     src = runner.read_text(encoding="utf-8")
     check("D2 引入 rerun_baseline", "rerun_baseline" in src)
     check("D3 探测当前最大 _seq", '"last_event_id": 0' in src and "_seq" in src)

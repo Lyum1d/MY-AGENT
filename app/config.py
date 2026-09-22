@@ -124,7 +124,7 @@ RESTORE_CHAT_CHARS = int(os.getenv("AGENT_RESTORE_CHAT_CHARS", "1200"))  # 单�
 # 此前只存尾部（output[-2000:]），导致工具开头的关键结果（命中统计、存活清单首页）
 # 永久丢失，而上下文压缩又提示模型「可用 search_history 检索」——提示与事实不符。
 # 改为头 + 尾都保留，中间以省略标记连接。
-# v031（第三轮 shhxqh 实战）：1500/2000 依然不够 —— 功能码全集、存活清单这类**中段**
+# v031（第三轮 某企业站 实战）：1500/2000 依然不够 —— 功能码全集、存活清单这类**中段**
 # 结果仍落进省略区，模型只能重新向目标发请求回捞（实测 6 次，占全局预算 1/3）。
 # 提到 4000/4000：单步落库上限 8KB，steps 表膨胀可控，换取「落库版本≈可用版本」。
 STEP_OUTPUT_HEAD = int(os.getenv("AGENT_STEP_OUTPUT_HEAD", "4000"))
@@ -171,7 +171,7 @@ FAILURE_STOP_THRESHOLD = int(os.getenv("AGENT_FAILURE_STOP", "6"))
 RUN_TOKEN_BUDGET = int(os.getenv("AGENT_RUN_TOKEN_BUDGET", "2500000"))
 # v041：token 预算的**预警比例** —— 达到该比例即注入「强制收敛、先出结论」提示。
 # 为什么必须有：原实现只有「步数」预警（BUDGET_REMIND_AT），token 仅在**超限瞬间**
-# 硬熔断。实测（lsnu 第三轮）出现「步数还有余、token 先超」：811,983/800,000 被直接截断，
+# 硬熔断。实测（某高校 第三轮）出现「步数还有余、token 先超」：811,983/800,000 被直接截断，
 # 测绘做完了却没输出任何结论，报告只能靠人工从事实库回捞 —— 交付层面的缺口。
 TOKEN_BUDGET_WARN_RATIO = float(os.getenv("AGENT_TOKEN_WARN_RATIO", "0.8"))
 
@@ -259,7 +259,7 @@ SCANNER_DEFAULT_THREADS = int(os.getenv("AGENT_SCANNER_DEFAULT_THREADS", "2"))  
 SUBTASK_MIN_BUDGET = int(os.getenv("AGENT_SUBTASK_MIN_BUDGET", "6"))
 
 # v023.7：项目「已证实事实」自动注入（每轮提醒里带上，供后续线索复用）。
-# 背景（shhxqh 第二轮实战）：第一轮的已证实事实（后端入口、免权限控制器…）
+# 背景（某企业站 第二轮实战）：第一轮的已证实事实（后端入口、免权限控制器…）
 # 只能靠人工写进任务书复述给模型，否则模型会重新发现甚至重复验证。
 INJECT_FACTS = os.getenv("AGENT_INJECT_FACTS", "1") == "1"
 INJECT_FACTS_MAX = int(os.getenv("AGENT_INJECT_FACTS_MAX", "10"))       # 最多注入条数

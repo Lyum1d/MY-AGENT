@@ -323,7 +323,7 @@ def _budget_note(budget: dict) -> str:
     if tok and tok_cap:
         head += f"累计 token {tok:,}/{tok_cap:,}。"
         # v041：**token 预算也要预警**（原实现只按步数预警）。
-        # 实测教训（lsnu 第三轮）：步数还有余（17/30）但 token 先超（811,983/800,000），
+        # 实测教训（某高校 第三轮）：步数还有余（17/30）但 token 先超（811,983/800,000），
         # 预警根本没触发 → 直接硬熔断 → **测绘做完了却没输出任何结论**。
         # 现在达到预警比例就先要求收敛，给模型一个"先把结论写出来"的机会。
         tok_warn = tok >= tok_cap * config.TOKEN_BUDGET_WARN_RATIO
@@ -344,7 +344,7 @@ def _budget_note(budget: dict) -> str:
 def _facts_note(session) -> str:
     """v023.7：把项目**已证实事实**注入每轮上下文，供跨线索复用。
 
-    为什么必须有（shhxqh 实战）：第一轮已证实的事实（CMS 后端入口、免权限
+    为什么必须有（某企业站 实战）：第一轮已证实的事实（CMS 后端入口、免权限
     控制器可达…）在第二轮只能靠**人工写进任务书**复述——平台不注入，模型要么
     重新发现（浪费预算与流量），要么在压缩后彻底失忆。这里把 verified 事实
     自动带上，candidate（未经确认）不注入，避免把猜测当既定前提。
@@ -514,7 +514,7 @@ _TARGET_FLAGS = {"-u", "--url", "-t", "--target"}
 _COMPRESSED_PREFIX = "〔已压缩〕"
 
 # 关键命中行特征（v023.6）：压缩时优先保留这些行，而不是只留输出首行。
-# 背景（shhxqh 实战）：ehole 的指纹命中位于输出中后部，压缩只留首行后
+# 背景（某企业站 实战）：ehole 的指纹命中位于输出中后部，压缩只留首行后
 # **证据不可再引用**，模型只能把指纹记为「候选」。这里改成按特征挑行 +
 # 自动落一条**候选**事实（带 step_id 溯源），压缩后仍可回查。
 _KEY_LINE_PATTERNS = (
@@ -2352,7 +2352,7 @@ class Agent:
         # /api/sessions/{sid}/cancel 置位）。
         # v023.6：把项目/会话上下文透传到每个出网入口——否则流量事件的
         # project_id 为空，项目维度的流量审计（面板/报告）查不到任何数据
-        # （shhxqh 实战暴露：442 条事件全部落在空项目桶）。
+        # （某企业站 实战暴露：442 条事件全部落在空项目桶）。
         _ctx = {"project_id": session.project or "", "session_id": session.id}
         if tool.alias == "httpreplay":
             gen = replayer.run_replay(step.target, step.args,

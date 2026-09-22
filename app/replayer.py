@@ -106,7 +106,7 @@ async def run_replay(url: str, args: str = "", cancel_event=None,
     """HTTP 重放器事件流。事件格式与 executor.run 一致。
 
     v023.6：project_id/session_id 透传到流量事件——缺了它们，项目维度的
-    流量审计查不到数据（shhxqh 实战暴露：事件全落在空项目桶）。
+    流量审计查不到数据（某企业站 实战暴露：事件全落在空项目桶）。
     """
     url = (url or "").strip().strip("'\"")
     # v012 后半：取消硬终止——发请求前检查，置位即放弃本次请求

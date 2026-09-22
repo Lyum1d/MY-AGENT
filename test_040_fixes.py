@@ -3,7 +3,7 @@
 
     python test_040_fixes.py
 
-现场（lsnu 第三轮）：Agent 对两个**未开 HTTPS** 的子域各打了一次 `https://`，两次都是
+现场（某高校 第三轮）：Agent 对两个**未开 HTTPS** 的子域各打了一次 `https://`，两次都是
 `ConnectRefused(10061)` —— 这本该被读作「**TCP 层没建链**（端口未监听/协议选错）」，
 但当时 `REFUSED_TO_BLOCK = 2` 让它直接升级为 **BLOCKED**，把**整个根域名 campus.test 熔断**，
 **连累其余 7 个子域（含最有价值的 jwgl）全部无法测绘**，本轮 4 个测绘目标只完成 1 个。
