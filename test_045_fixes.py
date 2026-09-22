@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """v045 优化回归测试：确认闸门前置与口径修复。
 
-本文件覆盖 2026-09-22 discuz.vip 实战暴露的四个具体缺陷（每个都有现场证据）：
+本文件覆盖 2026-09-22 实战暴露的四个具体缺陷（每个都有现场证据）：
 
   A. py_exec 语法预检 —— 实战中 Agent **连续 3 次**产出无法编译的代码
      （`unmatched ')'`、`unterminated string literal`），每次都先弹 L3 双轮确认、
@@ -25,8 +25,10 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -358,6 +360,80 @@ def test_session_detail_confirm_visibility():
     check("等待中会给出人可读摘要", "风险 " in src and "awaiting_summary" in src)
 
 
+def test_no_real_targets_in_tracked_sources():
+    """已跟踪文件里不得出现本机授权靶标域名。
+
+    为什么（2026-09-22 实测踩到）：`data/scope.json` 被 gitignore 的理由就是
+    「含真实授权靶标，严禁入库」，但源码注释与测试示例里**很容易顺手写进去** ——
+    本文件的第一版就在 docstring 里写了 5 处靶标名，随 v045 一起推到了
+    **public 仓库**，事后才发现。项目自己的纪律被绕过的方式，往往不是
+    刻意提交 scope.json，而是「写注释时顺手带上」。
+    仓库里另有若干历史遗留（数处靶标名散在多个 test_* 与 app/* 注释里）。
+
+    实现要点：靶标列表**从 data/scope.json 动态读取**，测试文件本身不含任何
+    靶标名 —— 否则这个防泄露测试自己就成了新的泄露源。
+    scope.json 不存在（他人克隆仓库）时跳过，不误报。
+    """
+    print("\n[H] 已跟踪源码不得含真实靶标（防「写注释顺手带进去」）")
+    repo = Path(__file__).resolve().parent
+    scope_file = repo / "data" / "scope.json"
+    if not scope_file.exists():
+        check("scope.json 不存在 → 跳过（非本机环境）", True)
+        return
+    try:
+        domains = json.loads(scope_file.read_text(encoding="utf-8")).get("domains") or []
+    except Exception as e:                      # noqa: BLE001
+        check("scope.json 可解析", False, str(e))
+        return
+    # 只查「有辨识度的真实域名」，排除泛化后缀（example.com 之类模板值）
+    targets = [d for d in domains
+               if isinstance(d, str) and "." in d
+               and not d.endswith(("example.com", "example.org"))
+               and d.count(".") >= 1 and len(d) > 8]
+    if not targets:
+        check("scope.json 无可查靶标 → 跳过", True)
+        return
+
+    r = subprocess.run(["git", "ls-files"], cwd=repo, capture_output=True,
+                       text=True, errors="replace")
+    tracked = [x for x in (r.stdout or "").splitlines() if x.strip()]
+    if not tracked:
+        check("git 不可用或非仓库 → 跳过", True)
+        return
+
+    hits: list[str] = []
+    for rel in tracked:
+        p = repo / rel
+        if p.suffix.lower() not in (".py", ".md", ".txt", ".json", ".example",
+                                    ".yaml", ".yml", ".js", ".html", ".bat"):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:                       # noqa: BLE001
+            continue
+        for d in targets:
+            if d in text:
+                hits.append(f"{rel}⊃{d}")
+    hits = sorted(set(hits))
+
+    # 分两段：本轮文件硬失败；历史遗留只报告。
+    # 为什么不一刀切失败：历史遗留（长期文档里的默认靶标示例、
+    # 另有 shhxqh/lsnu/cread 散落在若干 test_* 与 kb 文档里）属**既有问题**，
+    # 需要在单独一个版本里做统一脱敏；现在直接判红会把「回归 0 失败」这条
+    # 项目基线打破，反而让真正的回归信号被淹没。
+    OUR_FILES = ("app/pyexec.py", "app/pyexec_bridge.py", "app/replayer.py",
+                 "test_045_fixes.py", "app/main.py", "app/agent.py",
+                 "README.md", "run_all_tests.py")
+    ours = [h for h in hits if h.split("⊃")[0] in OUR_FILES]
+    legacy = [h for h in hits if h.split("⊃")[0] not in OUR_FILES]
+    check(f"本版改动过的文件不含真实靶标（查了 {len(targets)} 个域）",
+          not ours, "命中：" + "；".join(ours[:6]))
+    if legacy:
+        print(f"  [WARN] 历史遗留（需单独版本统一脱敏，共 {len(legacy)} 处）：")
+        for h in legacy[:10]:
+            print(f"         {h}")
+
+
 def main():
     print("=" * 68)
     print("v045 优化回归：确认闸门前置与口径修复")
@@ -371,6 +447,7 @@ def main():
     test_classifier_whitelist_synced()
     test_readme_defaults_in_sync()
     test_session_detail_confirm_visibility()
+    test_no_real_targets_in_tracked_sources()
     print("\n" + "=" * 68)
     print(f"结果：{PASS} 通过 / {FAIL} 失败")
     print("=" * 68)

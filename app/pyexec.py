@@ -338,7 +338,7 @@ def _scope_check_target(target: str) -> str | None:
 def syntax_error(code: str) -> str:
     """py_exec 语法预检。返回空串表示可编译，否则返回「可操作」的错误说明。
 
-    为什么要有它（v045，discuz.vip 实战实测）：
+    为什么要有它（v045，实战实测）：
       py_exec 是 L3，每个步骤要人工**两轮**确认。而实测 Agent 连续 3 次产出
       无法编译的代码（`unmatched ')'`、`unterminated string literal`）。原流程下
       每一步都先弹确认、人工放行后才在子进程里报 SyntaxError。后果有两层：

@@ -176,7 +176,7 @@ async def run_replay(url: str, args: str = "", cancel_event=None,
     # 4. 结构化回传
     # 长度口径（v045）：**必须以实际解码后的正文为准**。
     # 原实现写的是 r.headers.get('content-length', len(r.content)) —— 优先取头里的
-    # 声明值，但 gzip 下那只是**压缩后**长度。实测 www.discuz.vip 首页：
+    # 声明值，但 gzip 下那只是**压缩后**长度。实测某站点首页：
     #   Content-Length 头 18182  /  解码后 90482 字符  /  105723 字节（差 5 倍）
     # 模型看到一个 18182 会判断「页面很小、没什么内容」，或与 py_exec 报的 90482
     # 对比后误判「响应变了」。同一文件 174 行的审计字段用的是 len(r.content)——
