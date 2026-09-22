@@ -394,9 +394,15 @@ def test_no_real_targets_in_tracked_sources():
         check("scope.json 无可查靶标 → 跳过", True)
         return
 
-    r = subprocess.run(["git", "ls-files"], cwd=repo, capture_output=True,
-                       text=True, errors="replace")
-    tracked = [x for x in (r.stdout or "").splitlines() if x.strip()]
+    # 注意：必须显式按 UTF-8 解码 git 输出，**不能**用 text=True ——
+    # text=True 走系统 locale（本机 cp936），中文文件名（如
+    # `docs/burp-mcp-接入指南.md`）会被解坏 → 路径找不到 → 被静默跳过。
+    # 实测代价：这个 bug 让本测试对着 5 处真实靶标报了 PASS（假阴性），
+    # 是发布脚本的另一套红线才抓出来的。**防线自己有 bug 比没有防线更危险**。
+    r = subprocess.run(["git", "ls-files", "-z"], cwd=repo,
+                       capture_output=True)
+    tracked = [x.decode("utf-8", "replace")
+               for x in r.stdout.split(b"\x00") if x.strip()]
     if not tracked:
         check("git 不可用或非仓库 → 跳过", True)
         return
@@ -416,22 +422,11 @@ def test_no_real_targets_in_tracked_sources():
                 hits.append(f"{rel}⊃{d}")
     hits = sorted(set(hits))
 
-    # 分两段：本轮文件硬失败；历史遗留只报告。
-    # 为什么不一刀切失败：历史遗留（长期文档里的默认靶标示例、
-    # 另有 shhxqh/lsnu/cread 散落在若干 test_* 与 kb 文档里）属**既有问题**，
-    # 需要在单独一个版本里做统一脱敏；现在直接判红会把「回归 0 失败」这条
-    # 项目基线打破，反而让真正的回归信号被淹没。
-    OUR_FILES = ("app/pyexec.py", "app/pyexec_bridge.py", "app/replayer.py",
-                 "test_045_fixes.py", "app/main.py", "app/agent.py",
-                 "README.md", "run_all_tests.py")
-    ours = [h for h in hits if h.split("⊃")[0] in OUR_FILES]
-    legacy = [h for h in hits if h.split("⊃")[0] not in OUR_FILES]
-    check(f"本版改动过的文件不含真实靶标（查了 {len(targets)} 个域）",
-          not ours, "命中：" + "；".join(ours[:6]))
-    if legacy:
-        print(f"  [WARN] 历史遗留（需单独版本统一脱敏，共 {len(legacy)} 处）：")
-        for h in legacy[:10]:
-            print(f"         {h}")
+    # v046 起：**全量硬失败**，不再有「历史遗留」豁免。
+    # （v045 首次引入时历史遗留还有 20+ 处，一刀切判红会打破「回归 0 失败」基线，
+    #  所以当时分两段；v046 已把那 64 处全部脱敏，豁免随之取消。）
+    check(f"已跟踪文件不含真实靶标（查了 {len(targets)} 个域 / {len(tracked)} 个文件）",
+          not hits, "命中：" + "；".join(hits[:8]))
 
 
 def test_load_bytes_and_hash():

@@ -3,7 +3,7 @@
 
     python test_043_fixes.py
 
-现场（lsnu.edu.cn 第四轮）：目标前端 JS 里明文硬编码了 RSA 私钥。该材料被写进本地事实库，
+现场（campus.test 第四轮）：目标前端 JS 里明文硬编码了 RSA 私钥。该材料被写进本地事实库，
 而**事实库会注入每轮上下文、上下文会外发到云端模型**（model-studio）。原有 `_SECRET_RE`
 只认 `private_key` 这类关键词，**不匹配 `private_exponent`**，于是**私钥会原样出网** ——
 违反公益 SRC「严禁保存、传播、泄露测试中获取的任何数据」。

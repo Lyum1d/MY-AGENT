@@ -98,7 +98,7 @@ check("pyexec 对 single_shot 输出提示", "不经过**流量调度器" in src
 check("提示说明不受预算/暂停态约束", "不受目标暂停态约束" in src)
 
 print("== C. 长 URL 目标（P1） ==")
-u150 = "https://www.shhxqh.com/hxqhcms/SyncNoRightAction.do?_funccode_=C_CMS_W_Articles&" \
+u150 = "https://www.site-a.test/hxqhcms/SyncNoRightAction.do?_funccode_=C_CMS_W_Articles&" \
        "action=downloadatt&attguid=CB173DC2F97AB211E9961EBC5BCD7835&exe=view&ext=pdf&x=1"
 check("151 字符 URL 通过校验（原先被拒）",
       agent_mod.validate_target(u150) is None, agent_mod.validate_target(u150))
@@ -111,11 +111,11 @@ check("非 URL 目标仍限 120（防自然语言）",
 print("== D. 脏数据清理（P2） ==")
 store.upsert_traffic_state("", {"root_domain": "0.1", "state": "NORMAL", "reason": ""})
 store.upsert_traffic_state("", {"root_domain": "127.0.0.1", "state": "NORMAL", "reason": ""})
-store.upsert_traffic_state("", {"root_domain": "shhxqh.com", "state": "NORMAL", "reason": ""})
+store.upsert_traffic_state("", {"root_domain": "site-a.test", "state": "NORMAL", "reason": ""})
 n = store.cleanup_traffic_states()
 check("删除 1 条无效残留", n == 1, n)
 left = {s["root_domain"] for s in store.list_traffic_states("")}
-check("合法 IP 与域名保留", "127.0.0.1" in left and "shhxqh.com" in left, sorted(left))
+check("合法 IP 与域名保留", "127.0.0.1" in left and "site-a.test" in left, sorted(left))
 check("残留已消失", "0.1" not in left)
 
 print("== E. 拒绝文本含改写范例（P2） ==")

@@ -133,12 +133,12 @@ for _mod in ("executor", "replayer"):
 config.SCOPE_FILE = _ORIG_SCOPE
 
 # ---- 审计 P0-2/P0-3 绕过用例固化（2026-09-16）：这些形态必须永远被拒绝 ----
-set_scope(["example.com", "jiaoyu.cn"])
+set_scope(["example.com", "target.test"])
 _scope2 = load_scope()
 check("白名单加载非空", bool(_scope2), _scope2)
 
 # P0-3：url 型 target 用「授权域/+空格」夹带第二目标（修复前放行）
-_argv3 = ["tool.exe", "finger", "-u", "https://jiaoyu.cn/", "evil.com"]
+_argv3 = ["tool.exe", "finger", "-u", "https://target.test/", "evil.com"]
 _e3 = first_unauthorized_host_in_argv(_argv3)
 check("P0-3 url 型空格夹带被 argv 复核拦截",
       _e3 is not None and _e3[1] == "evil.com", _e3)
@@ -155,9 +155,9 @@ check("本地路径不产出主机", find_hosts("E:\\tool\\dirsearch.py") == [],
 check("URL token 不被盘符正则跳过", bool(find_hosts("https://evil.com")))
 # P2-3：尾点 FQDN 归一
 check("P2-3 尾点 FQDN 归一后放行",
-      _host_in_scope(_target_host("www.jiaoyu.cn."), ["jiaoyu.cn"]))
+      _host_in_scope(_target_host("www.target.test."), ["target.test"]))
 # 第五节：前导点/后缀变体仍全部拒绝
-for _h in ("evil-jiaoyu.cn", "notjiaoyu.cn", "jiaoyu.cn.evil.com", "www.jiaoyu.cn.evil.com"):
+for _h in ("evil-target.test", "nottarget.test", "target.test.evil.com", "www.target.test.evil.com"):
     check(f"后缀变体拒绝：{_h}", not _host_in_scope(_h, _scope2))
 
 config.SCOPE_FILE = _ORIG_SCOPE
@@ -167,27 +167,27 @@ config.SCOPE_FILE = _ORIG_SCOPE
 # evil.com 即可绕过全部校验。这组用例钉住 first_unauthorized_target_list_in_argv。
 from app.scope import first_unauthorized_target_list_in_argv   # noqa: E402
 
-set_scope(["example.com", "jiaoyu.cn"])
+set_scope(["example.com", "target.test"])
 _lf = _TMP / "targets.txt"
 
-_lf.write_text("https://jiaoyu.cn\nhttps://example.com/admin\n", encoding="utf-8")
+_lf.write_text("https://target.test\nhttps://example.com/admin\n", encoding="utf-8")
 check("列表文件全授权 → 放行",
       first_unauthorized_target_list_in_argv(
           ["nuclei", "-l", str(_lf)]) is None)
 
-_lf.write_text("jiaoyu.cn\nevil.com\nsub.example.com\n", encoding="utf-8")
+_lf.write_text("target.test\nevil.com\nsub.example.com\n", encoding="utf-8")
 check("列表文件含未授权域名 → 拦截 evil.com",
       first_unauthorized_target_list_in_argv(
           ["nuclei", "-l", str(_lf)]) == ("-l", "evil.com"))
 
-_lf.write_text("# 注释行\nhttp://jiaoyu.cn:8443/x\n192.168.1.10\n", encoding="utf-8")
+_lf.write_text("# 注释行\nhttp://target.test:8443/x\n192.168.1.10\n", encoding="utf-8")
 check("列表文件含未授权 IP → 拦截",
       first_unauthorized_target_list_in_argv(
           ["httpx", "--list", str(_lf)]) == ("--list", "192.168.1.10"))
 
 check("无列表参数 → 放行",
       first_unauthorized_target_list_in_argv(
-          ["nuclei", "-u", "https://jiaoyu.cn/"]) is None)
+          ["nuclei", "-u", "https://target.test/"]) is None)
 check("列表旗标后无值 → 放行（交工具自行报错）",
       first_unauthorized_target_list_in_argv(
           ["nuclei", "-l", "-t", "cves"]) is None)

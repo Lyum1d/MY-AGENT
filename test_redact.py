@@ -43,7 +43,7 @@ cases = [
     ("password=Admin@123! 不许泄漏", "[REDACTED_SECRET]", "Admin@123!"),
     ('"api_key": "sk-abcdef123456"', "[REDACTED_SECRET]", "sk-abcdef123456"),
     ("access_token: AT-999888777", "[REDACTED_SECRET]", "AT-999888777"),
-    ("管理员邮箱 admin@jiaoyu.cn 请联系", "[REDACTED_EMAIL]@jiaoyu.cn", "admin@jiaoyu.cn"),
+    ("管理员邮箱 admin@target.test 请联系", "[REDACTED_EMAIL]@target.test", "admin@target.test"),
     ("拨打电话 13812345678 核实", "[REDACTED_PHONE]", "13812345678"),
 ]
 for text, must_have, must_lose in cases:
@@ -53,7 +53,7 @@ for text, must_have, must_lose in cases:
 
 print("=== 2. 正常内容零误伤 ===")
 clean_cases = [
-    "https://www.jiaoyu.cn/admin/login.php",
+    "https://www.target.test/admin/login.php",
     "目标 192.168.0.1 开放 80/443 端口",
     "SQLite version 3.45.0, Python 3.13",
     "版本号 13812.345678 无关手机号",
@@ -78,7 +78,7 @@ config.CLOUD_EGRESS_MODE = _ORIG_MODE
 print("=== 4. egress_messages 深拷贝契约 ===")
 config.CLOUD_EGRESS_MODE = "redact"
 orig_msgs = [
-    {"role": "user", "content": "测试 jiaoyu.cn"},
+    {"role": "user", "content": "测试 target.test"},
     {"role": "tool", "tool_call_id": "t1",
      "content": "Cookie: sid=keepme-original; HttpOnly"},
     {"role": "assistant", "content": "",

@@ -22,7 +22,7 @@ _TMP = Path(tempfile.mkdtemp(prefix="src_agent_imp_test_"))
 config.DATA_DIR = _TMP
 scope_file = _TMP / "scope_v017.json"
 # scope：example.com + example.com:8443 限定；evil.com 用于验证越权拒绝
-scope_file.write_text('{"targets": [{"host": "example.com"}], "domains": ["jiaoyu.cn"]}',
+scope_file.write_text('{"targets": [{"host": "example.com"}], "domains": ["target.test"]}',
                       encoding="utf-8")
 config.SCOPE_FILE = scope_file
 
@@ -168,7 +168,7 @@ check("HAR query 语义键识别", any(c["field"] == "userId" for c in r0["objec
 
 print("== G. 入库与查询（项目隔离） ==")
 pid = store.create_project("导入测试", "example.com")["id"]
-pid2 = store.create_project("另一个项目", "jiaoyu.cn")["id"]
+pid2 = store.create_project("另一个项目", "target.test")["id"]
 n_inserted = 0
 for rec in records + records_h:
     if rec["scope_status"] == "allowed" and "duplicate" not in rec.get("tags", []):

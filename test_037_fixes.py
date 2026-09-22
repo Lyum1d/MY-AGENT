@@ -3,7 +3,7 @@
 
     python test_037_fixes.py
 
-现场（cread.com 首轮实战）：服务在 `pyexec.py` 清理 py_exec 工作目录时**整个进程退出**，
+现场（vendor.test 首轮实战）：服务在 `pyexec.py` 清理 py_exec 工作目录时**整个进程退出**，
 编排脚本随即因 SSE 断流报 `RemoteProtocolError`。根因不是网络，而是：
 
     [safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":54,"threshold":50,...}

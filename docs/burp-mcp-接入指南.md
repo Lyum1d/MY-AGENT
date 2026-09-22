@@ -70,24 +70,27 @@ E:\vulnclaw\burp-mcp\build\libs\burp-mcp-all.jar
 MCP 标签页里找到 **Auto-approve targets**，把 `data/scope.json` 里的授权域
 **逐个**加进去：
 
-**不要硬编码本文档的清单** —— 以 `data/scope.json` 为准，用下面的命令导出：
+**本文档刻意不列出授权域清单** —— 以本机 `data/scope.json` 为准，用下面的命令导出：
 
 ```bash
 python -c "import sys;sys.path.insert(0,'.');from app import scope;print('\n'.join(scope.load_scope()))"
 ```
 
-当前本机授权域（示例，随时可能变）：
+把导出结果**逐行**填进 Burp 的 Auto-approve targets，形如：
 
 ```
-jiaoyu.cn
-www.jiaoyu.cn
-shhxqh.com
-cread.com
-lsnu.edu.cn
+example.com
+www.example.com
+*.example.com
 ```
 
-> 也可以写 `*.lsnu.edu.cn` 用通配，但注意**通配范围比 scope.json 更宽**，
-> 请确认等价或更严再使用。
+> 上面是占位示例，**不是**真实清单。
+>
+> 为什么不在文档里写真实域名：本仓库是 **public**，而授权目标是**交战数据**。
+> `data/scope.json` 被 gitignore 的理由正是这条；文档里顺手列一份等于绕开它
+> —— 而这个口子比那个文件更隐蔽（谁会去看文档中间的一个代码块？）。
+>
+> 通配（`*.example.com`）比 `scope.json` 的匹配**更宽**，用之前请确认等价或更严。
 
 这一步的意义：**Burp 侧的审批闸门与 Agent 侧的 scope.json 形成两道独立闸门**。
 任何一侧配错，另一侧仍能拦住越权请求。

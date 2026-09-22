@@ -48,11 +48,11 @@ def check(name, cond, extra=""):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}{(' → ' + str(extra)) if extra else ''}")
 
 
-prj = store.create_project("v0237注入", "shhxqh.com")["id"]
+prj = store.create_project("v0237注入", "site-a.test")["id"]
 prj_empty = store.create_project("空事实项目", "x.com")["id"]
 
 # ---- 造数：verified 2 条 / candidate 1 条 / rejected 1 条 ----
-store.add_fact(prj, "CMS 后端入口泄露：https://shhxqh.com/hxqhcms/ 可直接访问",
+store.add_fact(prj, "CMS 后端入口泄露：https://site-a.test/hxqhcms/ 可直接访问",
                source="manual", status="verified")
 store.add_fact(prj, "SyncNoRightAction.do 免权限控制器未认证可达，返回管理端门户外壳",
                source="manual", status="verified")
@@ -105,16 +105,16 @@ check("恢复后仍可注入", bool(facts_note(prj)))
 
 print("== F. 接线到 _build_reminder ==")
 _step = agent_mod.Step(id="s1", tool_alias="httpx", tool_name="httpx",
-                       target="shhxqh.com", args="{}", risk={}, status="done")
-s = agent_mod.Session(id="rem1", project=prj, target="shhxqh.com", steps=[_step])
+                       target="site-a.test", args="{}", risk={}, status="done")
+s = agent_mod.Session(id="rem1", project=prj, target="site-a.test", steps=[_step])
 rem = agent_mod.Agent._build_reminder(s, budget={"total": 30, "step_no": 3, "elapsed": 10})
 check("提醒里含事实段", "【项目已证实事实" in rem)
-check("提醒里仍含目标段", "【本次任务目标：shhxqh.com】" in rem)
+check("提醒里仍含目标段", "【本次任务目标：site-a.test】" in rem)
 check("事实段位于目标段之后", rem.index("【项目已证实事实") > rem.index("【本次任务目标"))
 check("提醒里仍含工具历史段（接线未破坏既有顺序）", "【本轮已尝试过的工具】" in rem)
 check("事实段位于工具历史段之前", rem.index("【项目已证实事实") < rem.index("【本轮已尝试过的工具"))
 
-s2 = agent_mod.Session(id="rem2", project="", target="shhxqh.com")
+s2 = agent_mod.Session(id="rem2", project="", target="site-a.test")
 rem2 = agent_mod.Agent._build_reminder(s2, budget=None)
 check("无项目时提醒不含事实段（不报错）", "【项目已证实事实" not in rem2)
 

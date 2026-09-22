@@ -120,8 +120,8 @@ NODE_TESTS = [
 
 # 会真实执行工具 / 需要云端 Key 的脚本：不适合自动跑，列出来避免被误以为"已覆盖"
 MANUAL_TESTS = [
-    ("test_jiaoyu.py", "授权实靶回归：驱动服务对授权目标跑真实工具（补天公益 SRC），"
-                       "需先启动服务。项目规范指定改动后跑它"),
+    ("test_live_target.py", "授权实靶回归：驱动服务对授权目标跑真实工具（公益 SRC），"
+                            "目标运行时从 data/scope.json 读取。需先启动服务。项目规范指定改动后跑它"),
     ("test_agent.py", "终端里跑一轮真实工具调用，会碰目标"),
     ("test_api.py", "下发任务并消费 SSE，会真实执行工具"),
     ("test_e2e_deepseek.py", "云端 LLM 驱动真实工具链路，需 API Key 且会碰目标"),

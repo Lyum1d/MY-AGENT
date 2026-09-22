@@ -42,6 +42,38 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  [FAIL] {name}" + (f" —— {detail}" if detail else ""))
 
 
+def skip(name: str, why: str = "") -> None:
+    """环境性跳过：既不计通过也不计失败（保持 `结果：N 通过 / M 失败` 格式）。"""
+    print(f"  [SKIP] {name}" + (f" —— {why}" if why else ""))
+
+
+def _authorized_target() -> str:
+    """取一个**真实在授权白名单里**的域名，供需要走通 scope→governor 的测试使用。
+
+    为什么不能写死占位域（v046 实测踩到）：本组断言的是「出网请求必须过
+    TrafficGovernor」，链路是 `scope → governor → MCP`。target 若不在
+    `data/scope.json` 里，请求会**停在 scope 这一层**，根本到不了 governor ——
+    断言就测了个寂寞。把 target 从真实域名换成 `site-a.test` 后，本组 7 项直接红，
+    而被测代码其实是好的（这是个**假阴性**，比真失败更浪费时间）。
+
+    为什么不写死真实域名：本仓库是 public，写死等于泄露在测目标
+    —— v046 修的正是这条。故运行时从 `data/scope.json` 读取，
+    它本就是授权目标的唯一真相源。本机没有该文件时返回空串，调用方转 SKIP。
+    """
+    try:
+        raw = (Path(__file__).resolve().parent / "data"
+               / "scope.json").read_text(encoding="utf-8")
+        hosts = [x for x in (json.loads(raw).get("domains") or [])
+                 if isinstance(x, str) and "." in x]
+        return hosts[0] if hosts else ""
+    except Exception:                            # noqa: BLE001
+        return ""
+
+
+AUTH_TARGET = _authorized_target()
+AUTH_HOST = AUTH_TARGET          # 直接当 Host 头用
+
+
 # ============ 假 MCP 服务 ============
 class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """每连接一个线程。
@@ -451,6 +483,10 @@ def _drain(gen):
 
 def test_governor_required():
     print("\n[D] 出网必过 TrafficGovernor")
+    if not AUTH_TARGET:
+        # 没有 scope.json 就无法构造「能走到 governor」的请求（见 _authorized_target）
+        skip("本机无 data/scope.json，无法验证 scope→governor 链路（需先配置授权目标）")
+        return
     fake = _FakeMcp()
     port = fake.start()
     old_url = config.MCP_BURP_URL
@@ -461,14 +497,15 @@ def test_governor_required():
         rec = _RecGovernor()
         burp_tools.traffic.governor = rec
 
-        raw = "GET /api/x HTTP/1.1\r\nHost: shhxqh.com\r\n\r\n"
+        raw = f"GET /api/x HTTP/1.1\r\nHost: {AUTH_HOST}\r\n\r\n"
         events = _drain(burp_tools.run_burp_replay(
-            "https://shhxqh.com", raw, project_id="proj1", session_id="sess1"))
+            f"https://{AUTH_TARGET}", raw, project_id="proj1", session_id="sess1"))
 
         check("acquire 被调用一次", len(rec.calls) == 1, str(rec.calls))
         if rec.calls:
             got = rec.calls[0]
-            check("acquire 收到完整 URL", got.get("url") == "https://shhxqh.com:443/api/x",
+            check("acquire 收到完整 URL",
+                  got.get("url") == f"https://{AUTH_TARGET}:443/api/x",
                   str(got.get("url")))
             check("acquire tool_alias=burp_replay", got.get("tool_alias") == "burp_replay",
                   str(got.get("tool_alias")))
@@ -491,6 +528,9 @@ def test_governor_required():
 
 def test_governor_denied_stops_request():
     print("\n[D2] 调度器拒绝时「不得发出网请求」")
+    if not AUTH_TARGET:
+        skip("本机无 data/scope.json，无法验证 scope→governor 链路（需先配置授权目标）")
+        return
     fake = _FakeMcp()
     port = fake.start()
     old_url = config.MCP_BURP_URL
@@ -501,8 +541,8 @@ def test_governor_denied_stops_request():
         rec = _RecGovernor(raise_exc=burp_tools.traffic.TrafficBudgetExceeded("预算耗尽"))
         burp_tools.traffic.governor = rec
 
-        raw = "GET /a HTTP/1.1\r\nHost: shhxqh.com\r\n\r\n"
-        events = _drain(burp_tools.run_burp_replay("https://shhxqh.com", raw))
+        raw = f"GET /a HTTP/1.1\r\nHost: {AUTH_HOST}\r\n\r\n"
+        events = _drain(burp_tools.run_burp_replay(f"https://{AUTH_TARGET}", raw))
 
         check("acquire 被调用", len(rec.calls) == 1)
         check("**没有**发出 tools/call（关键安全断言）",
@@ -561,7 +601,7 @@ def test_method_whitelist():
     check("DELETE 拒绝原因含「破坏性」", denied and "破坏性" in denied, str(denied))
 
     events = _drain(burp_tools.run_burp_replay(
-        "https://shhxqh.com", "DELETE /a HTTP/1.1\r\nHost: shhxqh.com\r\n\r\n"))
+        "https://site-a.test", "DELETE /a HTTP/1.1\r\nHost: site-a.test\r\n\r\n"))
     check("DELETE 被本地拦下（无输出事件）",
           not any(e.get("type") == "output" for e in events), str(events))
     exits = [e for e in events if e.get("type") == "exit"]

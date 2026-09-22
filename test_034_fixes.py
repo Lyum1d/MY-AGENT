@@ -63,8 +63,14 @@ check("A2 truncation_note 不再含 encoding='utf-8' 读法",
       "open(r['saved_text_path'], encoding='utf-8')" not in src)
 check("A3 truncation_note 点明「原始字节」",
       "完整正文已落盘（原始字节）" in src)
-check("B1 模块文档示例用 rb",
-      'open(r["saved_text_path"], "rb").read()' in doc)
+check("B1 模块文档给出读落盘文件的**字节口径**写法",
+      'open(r["saved_text_path"], "rb").read()' in doc or "load_bytes" in doc)
+# v045.2 起，文档改成推荐受控接口 `load_bytes`，并明写「不要用 open()」——
+# 因为裸 `open()` 会被能力分档器判为非只读，**被推荐的标准动作反而过不了自己的闸门**。
+# 所以断言要跟着表达意图（字节口径 + 不推荐裸 open），而不是钉死某个具体写法
+# —— 钉写法的测试会在实现改进时误报，这类「假阴性」比真失败更浪费排查时间。
+check("B1b 文档不再推荐裸 open() 读落盘文件",
+      'open(r["saved_text_path"], "rb")' not in doc)
 check("B2 模块文档不再用 encoding=\"utf-8\" 读落盘文件",
       'open(r["saved_text_path"], encoding="utf-8")' not in doc)
 check("B3 模块文档警告「口径混用产生伪差异」",

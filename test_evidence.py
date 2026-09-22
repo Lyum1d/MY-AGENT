@@ -92,12 +92,12 @@ check("目标竖线被转义", "a\\|b.com" in md3)
 print("== D. 端口/协议授权（v012 P2-3）==")
 scope_file = _TMP / "scope_v012.json"
 scope_file.write_text('{"targets": [{"host": "example.com", "ports": [80, 443],'
-                      ' "schemes": ["https"]}], "domains": ["jiaoyu.cn"]}',
+                      ' "schemes": ["https"]}], "domains": ["target.test"]}',
                       encoding="utf-8")
 config.SCOPE_FILE = scope_file
 
 check("混合写法域名视图兼容（domains 仍在）",
-      "jiaoyu.cn" in scope.load_scope())
+      "target.test" in scope.load_scope())
 check("结构化写法的 host 也进白名单视图",
       "example.com" in scope.load_scope())
 _t_entry = next(e for e in scope.load_scope_targets() if e["host"] == "example.com")
@@ -113,14 +113,14 @@ check("host 命中 + https 授权协议（子域）→ 放行",
       scope.check_scope("https://sub.example.com/") is None)
 # 只声明 ports、不声明 schemes：协议不受限
 scope_file.write_text('{"targets": [{"host": "example.com", "ports": [80, 443]}],'
-                      ' "domains": ["jiaoyu.cn"]}', encoding="utf-8")
+                      ' "domains": ["target.test"]}', encoding="utf-8")
 check("只限端口不限协议：http 默认 80 在授权端口 → 放行",
       scope.check_scope("http://example.com/") is None)
 scope_file.write_text('{"targets": [{"host": "example.com", "ports": [80, 443],'
-                      ' "schemes": ["https"]}], "domains": ["jiaoyu.cn"]}',
+                      ' "schemes": ["https"]}], "domains": ["target.test"]}',
                       encoding="utf-8")
-check("旧写法域名不受端口限制（jiaoyu.cn 任意端口）",
-      scope.check_scope("http://jiaoyu.cn:9999/") is None)
+check("旧写法域名不受端口限制（target.test 任意端口）",
+      scope.check_scope("http://target.test:9999/") is None)
 check("未授权主机照旧拒绝",
       isinstance(scope.check_scope("http://evil.com:80/"), str))
 

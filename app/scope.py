@@ -180,7 +180,7 @@ def target_host(target: str) -> str:
     except Exception:
         host = ""
     if host:
-        # 尾点 FQDN（'www.jiaoyu.cn.'）会被 urlparse 原样保留，导致子域匹配失败；
+        # 尾点 FQDN（'www.target.test.'）会被 urlparse 原样保留，导致子域匹配失败；
         # 统一去掉尾点（审计 P2-3，方向仍是 fail-closed）
         return host.rstrip(".")
     # 解析失败：至少去掉端口，避免 "example.com:8080" 这类绕过精确匹配
