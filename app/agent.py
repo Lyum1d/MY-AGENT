@@ -21,6 +21,7 @@ from . import config, store
 from . import graph
 from . import kb, fofa
 from . import pyexec
+from . import pyexec_grade
 from . import replayer
 from . import burp_tools
 from . import mcp_client
@@ -430,6 +431,47 @@ def _budget_exhausted_note(session, total: int) -> str:
 
 
 
+# 目标串两端可能粘上的「装饰字符」。
+# 为什么需要：用户常把目标写在 Markdown 行内代码或强调里 —— `` `https://a.com/` ``、
+# `**https://a.com/**`。正则的字符集排除的是空白与中文标点，反引号与星号都是
+# **合法的 URL 字符**，于是会被吞进匹配结果。
+# 实测代价（2026-09-22，DB 里 5 个会话中招）：
+#   'https://www.discuz.vip/`'  /  '**https://www.discuz.vip/**'  /  'https://`（得到'
+# 这些串**能通过** `validate_target` 与 `_is_host_like`（主机部分仍解析得出来），
+# 于是一路流到执行层：请求变成对路径 `` /` `` 的访问 → 404 → 模型据此得出
+# 「该路径不存在」的**错误结论**。脏数据比报错更危险。
+#
+# 关键取舍：**ASCII 的 `(` `)` 不放进终止符集**。它们是合法 URL 字符
+# （`/p(1)` 这种路径真实存在），一旦当终止符就会把正确输入截断 ——
+# 我第一版就是这么写的，自测立刻抓到 `https://a.test/p(1)` → `https://a.test/p`。
+# Markdown 链接 `](url)` 造成的多余右括号，改由下面的「配对剥离」处理。
+_TARGET_TERMINATORS = "".join([
+    r"\s", "，。；、",
+    "（）【】「」『』《》〈〉“”‘’",     # 全角标点：URL 里不可能出现，可安全终止
+    "`*\"'<>",                        # 装饰/引号：同上
+])
+_TARGET_TAIL_STRIP = "`*\"'“”‘’「」『』【】《》〈〉"
+# 末梢配对标点：只有当「右括号多于左括号」时才从尾部剥掉。
+# 这样 `](https://a.com/)` → 剥掉多余的 `)`；而 `https://a.test/p(1)` 保持不动。
+_TARGET_PAIRS = {")": "(", "]": "[", "}": "{"}
+
+
+def _clean_target(s: str) -> str:
+    """剥掉目标串两端的装饰字符与多余的末梢右括号。"""
+    t = (s or "").strip().strip(_TARGET_TAIL_STRIP).strip()
+    while t:
+        last = t[-1]
+        left = _TARGET_PAIRS.get(last)
+        if not left:
+            break
+        # 右括号多于左括号 → 这个右括号是外层的语法符号，不是 URL 的一部分
+        if t.count(last) > t.count(left):
+            t = t[:-1]
+        else:
+            break
+    return t.strip().strip(_TARGET_TAIL_STRIP).strip()
+
+
 def extract_target(text: str) -> str:
     """从用户任务描述中提取目标（URL / IP / 域名）。
 
@@ -439,9 +481,16 @@ def extract_target(text: str) -> str:
     if not text:
         return ""
 
-    m = re.search(r"https?://[^\s，。；）)\"'<>]+", text)
+    # 终止字符集要点：中文标点要**左右两侧都排**（早期只排了 `）)`，于是
+    # '`https://a.com/`（apex' 会把 `（apex` 一起吞进来）；装饰字符也要排
+    # （反引号、成对书名号/引号）—— 详见 _TARGET_TERMINATORS 说明。
+    m = re.search(r"https?://[^" + _TARGET_TERMINATORS + r"]+", text)
     if m:
-        return m.group(0).rstrip("，。；）)")
+        cand = _clean_target(m.group(0))
+        # 剥完装饰后若已不成形（例如原文只有 "https://`（得到"），
+        # 不要返回半截串 —— 继续往下试 IP / 域名两个分支。
+        if cand:
+            return cand
 
     m = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b", text)
     if m:
@@ -1251,6 +1300,29 @@ class Agent:
                         "data": f"工具名 `{alias}` 不存在，已自动纠正为 `{tool.alias}`（{tool.name}）",
                     })
 
+                # ---- 交互式工具：不交给模型（v047）----
+                # 位置：必须在风险闸门之前，否则会走到「弹出确认 → 人放行 → 卡 120 秒」。
+                # 为什么单列一道：这类工具**只服务于人**。它的输出是一条等着输入的菜单，
+                # 模型既读不懂（半个菜单），也无法提供后续输入 —— 交回一句明确的
+                # 「别用它、改用 X」远比让它白烧一步 + 两分钟 + 一次人工确认有用。
+                # 实测来源：2026-09-22 discuz.vip 第三轮，某个加密小工具（分级 L0，
+                # 即自动执行）就这么卡满 TOOL_IDLE_TIMEOUT。
+                # 这类工具已从可用清单剔除，所以正常情况跑到这里的是「模型记住了旧清单」
+                # 或「别名模糊命中」——两种都值得留痕。
+                if getattr(tool, "interactive", False):
+                    why = getattr(tool, "interactive_reason", "") or "该工具为交互式菜单程序"
+                    msg = (f"{tool.name} 是交互式菜单程序，不能由你调用：{why}。"
+                           "请改用非交互的等价做法（哈希/编码类计算用 py_exec 的 "
+                           "`import hashlib` / `import base64`，它们在只读白名单内）。")
+                    session.messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                             "content": msg})
+                    await session.emit({
+                        "type": "error",
+                        "data": f"已拦截交互式工具：{tool.alias}（{tool.name}）",
+                    })
+                    logger.warning("拦截交互式工具：alias=%r name=%r", tool.alias, tool.name)
+                    continue
+
                 # ---- 元认知工具 think / halt_task（L0，纯本地，不走风险闸门）----
                 # think：给模型一个显式的「只想不做」出口，避免它为了整理线索而被迫
                 #        产出一个没用的工具调用；halt_task：给模型一个显式的收尾出口，
@@ -1300,6 +1372,18 @@ class Agent:
                 # 风险等级必须用「纠正后」的规范别名查，否则模型拼错工具名
                 # （如 ddddd_scan）时 risk_of 会查不到，等级变成 ? 被默认拒绝。
                 risk = registry.risk_of(tool.alias) or {}
+
+                # ---- py_exec 静态能力分档（v047）----
+                # 位置：必须在 Step 构造**之前**。`Step.risk` 会落库、`_await_confirm`
+                # 读的是 `risk["double_confirm"]`、前端弹窗文案也取这一份 —— 改晚了
+                # 就会出现「库里记 L3、实际按 L2 放行」的分叉，审计时无从解释。
+                #
+                # 为什么在语法预检之前也没关系：分档器遇到语法错误一律返回 opaque
+                # （不降级），随后 v045 的语法预检会给出更友好的信息并 `continue`。
+                grade_note = ""
+                if tool.alias == "py_exec":
+                    risk, grade_note = pyexec_grade.apply_to(args, risk)
+
                 step = Step(
                     id=tc["id"],
                     tool_alias=tool.alias,
@@ -1309,6 +1393,15 @@ class Agent:
                     risk=risk,
                 )
                 session.steps.append(step)
+
+                # 分档降级必须**留痕**：这步不再弹确认框（或只弹一轮），
+                # 操作者需要知道「为什么这次没问我」。同时写日志便于事后审计
+                # 「哪些 py_exec 是自动放行的」。
+                if grade_note:
+                    # 注意 `risk` 此处已是**降级后**的 dict，原等级在 note 里，
+                    # 所以日志只打印 note（否则会打出「L0 → L0」这种无信息量的行）。
+                    logger.info("py_exec 能力分档降级：%s", grade_note)
+                    await session.emit({"type": "reasoning", "data": grade_note})
 
                 # ---- 并行子任务：禁止需要人工确认的工具 ----
                 # split_task 派生的子任务是并发跑的，而确认通道是「一次一步」的交互式，

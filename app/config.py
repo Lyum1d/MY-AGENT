@@ -91,6 +91,27 @@ EXECUTION_MODE = os.getenv("AGENT_EXECUTION_MODE", "react").strip().lower()
 if EXECUTION_MODE not in ("react", "plan"):
     EXECUTION_MODE = "react"
 
+# ---------------- 超时口径（v047 统一说明）----------------
+# 系统里存在**两类**上限，含义不同、必须成对理解：
+#
+#   总时长上限   工具/代码从启动到结束的绝对上限。卡死、无限刷输出都靠它兜底。
+#   无输出上限   连续多久没有任何输出就判定卡死。**只对外部工具生效**。
+#
+# 为什么两类都要：只靠「无输出」挡不住 enscan 这类每 10 秒刷一行
+# 「需要安全验证」的工具 —— 输出不断流，idle 永不触发，进程会无限跑；
+# 只靠「总时长」则卡死要等满 10 分钟才被发现，反馈太慢。
+#
+# 各通道的有效上限（v047 起由 /api/health 的 timeouts 段直接给出，不必再推断）：
+#
+#   通道          总时长上限                        无输出上限
+#   外部工具       tool_overrides.timeout 或 TOOL_TIMEOUT      TOOL_IDLE_TIMEOUT
+#   py_exec        PY_EXEC_TIMEOUT                           无（脚本常长时间不出字，
+#                                                            加 idle 会误杀正常计算）
+#   httpreplay     nuclei 分支同「外部工具」
+#
+# 不变量（startup 会自检并在违反时告警）：
+#   **无输出上限 < 总时长上限**。否则 idle 检测永远轮不到触发 ——
+#   它是一条死代码，而配置文件上看起来「两个上限都设了」。
 TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "600"))  # 单工具总时长上限（秒）
 TOOL_IDLE_TIMEOUT = int(os.getenv("TOOL_IDLE_TIMEOUT", "120"))  # 无输出多久判定卡死（秒）
 MAX_OUTPUT_LINES = int(os.getenv("MAX_OUTPUT_LINES", "2000"))  # 单工具最多回传多少行
@@ -271,9 +292,30 @@ ACCESS_TOKEN = os.getenv("SRC_AGENT_TOKEN", "")
 
 
 # ---------- Python 代码执行通道（py_exec，Agent 直出代码） ----------
-PY_EXEC_TIMEOUT = int(os.getenv("PY_EXEC_TIMEOUT", "90"))    # 单段代码上限（秒），超时中断
+# PY_EXEC_TIMEOUT：单段代码总时长上限（秒）。**只有这一个上限，没有 idle 检测** ——
+# 脚本常常长时间不出字（纯计算、顺序探测），加「无输出判卡死」会误杀正常代码。
+# v047 由 90 → 120，理由（不是随手放宽）：
+#   ① py_exec 是**低配额目标的推荐探测通道**（见 tool_overrides 的 dirsearch 说明
+#      「低配额目标建议改用 py_exec + safe_http_request 逐点探测」），
+#      却是所有通道里预算最紧的 —— 推荐路径带宽比通用路径还小，这是设计倒挂；
+#   ② 它与「外部工具」的差别只应体现在**没有 idle 检测**，而不该顺手再压一档：
+#      把它对齐到 TOOL_IDLE_TIMEOUT 后，各通道的总时长上限关系变成可解释的；
+#   ③ 实测代价：第三轮一个字节往返脚本在 90s 处被砍（`执行超时（>90s）`）。
+# 注意这**不放宽流量**：单次请求上限（AGENT_PY_EXEC_REQUEST_TIMEOUT）与
+# 单脚本请求总数（AGENT_PY_EXEC_MAX_REQUESTS）都没变，墙钟放宽不增加任何请求。
+PY_EXEC_TIMEOUT = int(os.getenv("PY_EXEC_TIMEOUT", "120"))
 PY_EXEC_MAX_CHARS = 6000    # 单段代码最大字符数
 PY_EXEC_DIR = DATA_DIR / "scripts" / "exec"  # 代码留档目录（按目标分子目录）
+
+# ---- py_exec 静态能力分档（v047：把「一刀切 L3」换成按代码能力分级）----
+# 见 app/pyexec_grade.py。开关默认开；关掉则所有 py_exec 一律按工具默认等级（L3），
+# 供操作者需要绝对保守时使用。
+PY_EXEC_GRADE_ENABLED = os.getenv(
+    "AGENT_PY_EXEC_GRADE", "1").strip().lower() not in ("0", "false", "no", "off")
+# 档 → 等级映射。可覆盖，但 pyexec_grade.apply_to 强制「只降级不升级」，
+# 所以把它调高不会让任何脚本获得更高权限（只会失效为不降级）。
+PY_EXEC_GRADE_LEVEL_LOCAL = os.getenv("AGENT_PY_EXEC_GRADE_LEVEL_LOCAL", "L0")
+PY_EXEC_GRADE_LEVEL_NET = os.getenv("AGENT_PY_EXEC_GRADE_LEVEL_NET", "L2")
 
 # ---- py_exec 沙箱（v010 P0-1：进程级隔离）----
 # 背景：py_exec 在宿主解释器里执行模型直出的任意 Python，此前 env=os.environ
@@ -346,3 +388,59 @@ MCP_REQUIRE_APPROVAL = os.getenv("AGENT_MCP_REQUIRE_APPROVAL", "1") == "1"
 # 就是这么来的）。默认 20 条、上限 100 条，配合 offset 翻页。
 MCP_HISTORY_PAGE = int(os.getenv("AGENT_MCP_HISTORY_PAGE", "20"))
 MCP_HISTORY_MAX = int(os.getenv("AGENT_MCP_HISTORY_MAX", "100"))
+# 健康检查里 MCP 状态探测的缓存时长（秒）。
+# 加了它之后 /api/health 的延迟不再由「Burp 是否在跑」决定 —— 见 _mcp_health 说明。
+MCP_HEALTH_TTL = float(os.getenv("AGENT_MCP_HEALTH_TTL", "15"))
+
+
+# ---------- 超时口径自检（v047） ----------
+def timeout_profile() -> dict:
+    """给出各执行通道的**有效**上限，供 /api/health 暴露与 startup 自检。
+
+    为什么要做成函数而不是两张常量表：这些值来自多个环境变量与工具级 overrides，
+    散在四处。操作者排查「为什么工具 25 秒就被砍」时要翻源码是极差的体验，
+    而「口径不一致」这类问题**只有摆在一起看才看得出来**（v047 之前的实际状况：
+    py_exec 90s / 工具 idle 120s / 工具总时长 600s，三者关系从未被写明）。
+    """
+    return {
+        "channels": {
+            "external_tool": {
+                "total_cap": TOOL_TIMEOUT,
+                "total_cap_src": "TOOL_TIMEOUT（可被 tool_overrides.timeout 覆写）",
+                "idle_cap": TOOL_IDLE_TIMEOUT,
+                "idle_cap_src": "TOOL_IDLE_TIMEOUT",
+                "note": "双上限：idle 抓静默卡死，total 抓持续刷屏",
+            },
+            "py_exec": {
+                "total_cap": PY_EXEC_TIMEOUT,
+                "total_cap_src": "PY_EXEC_TIMEOUT",
+                "idle_cap": None,
+                "idle_cap_src": "",
+                "note": "只有总时长上限；脚本常长时间不出字，加 idle 会误杀正常计算",
+            },
+        },
+        # 不变量：idle < total。违反时 idle 检测永远轮不到触发（死代码），
+        # 而配置上看起来「两个上限都设了」—— 这正是需要机器来提醒的那类错。
+        "idle_below_total": TOOL_IDLE_TIMEOUT < TOOL_TIMEOUT,
+        "py_exec_grade_enabled": PY_EXEC_GRADE_ENABLED,
+        "py_exec_grade_levels": {
+            "readonly_local": PY_EXEC_GRADE_LEVEL_LOCAL,
+            "readonly_net": PY_EXEC_GRADE_LEVEL_NET,
+            "opaque": "L3",
+        },
+    }
+
+
+def timeout_warnings() -> list[str]:
+    """startup 自检：把「口径配错」从静默变成一条明确的告警。"""
+    out: list[str] = []
+    if TOOL_IDLE_TIMEOUT >= TOOL_TIMEOUT:
+        out.append(
+            f"口径异常：TOOL_IDLE_TIMEOUT({TOOL_IDLE_TIMEOUT}s) >= TOOL_TIMEOUT({TOOL_TIMEOUT}s)，"
+            "外部工具的「无输出判卡死」永远不会触发（总时长先到）—— 这条检测成了死代码。")
+    if PY_EXEC_TIMEOUT <= 0:
+        out.append(f"口径异常：PY_EXEC_TIMEOUT={PY_EXEC_TIMEOUT} 非正数。")
+    for key in ("PY_EXEC_GRADE_LEVEL_LOCAL", "PY_EXEC_GRADE_LEVEL_NET"):
+        if globals()[key] not in RISK_LEVELS:
+            out.append(f"口径异常：{key}={globals()[key]!r} 不是合法风险等级，分档将退化为不降级。")
+    return out

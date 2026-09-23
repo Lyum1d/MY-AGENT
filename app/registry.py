@@ -45,6 +45,12 @@ class Tool:
     disallowed_flags: list = field(default_factory=list)  # 明确禁止的旗标黑名单（v012 P2-2），命中即剔除并记录
     target_type: str = ""                              # target 形态声明（v012 P2-2）：url|domain|host，空=不校验
     stdin_input: str = ""               # 启动时写入子进程 stdin 的内容（用于绕开交互式提问）
+    # v047：交互式菜单程序。**这一类不能交给模型** ——
+    # 非交互调用只会打印菜单然后等 stdin，撞满 TOOL_IDLE_TIMEOUT 才被终止：
+    # 白烧一步 + 两分钟，而模型从输出里只能看到半个菜单，无法判断是失败还是卡住。
+    # 实测：某加密小工具（risk_grades 里是 L0，即**自动执行**）就这么白烧过一次。
+    interactive: bool = False
+    interactive_reason: str = ""
     # v023.2 扫描器内部流量能力声明（来自 overrides 的 network_control）
     network_control: dict = field(default_factory=dict)
 
@@ -63,6 +69,7 @@ class Tool:
             "exists": bool(self.executable),
             "disabled": self.disabled,
             "disabled_reason": self.disabled_reason,
+            "interactive": self.interactive,
         }
 
 
@@ -230,6 +237,9 @@ class ToolRegistry:
                         "traffic_class": str(nc.get("traffic_class") or "unknown"),
                     }
                 tool.stdin_input = ov.get("stdin_input", "") or ""
+                # v047：交互式菜单程序不进模型工具清单（见 Tool.interactive 说明）
+                tool.interactive = bool(ov.get("interactive"))
+                tool.interactive_reason = ov.get("interactive_reason", "") or ""
 
             if scriptable:
                 g = grades.get(tool.name)
@@ -498,8 +508,16 @@ class ToolRegistry:
         return {k: v for k, v in data.items() if not k.startswith("_")}
 
     def usable_scriptable(self) -> list[Tool]:
-        """Agent 实际可用的可编排工具：排除禁用项与文件缺失项。"""
-        return [t for t in self.scriptable_tools() if not t.disabled and t.executable]
+        """Agent 实际可用的可编排工具：排除禁用项与文件缺失项。
+
+        v047：**交互式工具也在这里排除**（它们只服务于人，不服务于模型）。
+        放在这个单一出口上，是为了让「模型看得见」「模型点名能得到纠正」
+        「不进工具清单」三处判定天然一致 —— 分别过滤必然漏掉一处。
+        注意 `get_by_alias` 的**精确命中**分支仍会返回交互式工具，
+        那是有意的：模型点名时给它一句明确的拒绝，比回「工具不存在」更有用。
+        """
+        return [t for t in self.scriptable_tools()
+                if not t.disabled and t.executable and not t.interactive]
 
     @staticmethod
     def external_service_of(alias: str) -> str:
@@ -586,6 +604,10 @@ class ToolRegistry:
     def web_tools(self) -> list[Tool]:
         return [t for t in self.tools if t.url]
 
+    def interactive_tools(self) -> list[Tool]:
+        """被标为交互式的工具（不交给模型，但可在工具箱面板人工启动）。"""
+        return [t for t in self.scriptable_tools() if t.interactive]
+
     def stats(self) -> dict[str, int]:
         return {
             "total": len(self.tools),
@@ -593,6 +615,7 @@ class ToolRegistry:
             "launchable": len(self.launchable_tools()),
             "web": len(self.web_tools()),
             "missing": sum(1 for t in self.scriptable_tools() if not t.executable),
+            "interactive": len(self.interactive_tools()),
         }
 
     # ---------- 风险闸门 ----------

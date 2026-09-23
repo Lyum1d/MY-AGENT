@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -311,6 +312,31 @@ class McpClient:
                     "确需如此请显式设置 MCP_ALLOW_REMOTE=1。")
         return ""
 
+    def _tcp_reachable(self, timeout: float = 0.6) -> bool:
+        """MCP 端点端口是否有人监听（便宜的前置检查）。
+
+        为什么需要（2026-09-23 实测）：Burp 没开时，`probe()` 会走
+        `_SSEReader.wait_opened(_sse_probe_timeout=8.0)` —— **白等满 8 秒**才
+        返回不可用。而这个 8 秒会传导到 `/api/health`：健康检查变成 8 秒，
+        前端每次打开页面都要等，回归 harness 的 2 秒探测直接超时、误判成
+        「端口被别的程序占用」并**静默跳过两个端到端套件**。
+
+        一个 TCP connect 探活只要零点几毫秒，能把「Burp 没开」这个**最常见**
+        的情形从 8 秒压到 0 毫秒。解析不出主机/端口时返回 True，
+        把判断交回原有流程（宁可慢，不可误判为不可用）。
+        """
+        try:
+            u = urlsplit(self.base_url)
+            host = u.hostname or "127.0.0.1"
+            port = u.port or (443 if u.scheme == "https" else 80)
+        except Exception:                            # noqa: BLE001
+            return True
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
     async def probe(self) -> tuple[bool, str]:
         """探测 MCP 服务可用性。**不抛异常**，返回 (是否可用, 说明)。
 
@@ -321,6 +347,14 @@ class McpClient:
         if denied:
             self._last_error = denied
             return False, denied
+        # 端口没人监听 → 立刻返回（最常见的「Burp 没开」路径，见 _tcp_reachable）。
+        # 放在 loopback 守卫之后：远程端点的拒绝理由比「端口不通」更该报给用户。
+        if not self._tcp_reachable():
+            note = (f"连不上 MCP 服务 {self.base_url}（端口未监听）。"
+                    "请确认 Burp Suite 已启动、官方扩展已加载，"
+                    "并在扩展的 MCP 页点过 Start。")
+            self._last_error = note
+            return False, note
         try:
             if self._loop_changed():
                 await self._reset_session()

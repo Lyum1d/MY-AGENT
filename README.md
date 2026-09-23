@@ -400,7 +400,11 @@ src-agent/
 |---|---|---|---|
 | `MAX_STEPS` | 单轮最大步数 | 30 | `AGENT_MAX_STEPS` |
 | `TOOL_TIMEOUT` | 单工具总时长(秒) | 600 | `TOOL_TIMEOUT` |
-| `TOOL_IDLE_TIMEOUT` | 无输出判卡死(秒) | 120 | `TOOL_IDLE_TIMEOUT` |
+| `TOOL_IDLE_TIMEOUT` | 无输出判卡死(秒)，仅外部工具 | 120 | `TOOL_IDLE_TIMEOUT` |
+| `PY_EXEC_TIMEOUT` | 单段代码总时长(秒)，py_exec 无 idle 检测 | 120 | `PY_EXEC_TIMEOUT` |
+| `PY_EXEC_GRADE_ENABLED` | py_exec 静态能力分档开关（关=一律按 L3） | 开 | `AGENT_PY_EXEC_GRADE` |
+| `PY_EXEC_GRADE_LEVEL_LOCAL` | 分档：只读且无网络的脚本定级 | L0 | `AGENT_PY_EXEC_GRADE_LEVEL_LOCAL` |
+| `PY_EXEC_GRADE_LEVEL_NET` | 分档：仅经受控接口出网的脚本定级 | L2 | `AGENT_PY_EXEC_GRADE_LEVEL_NET` |
 | `CONFIRM_TIMEOUT` | L2/L3 等用户确认上限(秒) | 600 | `AGENT_CONFIRM_TIMEOUT` |
 | `MAX_TOOL_SCHEMAS` | 单次决策回传工具数上限 | 40 | `AGENT_MAX_TOOL_SCHEMAS` |
 | `INTEL_CAP` | 情报库每类条目上限 | 150 | `INTEL_CAP` |

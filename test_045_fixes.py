@@ -244,7 +244,12 @@ def test_sandbox_module_health():
 def test_classifier_whitelist_synced():
     print("\n[E] 能力分档器与沙箱 API 保持同步")
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _classify_step import ALLOWED_SRCAGENT_NAMES, classify_py_exec
+    # v047：判定逻辑已从本机临时脚本 `_classify_step.py` 转正进产品模块
+    # `app/pyexec_grade.py`。这里必须跟着改 —— 原来的写法依赖一个
+    # **gitignored 的临时文件**，意味着任何人克隆仓库后这组测试必然崩，
+    # 而且报的是「名字不存在」这种与业务无关的错。**提交进仓库的测试，
+    # 不能依赖不提交的文件。**
+    from app.pyexec_grade import ALLOWED_SRCAGENT_NAMES, classify_py_exec
 
     ns, _ = load_sandbox_module()
     exported = {n for n in ns if not n.startswith("_") and callable(ns[n])}
@@ -493,7 +498,8 @@ def test_load_bytes_and_hash():
             check(f"load_bytes({bad!r}) 被拦", True)
 
     # 分档器白名单要跟着放宽，否则受控接口自己也会被判非只读
-    from _classify_step import classify_py_exec
+    # （v047：改从产品模块导入，见 [E] 组内的说明）
+    from app.pyexec_grade import classify_py_exec
     ok, why = classify_py_exec(
         "from srcagent import safe_http_request, load_bytes, file_md5, file_info\n"
         "r = safe_http_request('https://a.example/i?k=1')\n"

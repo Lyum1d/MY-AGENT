@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 from typing import AsyncIterator
 from urllib.parse import urlparse, urlsplit
@@ -43,6 +44,22 @@ async def _cleanup_stale_persist_dirs() -> None:
             logger.info("已清理 %d 个过期落盘目录（合规：测试数据用完即清）", n)
     except Exception:
         logger.warning("清理过期落盘目录失败", exc_info=True)
+
+    # v047：超时/分档口径自检。
+    # 「口径不一致」这类配置问题**不会自己暴露** —— 它表现为「某个工具莫名被砍」
+    # 或「明明配了两个上限却只有一个生效」，而配置文件上看起来一切正常。
+    # 把不可见的口径错误在启动时变成一条明确告警，是唯一能拦住它的时机。
+    for w in config.timeout_warnings():
+        logger.warning("%s", w)
+    # 交互式工具被剔出模型清单这件事也留一条：数量变化本身就是「有工具被标记了」的信号，
+    # 而它的现象（模型不再调用某工具）恰好最容易被误判成「模型变笨了」。
+    try:
+        _it = registry.interactive_tools()
+        if _it:
+            logger.info("已从模型工具清单剔除 %d 个交互式工具：%s",
+                        len(_it), ", ".join(t.alias for t in _it))
+    except Exception:
+        logger.debug("交互式工具统计失败", exc_info=True)
 
 
 @app.post("/api/maintenance/cleanup-persist")
@@ -333,11 +350,27 @@ async def health():
         # 而工具清单是模型看的、用户在界面上看不到——于是现象是「Agent 好像变笨了，
         # 不会用 Burp」，排查方向全错。这里显式暴露状态与可操作提示。
         "mcp": await _mcp_health(),
+        # v047：超时口径。以前这些值散在 config.py 与工具 overrides 里，
+        # 排查「为什么这个工具 25 秒就被砍」要翻源码。摆在一起才看得出来
+        # 「py_exec 的预算比通用工具还紧」这类倒挂（v047 前就是这样）。
+        "timeouts": config.timeout_profile(),
     }
 
 
+# MCP 状态缓存：健康检查必须**快**，不能由可选依赖决定。
+# 实测（2026-09-23）：Burp 没开时 /api/health 要 8 秒（SSE 探测等满超时），
+# 而前端打开一次页面会连调两次 health —— 属于「点一下卡 8 秒」级别的体验问题，
+# 也让回归 harness 的短超时探测误判（详见 run_all_tests.probe_service）。
+# 缓存 TTL 内直接返回上次结果；`cached_seconds` 一并回传，避免把缓存当成实时。
+_mcp_health_cache: dict = {"at": 0.0, "data": None}
+
+
 async def _mcp_health() -> dict:
-    """MCP 状态汇总（供 /api/health）。任何异常都不得影响 health 本身。"""
+    """MCP 状态汇总（供 /api/health）。任何异常都不得影响 health 本身。
+
+    带 TTL 缓存：探测代价由**可选依赖**（Burp 是否在跑）决定，不能让健康检查
+    跟着它一起变慢。TTL 只影响「多久后重新探测」，不影响结果语义。
+    """
     info: dict = {
         "enabled": config.MCP_ENABLED,
         "endpoint": config.MCP_BURP_URL,
@@ -346,10 +379,19 @@ async def _mcp_health() -> dict:
         "tools": [],
         "proxy_warnings": [],
         "require_approval": config.MCP_REQUIRE_APPROVAL,
+        "cached_seconds": 0.0,
     }
     if not config.MCP_ENABLED:
         info["note"] = "已通过 AGENT_MCP_ENABLED=0 关闭"
         return info
+
+    now = time.time()
+    cached = _mcp_health_cache.get("data")
+    if cached is not None and (now - _mcp_health_cache["at"]) < config.MCP_HEALTH_TTL:
+        out = dict(cached)
+        out["cached_seconds"] = round(now - _mcp_health_cache["at"], 1)
+        return out
+
     try:
         ok, note, tools = await mcp_client.availability()
         info["available"] = ok
@@ -359,6 +401,8 @@ async def _mcp_health() -> dict:
             info["proxy_warnings"] = await mcp_client.check_proxy_sanity()
     except Exception as e:      # noqa: BLE001 - health 必须永远返回
         info["note"] = f"MCP 状态检查异常（已降级）：{type(e).__name__}: {e}"
+    _mcp_health_cache["at"] = time.time()
+    _mcp_health_cache["data"] = dict(info)
     return info
 
 
