@@ -99,6 +99,7 @@ PY_TESTS = [
     ("云端外发脱敏·密钥材料与摘要值边界（v043）", "test_043_fixes.py", False),
     ("Burp MCP 接入·治理闸门与优雅降级（v044）", "test_044_mcp.py", False),
     ("确认闸门前置与口径修复（v045）", "test_045_fixes.py", False),
+    ("py_exec 能力分档·交互式工具·超时口径（v047）", "test_047_fixes.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),
@@ -153,9 +154,32 @@ def port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def probe_service(timeout: float = 2.0) -> dict | None:
+def _local_opener():
+    """构造一个**不走环境代理**的 opener。
+
+    本机有 HTTP(S)_PROXY 环境变量，回环探测没有理由经过代理（多一跳、且代理
+    对非白名单目标会返回 502），所以统一用空 ProxyHandler。
+    注：实测本机裸 urlopen 对回环也能通，所以**这不是** 2026-09-23 那次
+    「探测不到自己的服务」的原因 —— 真因见 probe_service 的超时说明。
+    留着它是为了消除一个不必要的依赖，不是当修复。
+    """
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+# 探测超时。**不能小**：/api/health 里含一段 MCP 状态探测，Burp 没开时要等
+# 满 SSE 探测超时（8s）才返回。原来写 2.0s，于是探测定时失败 →
+# 打印「端口被别的程序占用」→ **静默跳过两个端到端套件**，
+# 而汇总行照样写「合计 N 项通过 / 0 项失败」—— 跳过被读成了绿灯。
+# （2026-09-23 实测：health 用时 8.07s，2s 超时必失败；30s 正常。）
+# 产品侧已给 health 加了「端口不监听就立刻返回」+ 结果 TTL 缓存，
+# 正常情形这次探测是毫秒级；这里的超时只是兜底。
+PROBE_TIMEOUT = 30.0
+
+
+def probe_service(timeout: float = PROBE_TIMEOUT) -> dict | None:
     try:
-        with urllib.request.urlopen(f"{BASE}/api/health", timeout=timeout) as r:
+        # 绕环境代理：见 _local_opener 说明
+        with _local_opener().open(f"{BASE}/api/health", timeout=timeout) as r:
             d = json.loads(r.read().decode("utf-8"))
         if isinstance(d, dict) and "registry" in d and "toolbox" in d:
             return d
@@ -290,7 +314,10 @@ def main() -> int:
             print(f"  复用已在运行的服务（版本 {live.get('version', '?')} / "
                   f"构建 {live.get('build', '?')}）")
         elif port_open(PORT):
-            print(f"  [警告] 端口 {PORT} 被别的程序占用，将跳过端到端测试。")
+            print(f"  [警告] 端口 {PORT} 有服务在监听，但 /api/health 探测失败"
+                  f"（{PROBE_TIMEOUT:.0f}s 超时或无预期字段），将跳过端到端测试。")
+            print("         常见原因：那是别的程序；或该服务 /api/health 被可选依赖"
+                  "（如 Burp MCP）拖慢。排除后重跑即可。")
             need_server = False
         else:
             print("  启动临时服务…")
