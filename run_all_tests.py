@@ -100,6 +100,7 @@ PY_TESTS = [
     ("Burp MCP 接入·治理闸门与优雅降级（v044）", "test_044_mcp.py", False),
     ("确认闸门前置与口径修复（v045）", "test_045_fixes.py", False),
     ("py_exec 能力分档·交互式工具·超时口径（v047）", "test_047_fixes.py", False),
+    ("文档契约·getattr 例外·任务级约束闸门（v048）", "test_048_fixes.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

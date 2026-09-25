@@ -51,6 +51,10 @@ class Tool:
     # 实测：某加密小工具（risk_grades 里是 L0，即**自动执行**）就这么白烧过一次。
     interactive: bool = False
     interactive_reason: str = ""
+    # v048：能力标签（来自 overrides 的 caps）。用于**任务级约束闸门**：
+    # 任务声明「不做字典爆破」时，凡带 bruteforce 标签的工具一律拒绝。
+    # 刻意用显式声明而不是按工具名/描述猜 —— 见 app/taskguard.py 的设计说明。
+    caps: list = field(default_factory=list)
     # v023.2 扫描器内部流量能力声明（来自 overrides 的 network_control）
     network_control: dict = field(default_factory=dict)
 
@@ -70,6 +74,7 @@ class Tool:
             "disabled": self.disabled,
             "disabled_reason": self.disabled_reason,
             "interactive": self.interactive,
+            "caps": list(self.caps),
         }
 
 
@@ -240,6 +245,8 @@ class ToolRegistry:
                 # v047：交互式菜单程序不进模型工具清单（见 Tool.interactive 说明）
                 tool.interactive = bool(ov.get("interactive"))
                 tool.interactive_reason = ov.get("interactive_reason", "") or ""
+                # v048：能力标签，供任务级约束闸门用
+                tool.caps = [str(x) for x in (ov.get("caps") or [])]
 
             if scriptable:
                 g = grades.get(tool.name)
@@ -350,25 +357,52 @@ class ToolRegistry:
             {
                 "name": "Python代码执行",
                 "alias": "py_exec",
+                # ⚠️ 描述里也曾经写「（httpx/requests 可用）」—— 与 caveat 的 ④ 同样
+                # 在教模型用会被闸门拒绝的库（分档器一律判 `import httpx` 非只读）。
+                # 描述是模型最先读到的一段，写错比 caveat 写错影响更大。
                 "description": "在受控 Python 通道执行一段代码并回传输出（Intent Engineering：单点任务直接写代码，"
-                               "替代碎片化工具串）。适合：HTTP 请求分析（httpx/requests 可用）、数据处理、"
-                               "脚本化验证、生成字典/批量请求。代码用 print 输出结果。",
+                               "替代碎片化工具串）。适合：HTTP 请求分析、数据处理、"
+                               "脚本化验证、生成字典（**不要**用它在循环里批量发包，见下）。"
+                               "代码用 print 输出结果。",
                 "risk_level": "L3",
                 "risk_reason": "在宿主解释器执行任意 Python 代码，能力等同本机命令行，风险高；"
                                "须用户确认并勾选书面授权",
                 "caveat": "target 填当前授权目标（仅用于留档归类）；args 填完整 Python 代码（多行）。"
                           "代码内 HTTP 请求只允许发往当前授权目标及其资产，禁止扫描/访问未授权主机或内网。"
-                          "**必读（v023.7）**：①脚本内发请求请用受控接口 "
-                          "`from srcagent import safe_http_request`（返回 dict，同时支持 "
-                          "`r[\"status_code\"]` 与 `r.status_code`；**先查 `r[\"error\"]` 判成败**，"
-                          "不要用 text 是否为空推断目标内容）；②不要写 `import httpx/requests/urllib` "
-                          "的循环发包脚本（会被拒绝执行）；③需要「上一步取数、下一步解析」时用 "
-                          "`from srcagent import tmpdir` 拿会话级持久目录落盘，"
-                          "**不要写 /tmp 或其它系统绝对路径**（本机 /tmp 会落到 C:\\tmp，不受管控）；"
-                          "④不确定接口用法时先 `print(safe_http_request.__doc__)` 再发请求，"
-                          "省一次目标流量。"
+                          # ⚠️ 下面两段是**机器可校验的契约**（见 test_048_fixes.py 的 [A] 组）：
+                          # 分档器的白名单、沙箱实际导出、这两段声明，三者必须完全一致。
+                          # 为什么做成契约而不是散文：v045 补了 save_text/load_text、v045.2 补了
+                          # load_bytes/file_md5/file_info，**只改了沙箱 docstring，没改这份 caveat** ——
+                          # 而模型能直接看到的只有 caveat，沙箱 docstring 要主动 print 才看得到。
+                          # 后果（2026-09-25 某企业站实战）：Agent 想「落盘后本地全量解析」，
+                          # 只能用裸 open() 去读 → 被判非只读拒 → **只好放弃落盘**，
+                          # 于是 128KB 截断的大 JS 永远读不完整，v031 建的落盘机制一次没用上。
+                          # 散文会漂移，契约不会。
+                          # 格式约束：`【受控接口】` 与 `【禁止使用】` 两个标记**必须原样保留**
+                          # （测试按它们定位），且段内**只放名字**（用「、」分隔）——
+                          # 夹带解释文字会把名字粘成无效 token，契约就解析不出来了。
+                          "受控接口的写法是 `from srcagent import X`。"
+                          "【受控接口】safe_http_request、get、post、tmpdir、TMPDIR、Resp、"
+                          "save_text、load_text、list_tmpdir、load_bytes、file_md5、file_info"
+                          "【禁止使用】httpx、requests、urllib.request、urllib.error、os、"
+                          "subprocess、shutil、pathlib、socket、tempfile、pickle、importlib、"
+                          "open、eval、exec、compile、globals、locals、vars、setattr"
+                          "上面这两段是硬约束：「禁止使用」里的名字一律会被判「非只读」"
+                          "拒绝执行，白等一次人工确认。"
+                          "【发请求】统一用 `safe_http_request`（返回对象同时支持 "
+                          "`r[\"status_code\"]` 与 `r.status_code`；**先看 `r[\"error\"]` 判成败**，"
+                          "不要用 text 是否为空推断目标内容）；**不要写循环发包脚本**，"
+                          "多次取数就写多行顺序调用；不确定用法先 `print(safe_http_request.__doc__)`。"
+                          "`getattr(obj, \"字面量名\")` 允许；`getattr(obj, 变量名)` 不允许。"
+                          "【大响应必须落盘再解析】响应超过约 128KB 会被截断，"
+                          "此时返回值里带 `saved_text_path` —— 用 `load_text(path)` 取全文、"
+                          "`load_bytes(path)` 取**原始字节**（算哈希必须用它，文本读取会被换行污染）、"
+                          "`file_md5(path)` 直接算摘要；**不要用裸 `open()` 去读它**。"
+                          "要写自己的中间文件用 `save_text(name, text)`，目录用 `tmpdir()`；"
+                          "**不要写 /tmp 或任何系统绝对路径**（本机 /tmp 会落到 C:\\tmp，不受管控）。"
                           "每段代码保持小且聚焦（<30 行），超时就拆小重试，禁止在代码里 sleep 空转。"
-                          "依赖仅限标准库与已装包（httpx/pydantic 等），需要其他包用 urllib 或说明原因。",
+                          "依赖只用上面列出的受控接口与标准库**纯计算**模块（re/json/base64/hashlib/…）；"
+                          "需要网络能力一律改用 `safe_http_request`，不要 import 网络库。",
                 "executable": "builtin://py_exec",
                 "exists": True,
             },

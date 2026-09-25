@@ -351,6 +351,10 @@ def init_db() -> None:
             # 是否 split_task 派生的并行子任务。必须落库：子任务内禁 L2/L3 是安全闸门，
             # 只存内存的话，服务重启或被 adopt 后标记丢失、闸门就静默失效了。
             ("subtask", "INTEGER DEFAULT 0"),
+            # v048 任务级约束（JSON 对象：能力标签 → 命中的任务原文片段）。
+            # 与 subtask 同理且更要紧：它是**闸门依据**。只存内存的话，adopt 续聊后
+            # 约束消失 → Agent 重新去做任务书明令禁止的事，而库表上看不出任何异常。
+            ("constraints", "TEXT DEFAULT '{}'"),
         ):
             if col not in cols:
                 c.execute(f"ALTER TABLE sessions ADD COLUMN {col} {ddl}")
@@ -480,13 +484,22 @@ def delete_project(pid: str) -> bool:
 def save_session(sid: str, project_id: str, task: str, target: str, state: str,
                  parent_id: str | None = None, title: str | None = None,
                  context: list | None = None, status: str | None = None,
-                 summary: str | None = None, subtask: bool | None = None) -> None:
+                 summary: str | None = None, subtask: bool | None = None,
+                 constraints: dict | None = None) -> None:
     """保存/更新会话。树相关列（parent_id/title/context/status/summary/subtask）
-    只在显式传入时更新，避免普通落库把分支元数据冲掉。"""
+    只在显式传入时更新，避免普通落库把分支元数据冲掉。
+
+    `constraints`（v048 任务级约束）同样只在显式传入时更新，理由更强：
+    它是**闸门依据**，不是展示字段。普通落库把它清空 = 任务级约束静默失效，
+    而现象只是「Agent 又开始做被禁止的事了」，从库表上看不出任何异常。
+    """
     with _db() as c:
         row = c.execute("SELECT id FROM sessions WHERE id=?", (sid,)).fetchone()
         sets = ["project_id=?", "task=?", "target=?", "state=?"]
         vals: list = [project_id, task, target, state]
+        if constraints is not None:
+            sets.append("constraints=?")
+            vals.append(json.dumps(constraints or {}, ensure_ascii=False))
         if parent_id is not None:
             sets.append("parent_id=?")
             vals.append(parent_id)
@@ -509,14 +522,19 @@ def save_session(sid: str, project_id: str, task: str, target: str, state: str,
             vals.append(sid)
             c.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id=?", vals)
         else:
+            # ⚠️ INSERT 分支也必须带 constraints（v048 由端到端测试抓出）：
+            # 首次落库走的**就是**这条分支（sessions.create 只建内存对象，不写库），
+            # 若这里漏掉，UPDATE 分支写得再对也没用 —— 约束永远是默认的 `{}`，
+            # 也就是「任务级闸门从没真正落过库」，而库表上看不出任何异常。
             c.execute(
                 "INSERT INTO sessions (id,project_id,task,target,state,created_at,"
-                "parent_id,title,status,context,summary,subtask) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "parent_id,title,status,context,summary,subtask,constraints) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (sid, project_id, task, target, state, time.time(),
                  parent_id or "", title or "", status or "active",
                  json.dumps(context or [], ensure_ascii=False), summary or "",
-                 1 if subtask else 0),
+                 1 if subtask else 0,
+                 json.dumps(constraints or {}, ensure_ascii=False)),
             )
 
 

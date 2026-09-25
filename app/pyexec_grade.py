@@ -44,6 +44,20 @@
     + data/scope.json + Burp 侧人工闸门
   · 被降级的步骤**必须留痕**（`apply_to` 返回可读理由，由调用方写进事件与步骤记录）
 
+## 两处「字面量例外」（v048 补齐第二条）
+
+`__import__` 与 `getattr` 都是动态能力的入口，默认拒绝。但当**参数是字面量字符串**时，
+它们不构成任何动态能力 —— 这种形态拦下来只是白卡一步（两处都是实测踩出来的）：
+
+| 例外 | 放行条件 | 判定函数 |
+|---|---|---|
+| `__import__("re")` | 唯一实参、字面量、模块在白名单内 | `_literal_allowed_import` |
+| `getattr(x, "text", "")` | 2–3 个位置参数、第 2 个是字面量、不以 `_` 开头、不在 `DENIED_ATTR_NAMES` | `_literal_allowed_getattr` |
+
+**为什么第二条必须补**：第一条早已存在，第二条却一直缺 —— 同一个原理只落在一半的
+入口上，就是自相矛盾。`getattr(obj, "text", "")` 是模型最常用的防御性取字段写法，
+实测因它一步 py_exec 被判 L3、白等 90 秒。
+
 ## 与 `_classify_step.py` 的关系
 
 那个文件是本模块的原型（v045 实战期间以临时脚本形式验证收益，27/27 自测通过）。
@@ -70,6 +84,14 @@ ALLOWED_MODULES = {
 }
 
 # srcagent 受控通道里允许使用的名字（沙箱注入的 API）。
+#
+# ⚠️ 这张表**必须与沙箱实际导出的名字逐一对应**（v048 加守卫测试绑定）。
+# 原先表里还有 `range_download` 与 `save_artifact` 两个名字 —— 实测**沙箱根本没导出它们**
+# （`save_artifact` 是 store 的宿主侧函数，`range_download` 在所有代码里都查不到）。
+# 后果很隐蔽：脚本写 `from srcagent import save_artifact` 会被判「只读出网」放行，
+# 然后在子进程里 ImportError —— **闸门说自己放行了一个它其实不该放行的东西**。
+# 白名单列出不存在的 API，比漏列更糟：漏列只是多问一次人，多列是给了假许可。
+# 已移除；将来要提供这两个能力，先实现沙箱导出，再回填到这里。
 ALLOWED_SRCAGENT_NAMES = {
     "safe_http_request", "get", "post", "tmpdir", "TMPDIR", "Resp",
     "save_text", "load_text", "list_tmpdir",
@@ -77,7 +99,6 @@ ALLOWED_SRCAGENT_NAMES = {
     # 而 docstring 原本教人用 `open(p, "rb")`（被本判定器禁止），
     # 于是「被文档推荐的标准动作」反而过不了自己的闸门（实测白烧三步）。
     "load_bytes", "file_md5", "file_info",
-    "save_artifact", "range_download",
 }
 
 # 允许「裸导入」的模块。srcagent 必须在内 —— Agent 撞到字段名错误后用
@@ -87,9 +108,9 @@ ALLOWED_SRCAGENT_NAMES = {
 ALLOWED_BARE_MODULES = ALLOWED_MODULES | {"srcagent"}
 
 # 会出网的名字（决定 readonly_net 档）
-EGRESS_NAMES = {"safe_http_request", "get", "post", "range_download"}
+EGRESS_NAMES = {"safe_http_request", "get", "post"}
 # 会产生本地副作用的受控名字（拿不准算不算「只读」→ 统一按 net 档，宁严不松）
-EFFECT_NAMES = {"save_artifact", "save_text"}
+EFFECT_NAMES = {"save_text"}
 
 # 禁止访问下划线开头的属性（`_os` / `__class__` / `__globals__` / `__subclasses__` …）。
 # 这条比「禁止导入」更贴近真实威胁：`import re; re._compiler` 本身无害，
@@ -100,10 +121,36 @@ ALLOWED_DUNDER_ATTRS = {"__doc__", "__name__"}
 # 注意必须含 getattr —— 它是「动态取属性」的入口，实测可绕过静态判定：
 #   getattr(__builtins__, 'ev'+'al')('1')   ← 拼出来的名字躲过字面量检查
 # 宁可让用了 getattr 的正常代码回落到人工确认，也不放行这条绕过路径。
+# **例外**：参数是字面量字符串的 getattr 不构成动态能力，见 _literal_allowed_getattr。
 DENIED_BUILTINS = {
     "open", "exec", "eval", "compile", "__import__", "input", "breakpoint",
     "globals", "locals", "vars", "setattr", "delattr", "getattr", "exit",
     "quit", "help", "memoryview",
+}
+
+# 「属性名本身就是危险动词」的名单。
+# 为什么 `getattr` 放开字面量调用之后还需要它：`getattr(x, "system")` 的参数确实是
+# 字面量、也确实不以 `_` 开头，但取到的属性本身就是起进程 / 删文件 / 出网的入口。
+# 光看「是不是字面量」不够，还得看「取出来的这个名字危不危险」。
+DENIED_ATTR_NAMES = {
+    # 起进程
+    "system", "popen", "spawn", "spawnl", "spawnle", "spawnv", "spawnve",
+    "execv", "execve", "execvp", "execvpe", "fork", "forkpty", "posix_spawn",
+    "run", "call", "check_output", "check_call", "Popen", "startfile",
+    # 环境与路径
+    "environ", "getenv", "putenv", "chdir", "chroot", "getcwd", "startfile",
+    # 文件系统
+    "listdir", "scandir", "walk", "remove", "unlink", "rmdir", "removedirs",
+    "rmtree", "chmod", "chown", "rename", "replace", "symlink", "link",
+    "mkdir", "makedirs", "open", "fdopen",
+    # 网络
+    "urlopen", "urlretrieve", "socket", "connect", "bind", "listen", "send",
+    "sendall", "recv", "recvfrom",
+    # 动态加载与内省逃逸
+    "modules", "import_module", "invalidate_caches", "reload",
+    "builtins", "__builtins__", "__loader__", "__import__",
+    # 终止
+    "kill", "killpg", "abort", "_exit",
 }
 
 # 危险根模块：任何位置的引用都判非只读。
@@ -176,6 +223,36 @@ def _literal_allowed_import(node: ast.Call) -> bool:
     return a.value in ALLOWED_MODULES
 
 
+def _literal_allowed_getattr(node: ast.Call) -> bool:
+    """判断 `getattr(obj, "字面量名"[, 默认值])` 是否无害。
+
+    为什么单开一条（v048 实测踩到）：`getattr` 本身是动态取属性的入口，
+    `getattr(__builtins__, "ev"+"al")` 是经典绕过，所以它在 DENIED_BUILTINS 里。
+    但模型大量使用**字面量的防御性取字段**（`getattr(r, "text", "")`）——
+    这与 `__import__("re")` 是**同一类**「参数是字面量、不构成任何动态能力」的形态。
+    分档器已经给后者开了窄例外，却对前者一律拒绝，**自相矛盾**。
+
+    实测代价：一步 py_exec 因此被判 L3、白等 90 秒才被拒（2026-09-25 某企业站）。
+
+    判定极窄，四条同时满足才放行：
+      · 2 或 3 个位置参数、**无**关键字参数
+      · 第 2 个参数是**字面量字符串**
+      · 该字符串**不以 `_` 开头**（挡 `__class__` / `__globals__` / `__subclasses__`）
+      · 不在 DENIED_ATTR_NAMES（挡「属性名本身就是危险动词」，如 `getattr(x, "system")`）
+
+    任何拼接、变量、双下划线属性名都仍然拒绝（fail-closed）。
+    """
+    if node.keywords or not (2 <= len(node.args) <= 3):
+        return False
+    arg = node.args[1]
+    if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+        return False
+    name = arg.value
+    if not name or name.startswith("_"):
+        return False
+    return name not in DENIED_ATTR_NAMES
+
+
 def analyze(code: str) -> tuple[list[str], bool]:
     """静态扫描代码，返回 (非只读能力清单, 是否出网)。
 
@@ -227,8 +304,11 @@ def analyze(code: str) -> tuple[list[str], bool]:
         elif isinstance(node, ast.Call):
             f = node.func
             if isinstance(f, ast.Name) and f.id in DENIED_BUILTINS:
-                # 唯一例外：字面量白名单模块的 __import__（见 _literal_allowed_import）
+                # 两处窄例外：字面量白名单模块的 __import__、字面量属性名的 getattr
+                # （两者的共同点：**参数是字面量 → 不构成动态能力**）
                 if f.id == "__import__" and _literal_allowed_import(node):
+                    continue
+                if f.id == "getattr" and _literal_allowed_getattr(node):
                     continue
                 problems.append(f"调用 {f.id}()")
             elif isinstance(f, ast.Attribute):

@@ -317,6 +317,14 @@ PY_EXEC_GRADE_ENABLED = os.getenv(
 PY_EXEC_GRADE_LEVEL_LOCAL = os.getenv("AGENT_PY_EXEC_GRADE_LEVEL_LOCAL", "L0")
 PY_EXEC_GRADE_LEVEL_NET = os.getenv("AGENT_PY_EXEC_GRADE_LEVEL_NET", "L2")
 
+# ---- 任务级约束闸门（v048）----
+# 从任务文本解析**显式禁令**（「不做字典爆破」等），凡具备对应能力的工具一律拒绝执行。
+# 见 app/taskguard.py。默认开；关掉则只剩风险闸门（回到 v047 的行为）。
+# 关闭的正当理由只有一个：约束解析**误判**了（把「禁止扫描未授权主机」当成「禁止扫描」）。
+# 误判已有上下文过滤处理，但仍保留这个出口。
+TASK_CONSTRAINTS_ENABLED = os.getenv(
+    "AGENT_TASK_CONSTRAINTS", "1").strip().lower() not in ("0", "false", "no", "off")
+
 # ---- py_exec 沙箱（v010 P0-1：进程级隔离）----
 # 背景：py_exec 在宿主解释器里执行模型直出的任意 Python，此前 env=os.environ
 #   完整继承宿主环境——DeepSeek/FOFA/代理凭据等全部对子进程可见，且 proc.kill()

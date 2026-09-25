@@ -106,9 +106,18 @@ doc = sa.safe_http_request.__doc__ or ""
 check("docstring 含字段表", "status_code" in doc and "headers" in doc and "error" in doc)
 check("docstring 强调先查 error", "先查 error" in doc or "error 非空" in doc)
 check("模块 docstring 给 tmpdir 用法", "tmpdir" in (sa.__doc__ or ""))
-reg_src = (ROOT / "app" / "registry.py").read_text(encoding="utf-8")
-check("py_exec 工具描述含 tmpdir 与先查 error 指引",
-      "srcagent import tmpdir" in reg_src and "先查" in reg_src)
+# v048：这条曾经钉死具体措辞（`"srcagent import tmpdir" in reg_src and "先查" in reg_src`），
+# 于是任何一次措辞改写都会假红 —— 与 v045 在 test_034 B1 上踩的是同一个坑。
+# 钉**意图**：模型对 py_exec 可见的全部文字（description + caveat）里必须
+# ① 提到 tmpdir（会话目录怎么拿）② 提到先看 error（判成败方式）。
+# 用 registry 实际加载出的对象，而不是 grep 源码 —— 那才是模型真正看到的东西。
+from app.registry import registry as _reg
+_reg.load()
+_px = _reg.get_by_alias("py_exec")
+_visible = (_px.description or "") + (_px.caveat or "") if _px else ""
+check("py_exec 对模型可见的说明含 tmpdir 用法与「先看/先查 error」指引",
+      bool(_px) and "tmpdir" in _visible
+      and ("先看" in _visible or "先查" in _visible) and "error" in _visible)
 
 print(f"\n{'=' * 56}")
 print(f"  通过 {len(ok)} 项，失败 {len(fail)} 项")
