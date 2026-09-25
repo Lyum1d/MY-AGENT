@@ -90,8 +90,10 @@ def test_a_grading():
          "print(safe_http_request('https://a.test/'))", "from-import 形态"),
         ("import srcagent\nprint(srcagent.safe_http_request('https://a.test/'))",
          "属性调用形态"),
-        ("from srcagent import save_artifact\nprint(save_artifact('a.txt','x'))",
-         "受控落盘证据也有副作用"),
+        # v048：这里原本用 save_artifact —— 实测沙箱**从未导出**它（幽灵 API），
+        # 已从白名单移除，故改用真正存在的 save_text 表达同一意图（受控落盘 → net 档）。
+        ("from srcagent import save_text\nprint(save_text('a.txt','x'))",
+         "受控落盘（有本地副作用）也按 net 档"),
     ]:
         r = g(code)
         check(f"受控出网判为 {pyexec_grade.TIER_NET}：{why}",
@@ -136,10 +138,21 @@ def test_a_grading():
     check("非白名单模块的 __import__ 仍拒绝", r.tier == pyexec_grade.TIER_OPAQUE)
 
     # ---- 文件权限：判定器不得碰网络/文件（纯 AST）----
+    # v048：这条原先用「DENIED_ROOTS 之前不许出现 socket/subprocess 字样」当代理指标，
+    # 而新增的 DENIED_ATTR_NAMES 里正好有 "socket"/"system" 这些**属性名** —— 假红。
+    # 代理指标不可靠，直接查真正的导入表。
     src = read("app/pyexec_grade.py")
-    check("判定器只做静态分析（不 import 网络/进程模块）",
-          "import ast" in src and "socket" not in src.split("DENIED_ROOTS")[0]
-          and "subprocess" not in src.split("DENIED_ROOTS")[0])
+    imports = set()
+    for ln in src.splitlines():
+        m = re.match(r"\s*(?:from\s+([\w.]+)\s+import|import\s+([\w., ]+))", ln)
+        if m:
+            for part in (m.group(1) or m.group(2) or "").split(","):
+                imports.add(part.strip().split(".")[0].split(" as ")[0].strip())
+    check("判定器只做静态分析（导入表里没有网络/进程/文件模块）",
+          "ast" in imports
+          and not (imports & {"socket", "subprocess", "os", "shutil", "pathlib",
+                              "httpx", "requests", "urllib"}),
+          f"实得导入 {sorted(imports)}")
 
 
 def test_b_apply_to():

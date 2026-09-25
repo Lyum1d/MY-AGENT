@@ -22,6 +22,7 @@ from . import graph
 from . import kb, fofa
 from . import pyexec
 from . import pyexec_grade
+from . import taskguard
 from . import replayer
 from . import burp_tools
 from . import mcp_client
@@ -706,6 +707,12 @@ class Session:
     # （实测踩中）。threading.Event 的 is_set/set 无循环绑定，执行器侧
     # 只需轮询 is_set()，完全等价。
     cancel_event: "threading.Event" = field(default_factory=threading.Event)
+    # ---- 任务级约束（v048）----
+    # 从任务文本里解析出的**显式禁令** → 能力标签，如 {"bruteforce": "不做字典爆破"}。
+    # 为什么挂在会话上：约束是**每个任务各不相同**的，系统提示里写不了；
+    # 而闸门每步都要读它（见 app/taskguard.py 的实测复盘：L0 的 OneForALL 自动放行，
+    # 任务书写了「不做字典爆破」也拦不住）。必须落库，否则 adopt 续聊后闸门静默失效。
+    constraints: dict = field(default_factory=dict)
     # 事件落库游标：emit 时由 store.save_event 返回并回填到事件里（_seq），
     # 供 SSE 断线重放去重（Last-Event-ID 之后只发增量）。
     last_seq: int = 0
@@ -805,6 +812,12 @@ class SessionManager:
         s.target = row.get("target") or ""
         s.state = "idle"
         s.summary = row.get("summary") or ""
+        # v048：任务级约束必须装回 —— 它是**闸门依据**，丢了闸门就静默失效
+        # （与上面 subtask 同一个道理，见 store.py 的 subtask 注释）。
+        try:
+            s.constraints = json.loads(row.get("constraints") or "{}")
+        except Exception:                                # noqa: BLE001
+            s.constraints = {}
         # 续聊记忆：把落库的对话原文装回 messages。
         # 少了这一步，「切回线索继续聊」等于失忆 —— 模型看不到任何历史轮次（用户原话、
         # 自己的判断、结论全丢），而前端依然能从 chat_messages 回放完整对话，
@@ -862,6 +875,15 @@ class Agent:
         except Exception:
             logger.exception("用户消息落库失败")
         session.target = extract_target(user_message)
+        # ---- 任务级约束解析（v048）----
+        # 从任务文本里读**显式禁令**（只有明确写出来的才算，不猜），映射成能力标签，
+        # 供闸门在每步之前核对。merge 而非覆盖：用户可能分几条消息说要求，
+        # 后面的补充不该把先前声明的禁令抹掉。
+        if config.TASK_CONSTRAINTS_ENABLED:
+            session.constraints = taskguard.merge(
+                session.constraints, taskguard.parse(user_message))
+            if session.constraints:
+                logger.info("本任务生效的约束：%s", session.constraints)
         # 项目里显式填写的「目标」优先：用户建项目时填的常是纯企业名/域名，
         # 而任务描述往往只说「做信息收集」之类，模型从消息里识别不出目标。
         proj = store.get_project(session.project) if session.project else None
@@ -881,7 +903,7 @@ class Agent:
         # 分支线索在首次运行后就出现在小地图上）
         store.save_session(session.id, session.project, user_message, session.target,
                            "running", parent_id=session.parent_id, title=session.title,
-                           subtask=session.subtask)
+                           subtask=session.subtask, constraints=session.constraints)
         await session.emit({"type": "session_start", "session_id": session.id})
         backend = get_backend(self.backend_name)
         # 漏洞验证类任务自动路由云端：本地小模型在多步推理上明显吃力，
@@ -1451,6 +1473,38 @@ class Agent:
                         except Exception:
                             pass
                         continue
+
+                # ---- 任务级约束闸门（v048）----
+                # 位置：风险闸门**之前**，而且对 L0/L1 也生效 —— 这正是本闸门存在的理由。
+                # 2026-09-25 某企业站实战：任务书写明「不做字典爆破」，Agent 仍调了
+                # OneForALL（95247 词字典）。它是 **L0 → 风险闸门自动放行**，
+                # 整条链上没有任何环节能拦住 —— 风险闸门只知道「工具多危险」，
+                # 不知道「本次任务不允许什么」。
+                # 这里**拒绝**而不是降级为需确认：约束是操作者自己写下的指令，
+                # 降级的话无人值守时审批器会等满宽限期再拒，同一个结果多烧一步 + 90 秒。
+                viol = taskguard.violation(session.constraints,
+                                           getattr(tool, "caps", None))
+                if viol:
+                    cap, hit = viol
+                    msg = taskguard.refusal_message(tool.name, cap, hit)
+                    step.status = "denied"
+                    step.output = msg
+                    session.messages.append({"role": "tool",
+                                             "tool_call_id": tc["id"], "content": msg})
+                    await session.emit({"type": "step_denied",
+                                        "step": self._step_dict(step)})
+                    try:
+                        store.save_step(session.id, self._step_dict(step))
+                    except Exception:
+                        pass
+                    logger.info("任务级约束拦下 %s（能力 %s，任务声明「%s」）",
+                                tool.alias, cap, hit)
+                    await session.emit({
+                        "type": "reasoning",
+                        "data": f"已按任务级约束拒绝 {tool.name}：任务声明「{hit}」，"
+                                f"而该工具具备「{taskguard.CAP_LABEL.get(cap, cap)}」能力。",
+                    })
+                    continue
 
                 # ---- 风险闸门 ----
                 if not risk.get("auto", False):
@@ -2196,6 +2250,18 @@ class Agent:
             parts.append(
                 f"\n\n【本次任务目标：{session.target}】\n{note}"
                 f"不要向用户索要目标，也不要把说明文字填进 target。"
+            )
+        # v048：任务级约束注入。放在目标之后、事实之前 ——
+        # 模型先知道「打哪」，再知道「这次不许做什么」，最后才是「已经确认过什么」。
+        # 必须每轮重申：v048 之前 Agent 在**第一步**就调了被任务书明令禁止的 OneForALL，
+        # 说明光写在任务书开头挡不住（长上下文里它会被淹没）。
+        cnote = taskguard.describe(session.constraints)
+        if cnote:
+            parts.append(
+                f"\n\n【本次任务已声明的禁令（硬约束，不要试探）】{cnote}。"
+                f"具备对应能力的工具（如 oneforall / dirsearch / goon 之于爆破，"
+                f"各类 scan 工具之于扫描）**会被直接拒绝执行**，不是「需要确认」。"
+                f"请改用不违反约束的做法；被拒后**不要换成另一个同类工具重试**。"
             )
         # v023.7：项目已证实事实注入（放在目标之后——模型先知道「打哪」，
         # 再看到「已经确认过什么」，避免把预算重复花在已证实的结论上）
