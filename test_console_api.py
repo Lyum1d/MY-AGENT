@@ -243,6 +243,35 @@ def test_c_read_verify():
 
 
 # ============================================================ D preview 校验
+def test_c2_structured_count():
+    """[C2] 「结构化条目数」口径：数 raw targets，不能数合并视图的长度。
+
+    实测踩到（2026-09-27 起服务跑端到端时）：总览把 7 个 host 显示成「结构化 14 条」——
+    因为 `load_scope_targets()` 是 `domains` + `targets` 的**合并视图**，
+    同一个 host 各出一条。数字本身不影响授权，但对运维界面是**误导**：
+    看到「14 条」会以为有一批重复条目要清。
+    """
+    print("\n[C2] 总览「结构化条目数」口径")
+    saved = config.CONSOLE_PASSWORD
+    try:
+        config.CONSOLE_PASSWORD = PW
+        with Sandbox() as _sb, TestClient(app, base_url=LOOPBACK) as c:
+            # 同一个 host 同时出现在 domains 与 targets → 合并视图会出 2 条
+            config.SCOPE_FILE.write_text(json.dumps(
+                {"domains": ["a.test"], "targets": [{"host": "a.test"}]},
+                ensure_ascii=False), encoding="utf-8")
+            c.post("/api/console/login", json={"password": PW})
+            d = c.get("/api/console/overview").json()
+            merged = len(scope.load_scope_targets())
+            check("合并视图确实有 2 条（用例前提成立）", merged == 2, str(merged))
+            check("总览报的结构化条数是 1（数 raw targets，不是合并视图）",
+                  d["scope"]["structured"] == 1, str(d["scope"]))
+            check("总览报的主机数是 1（合并视图已去重）",
+                  d["scope"]["count"] == 1, str(d["scope"]))
+    finally:
+        config.CONSOLE_PASSWORD = saved
+
+
 def test_d_preview_validation():
     print("\n[D] 提交前校验（不给「写了才发现坏」的机会）")
     saved = config.CONSOLE_PASSWORD
@@ -580,6 +609,7 @@ def main() -> int:
     test_a_gate()
     test_b_login()
     test_c_read_verify()
+    test_c2_structured_count()
     test_d_preview_validation()
     test_e_commit_enforcement()
     test_f_end_to_end()

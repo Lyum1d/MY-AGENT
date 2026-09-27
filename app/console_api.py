@@ -177,6 +177,10 @@ async def overview(request: Request):
     domains = scope.load_scope()
     entries = scope.load_scope_targets()
     raw = config_io.read_json(config.SCOPE_FILE, default={}) or {}
+    # ⚠️ 「结构化条目数」必须数 **raw["targets"] 的条数**，不能数 `load_scope_targets()` 的长度：
+    # 后者是 domains（旧写法）+ targets（结构化）**合并后**的视图，同一个 host 会各出一条，
+    # 于是 7 个 host 显示成「结构化 14 条」—— 实测看到过这个误导，故显式取 raw 计数。
+    n_structured = len([t for t in (raw.get("targets") or []) if isinstance(t, dict)])
 
     # 白名单告警：每一条都对应一种「看起来配了、其实没防住」的情况
     warns: list[dict] = []
@@ -240,8 +244,8 @@ async def overview(request: Request):
     return {
         "ok": True,
         "scope": {
-            "count": len(domains),
-            "structured": len(entries),
+            "count": len(domains),          # 主机数（合并视图，已去重）
+            "structured": n_structured,     # raw["targets"] 条数（见上方注释）
             "enforce": bool(config.ENFORCE_SCOPE),
             "needs_review": len(needs_review),
             "file": config_io.file_state(config.SCOPE_FILE),
