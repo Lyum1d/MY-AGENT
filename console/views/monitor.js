@@ -1,5 +1,5 @@
 /* 实时运行监控（P1 占位，P3 实现）。 */
-import { placeholder } from '/console-assets/views/_placeholder.js?v=050';
+import { placeholder } from '/console-assets/views/_placeholder.js?v=0502';
 
 export const render = placeholder({
   title: '实时监控',

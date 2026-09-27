@@ -46,6 +46,19 @@
 
 * { box-sizing: border-box; }
 
+/* ⚠️ 这一条是**必须的**，不是可选美化（v050.1 实测踩到的真 bug，第一次真用就中）：
+ *
+ * `hidden` 属性在浏览器里靠 UA 样式表的 `[hidden] { display: none }` 生效，
+ * 而**作者样式表的 `display` 会覆盖 UA 样式表**。本文件里 `.app` / `.modal-mask` /
+ * `.login-mask` / `.ack` 都写了 `display: flex` —— 于是它们上面的 `hidden` **完全不起作用**：
+ *   · 一进 /console 就看到「确认」弹窗盖在登录卡上（截图可见）；
+ *   · 点「关闭/取消/确认提交」也没反应 —— 关弹窗的动作就是设 `hidden=true`，
+ *     而它同样被覆盖，弹窗**永远关不掉**，人被卡死在这一屏。
+ * 加 `!important` 让 `hidden` 重新说了算。这是本文件里唯一使用 `!important` 的地方，
+ * 理由是它需要压过**同一文件内**的其它规则，且表达的是「这个元素不该参与布局」的硬语义。
+ */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);

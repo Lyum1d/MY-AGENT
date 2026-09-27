@@ -602,6 +602,69 @@ def test_h_wiring_and_redlines():
         check("scope.json 不存在 → 防泄露检查跳过", True)
 
 
+def test_i_ui_regressions():
+    """[I] 前端两个「第一次真用就中」的缺陷（v050.1 / v050.2）。
+
+    这两个都不是逻辑错误，而是**平台机制**踩坑，靠读代码很难发现，
+    所以各留一条守卫：
+
+    1. **`hidden` 被 CSS 的 `display` 覆盖**（用户截图报的正是这个）：
+       `hidden` 靠 UA 样式表 `[hidden] { display: none }` 生效，而**作者样式的
+       `display` 会压过 UA 样式**。`console.css` 里 `.app` / `.modal-mask` /
+       `.login-mask` / `.ack` 都写了 `display: flex` —— 于是它们上面的 `hidden`
+       完全失效：一进 /console 就有「确认」弹窗盖在登录卡上，
+       而且点「关闭/取消/确认提交」都没反应（关弹窗就是设 `hidden=true`，同样被压过）。
+       → 守卫：必须存在 `[hidden] { display: none !important }`。
+
+    2. **`/console-assets/` 没被 `no-cache` 覆盖**：中间件原本只判 `/static`，
+       于是控制台改完 CSS 后**用户浏览器一直吃缓存里的旧样式**，
+       现象是「你按说的修了，但我这边还是坏的」（2026-09-18 线索图黑块事故同源）。
+       → 守卫：真实请求该路径必须带 `Cache-Control: no-cache`。
+    """
+    print("\n[I] 前端机制类缺陷的守卫")
+    css = read("console/console.css")
+    html = read("console/index.html")
+
+    check("console.css 含 [hidden] 强制隐藏规则（否则 hidden 会被 display 压过）",
+          "[hidden]" in css and "display: none !important" in css,
+          "缺 `[hidden] { display: none !important; }`")
+    check("该规则确实用了 !important（不加会被同文件的 display: flex 压过）",
+          "display: none !important" in css)
+
+    # 反向：index.html 里所有带 hidden 的元素，其 class 在 CSS 里都设过 display
+    # → 正是需要这条守卫的场景。列出来是为了失败时能一眼看出影响面。
+    cls_with_hidden = sorted({m for m in _re.findall(
+        r'class="([^"]+)"[^>]*\shidden', html)})
+    display_rules = {c for c in cls_with_hidden
+                     if _re.search(r"\." + _re.escape(c.split()[0]) + r"\s*\{[^}]*display\s*:",
+                                   css)}
+    check("确实存在「带 hidden 且其 class 设了 display」的元素（用例前提成立）",
+          bool(display_rules), f"带 hidden 的 class={cls_with_hidden}")
+    check("因此必须先有 [hidden] 守卫才安全（两者同时成立即正确）",
+          bool(css.count("display: none !important")))
+
+    # ---- 真实请求验证 no-cache（走中间件，不只看源码）----
+    with TestClient(app, base_url=LOOPBACK) as c:
+        r = c.get("/console-assets/console.css")
+        check("console.css 可取", r.status_code == 200, str(r.status_code))
+        check("/console-assets/ 带 Cache-Control: no-cache（否则用户看不到修复）",
+              r.headers.get("cache-control") == "no-cache",
+              f"实得 {r.headers.get('cache-control')!r}")
+        r2 = c.get("/static/style.css")
+        check("既有 /static 的 no-cache 未被破坏",
+              r2.status_code in (200, 404)
+              and (r2.status_code == 404
+                   or r2.headers.get("cache-control") == "no-cache"),
+              f"{r2.status_code} {r2.headers.get('cache-control')!r}")
+
+    # ---- 资源版本号：改了前端就必须升版本，否则老缓存继续生效 ----
+    asset_refs = _re.findall(r"/console-assets/[^'\"\s]+", html + read("console/core.js"))
+    unversioned = [x for x in asset_refs
+                   if x.endswith((".js", ".css")) and "?v=" not in x]
+    check("所有 console 资源引用都带版本号（升版本才能绕过旧缓存）",
+          not unversioned, str(unversioned))
+
+
 def main() -> int:
     print("=" * 68)
     print("v050 配置控制台回归（P1：口令闸门 / 白名单 CRUD / 迁移）")
@@ -615,6 +678,7 @@ def main() -> int:
     test_f_end_to_end()
     test_g_migrate()
     test_h_wiring_and_redlines()
+    test_i_ui_regressions()
     print("\n" + "=" * 68)
     print(f"结果：{PASS} 通过 / {FAIL} 失败")
     print("=" * 68)

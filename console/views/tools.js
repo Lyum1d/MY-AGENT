@@ -1,5 +1,5 @@
 /* 工具与分级（P1 占位，P2 实现）。 */
-import { placeholder } from '/console-assets/views/_placeholder.js?v=050';
+import { placeholder } from '/console-assets/views/_placeholder.js?v=0502';
 
 export const render = placeholder({
   title: '工具与分级',

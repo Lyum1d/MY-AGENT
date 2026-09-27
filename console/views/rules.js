@@ -1,5 +1,5 @@
 /* 合规红线与模板（P1 占位，P2 实现）。 */
-import { placeholder } from '/console-assets/views/_placeholder.js?v=050';
+import { placeholder } from '/console-assets/views/_placeholder.js?v=0502';
 
 export const render = placeholder({
   title: '合规与模板',

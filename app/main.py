@@ -132,7 +132,12 @@ async def remote_access_token_guard(request, call_next):
     # 浏览器仍直接吃本地缓存（不发请求、不看 ETag）——表现为「新版页面 +
     # 旧版 CSS」混合渲染：图节点全黑块、弹窗布局错乱。no-cache 保留 ETag
     # 协商缓存（文件没变走 304，不吃流量），变了立即生效。
-    if request.url.path.startswith("/static"):
+    #
+    # ⚠️ v050.2：控制台的 `/console-assets/` 也必须覆盖。原实现只判 `/static`，
+    # 于是控制台改完 CSS 后**用户浏览器一直用缓存里的旧样式**：
+    # 现象是「按你说的修了，但我这边还是坏的」—— 与上面那次事故同一个坑。
+    # 新增静态目录时必须同步加进这个判断（两份清单只留一处，别再各写一套）。
+    if request.url.path.startswith(("/static", "/console-assets")):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
