@@ -184,6 +184,24 @@ class ToolRegistry:
 
     # ---------- 加载 ----------
     def load(self) -> "ToolRegistry":
+        """载入工具清单。**可重复调用（幂等）**。
+
+        ⚠️ v051 修：原实现只往 `self.tools` 里 append，从不清空 —— 重复调用会让
+        清单**线性膨胀**（实测 211 → 408 → 605），而 `_by_name` / `_by_alias` 是字典、
+        只保留最后一份。于是两个视图互相矛盾：`tools` 里有 600 个、按 alias 查只有 211 个。
+        遍历 `tools` 的地方（工具统计、`/api/console/tools`、test_registry 的计数）
+        都会看到错数字，而且**不报任何错**。
+
+        为什么以前没暴露：生产路径只在启动时载入一次。配置控制台的「改完重载 registry」
+        （`config_io.reload_for("tools")`）是第一个在**运行期反复调用**它的功能 ——
+        随手改一个工具的分级，清单就翻倍。
+        """
+        # 先清空再载入：这是「载入」该有的语义，也是幂等的前提。
+        self.tools.clear()
+        self._by_name.clear()
+        self._by_alias.clear()
+        self.errors.clear()
+
         tools_json = config.TOOLBOX_ROOT / "config" / "tools.json"
         if not tools_json.exists():
             self.errors.append(f"找不到工具清单：{tools_json}")

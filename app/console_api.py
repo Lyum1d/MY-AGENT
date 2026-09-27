@@ -65,14 +65,12 @@ _CONFIRMS: dict[str, dict] = {}
 def _flat_yaml(path) -> dict:
     """读扁平 `key: value` 配置（本机 config.yaml）。
 
-    复用 `app/fofa.py` 里已经写好并测过的解析器（它自己也是在没有 pyyaml 时的兜底）。
-    **不另写一份** —— 同一个原理落两份实现，迟早漂移（v047/v048 各踩过一次）。
+    ⚠️ 这里**只做转发**，实现在文件末尾的 `console_api_flat_yaml()`。
+    曾经的写法是在本函数里直接 `from .fofa import _parse_flat_yaml` 再调，
+    结果 P2 新增 secrets 接口时又写了一份同功能的函数 —— **同一个原理两份实现**，
+    正是本项目反复踩过的那类问题（v047/v048/v050）。现在只留一份，本函数是别名。
     """
-    try:
-        from .fofa import _parse_flat_yaml
-        return _parse_flat_yaml(path.read_text(encoding="utf-8", errors="ignore")) or {}
-    except Exception:                                    # noqa: BLE001
-        return {}
+    return console_api_flat_yaml(path)
 
 
 def console_password() -> str:
@@ -521,3 +519,585 @@ def _collect_hosts(records: list[dict]) -> list[str]:
         walk(r.get("after"))
         walk(r.get("extra"))
     return sorted(out, key=len, reverse=True)
+
+
+# ============================================================ 工具与分级（P2）
+# 写入面是**两个文件**，键口径还不一样：
+#   · `data/risk_grades.json`  —— 键是**工具名**（中文名），存 level + reason
+#   · `data/tool_overrides.json` —— 键是 **alias**，存 disabled/timeout/caps/旗标/caveat
+# 所以预览要同时报两个文件的哈希，提交要同时带两个（否则可能只把一半改动落盘）。
+GRADES_FILE_NAME = "risk_grades.json"
+OVERRIDES_FILE_NAME = "tool_overrides.json"
+
+# 控制台允许改的覆写字段（白名单）。**不能让它写任意键** ——
+# tool_overrides 里还有 network_control / stdin_input 这类字段，
+# 手改它们会绕过速率声明与交互式处理，属于「闸门参数」，不该从工具页随手改。
+OVERRIDE_EDITABLE = ("disabled", "reason", "timeout", "caveat", "caps",
+                     "target_type", "allowed_flags", "value_flags",
+                     "disallowed_flags", "ignore_exit_code", "interactive",
+                     "interactive_reason")
+
+
+def _grades_path():
+    return config.DATA_DIR / GRADES_FILE_NAME
+
+
+def _overrides_path():
+    return config.DATA_DIR / OVERRIDES_FILE_NAME
+
+
+@router.get("/tools")
+async def tools_get(request: Request):
+    """全部工具（含不可编排的），带分级、覆写、是否进模型清单、文件是否存在。"""
+    require_auth(request)
+    from .registry import registry
+
+    in_model = {t.alias for t in registry.usable_scriptable()}
+    ov_raw = config_io.read_json(_overrides_path(), default={}) or {}
+    gr_raw = config_io.read_json(_grades_path(), default={}) or {}
+    items = []
+    for t in registry.tools:
+        ov = ov_raw.get(t.alias) or {}
+        g = gr_raw.get(t.name) or {}
+        items.append({
+            "alias": t.alias, "name": t.name, "category": t.category,
+            "type": t.type, "scriptable": t.scriptable,
+            "level": t.risk_level, "level_reason": t.risk_reason,
+            "level_in_grades": bool(g),
+            "has_override": bool(ov),
+            "disabled": t.disabled, "disabled_reason": t.disabled_reason,
+            "interactive": t.interactive, "interactive_reason": t.interactive_reason,
+            "caps": list(t.caps),
+            "timeout": t.tool_timeout or 0,
+            "target_type": t.target_type,
+            "allowed_flags": list(t.allowed_flags),
+            "disallowed_flags": list(t.disallowed_flags),
+            "value_flags": list(t.value_flags),
+            "ignore_exit_code": t.ignore_exit_code,
+            "caveat_chars": len(t.caveat or ""),
+            "executable": bool(t.executable),
+            "in_model_list": t.alias in in_model,
+            # 只显示长度不显示内容：caveat 可能很长，整表回传会让页面噎住；
+            # 需要看全文时由 /tools/detail 单独取。
+        })
+    return {"ok": True, "items": items,
+            "files": {"grades": config_io.file_state(_grades_path()),
+                      "overrides": config_io.file_state(_overrides_path())},
+            "editable_fields": list(OVERRIDE_EDITABLE),
+            "levels": [{"level": k, "name": v["name"], "policy": v["policy"]}
+                       for k, v in config.RISK_LEVELS.items()],
+            "note": ("分级写 risk_grades.json（按工具名）；"
+                     "禁用/超时/caps/旗标写 tool_overrides.json（按 alias）。"
+                     "两者是不同文件，控制台会一起做乐观锁与回滚。")}
+
+
+class ToolEditRequest(BaseModel):
+    alias: str = ""
+    overrides: dict | None = None      # None = 不改这个文件
+    grade: dict | None = None          # None = 不改这个文件
+    confirm_token: str = ""
+    expect_sha256: dict = {}
+
+
+def _tool_edit_diff(alias: str, overrides: dict | None, grade: dict | None) -> dict:
+    """算出「改前 → 改后」的差异，并做字段级校验。返回 {diff, problems, payload, to_write}。"""
+    from .registry import registry
+
+    problems: list[str] = []
+    diff: list[dict] = []
+    t = registry.get_by_alias(alias) if alias else None
+
+    ov_raw = config_io.read_json(_overrides_path(), default={}) or {}
+    gr_raw = config_io.read_json(_grades_path(), default={}) or {}
+    new_ov = dict(ov_raw)
+    new_gr = dict(gr_raw)
+    to_write: list[tuple] = []
+
+    if overrides is not None:
+        if not t:
+            problems.append(f"未知工具 alias：{alias}")
+        bad = [k for k in overrides if k not in OVERRIDE_EDITABLE]
+        if bad:
+            problems.append(
+                f"不允许从工具页修改这些字段：{bad}（它们属于闸门参数，"
+                "改它们会绕过速率声明或交互式处理）")
+        if not problems:
+            cur = dict(ov_raw.get(alias) or {})
+            for k, v in overrides.items():
+                old = t and getattr(t, {
+                    "timeout": "tool_timeout"}.get(k, k), None)
+                if (cur.get(k) if k in cur else old) != v:
+                    diff.append({"file": OVERRIDES_FILE_NAME, "key": f"{alias}.{k}",
+                                 "before": cur.get(k, old), "after": v})
+                cur[k] = v
+            if not cur.get("reason") and (cur.get("disabled") or overrides.get("disabled")):
+                problems.append("禁用工具必须填 reason（写清「为什么不可用」，否则后来人只能猜）")
+            if not problems:
+                new_ov[alias] = cur
+                to_write.append((_overrides_path(), new_ov))
+
+    if grade is not None:
+        if not t:
+            problems.append("未知工具，无法改分级")
+        lvl = grade.get("level")
+        if lvl not in config.RISK_LEVELS:
+            problems.append(f"非法风险等级：{lvl!r}（允许 {list(config.RISK_LEVELS)}）")
+        if not str(grade.get("reason") or "").strip():
+            problems.append("改分级必须填 reason（分级依据要留痕）")
+        if t and not t.scriptable:
+            problems.append(
+                f"「{t.name}」不可编排（图形界面/网页工具），分级只对可编排工具生效 —— "
+                "改它不会有任何效果")
+        if not problems:
+            cur_g = dict(gr_raw.get(t.name) or {})
+            for k in ("level", "reason"):
+                if cur_g.get(k) != grade.get(k):
+                    diff.append({"file": GRADES_FILE_NAME, "key": f"{t.name}.{k}",
+                                 "before": cur_g.get(k), "after": grade.get(k)})
+            cur_g.update({"level": lvl, "reason": grade.get("reason", "")})
+            cur_g.setdefault("type", t.type)
+            cur_g.setdefault("category", t.category)
+            cur_g.setdefault("path", str(t.rel_path or ""))
+            new_gr[t.name] = cur_g
+            to_write.append((_grades_path(), new_gr))
+
+    if not to_write and not problems:
+        problems.append("没有任何改动")
+    return {"diff": diff, "problems": problems, "to_write": to_write,
+            "files": [p.name for p, _ in to_write], "tool": t.name if t else ""}
+
+
+@router.post("/tools/detail")
+async def tools_detail(req: ToolEditRequest, request: Request):
+    """取单个工具的完整 caveat 等长字段（列表页不回传全文，避免页面噎住）。"""
+    require_auth(request)
+    from .registry import registry
+    t = registry.get_by_alias(req.alias)
+    if not t:
+        raise HTTPException(404, "未知工具 alias")
+    return {"ok": True, "alias": t.alias, "name": t.name,
+            "caveat": t.caveat or "", "description": t.description or "",
+            "risk_reason": t.risk_reason or "",
+            "network_control": t.network_control or {}}
+
+
+@router.post("/tools/preview")
+async def tools_preview(req: ToolEditRequest, request: Request):
+    require_auth(request)
+    r = _tool_edit_diff(req.alias, req.overrides, req.grade)
+    if r["problems"]:
+        raise HTTPException(400, "校验未通过：" + "；".join(r["problems"]))
+    hashes = {"grades": config_io.sha256_short(_grades_path()),
+              "overrides": config_io.sha256_short(_overrides_path())}
+    tok = _issue_confirm("tools", "write",
+                         {"alias": req.alias, "overrides": req.overrides,
+                          "grade": req.grade}, hashes["overrides"] + hashes["grades"])
+    level = "high" if any(d["key"].endswith((".level", ".disabled")) for d in r["diff"]) \
+        else "mid"
+    return {"ok": True, "diff": r["diff"], "files": r["files"], "tool": r["tool"],
+            "level": level, "requires_confirm": True, "confirm_token": tok,
+            "expect_sha256": hashes, "confirm_ttl": config.CONSOLE_CONFIRM_TTL}
+
+
+@router.post("/tools/commit")
+async def tools_commit(req: ToolEditRequest, request: Request):
+    require_auth(request)
+    rec = _consume_confirm(req.confirm_token, "tools")
+    # 乐观锁：两个文件都要核对（任一被手工改过就停）
+    for name, path in (("overrides", _overrides_path()), ("grades", _grades_path())):
+        want = (req.expect_sha256 or {}).get(name, "")
+        cur = config_io.sha256_short(path)
+        if want and cur and cur != want:
+            raise HTTPException(409, (
+                f"{path.name} 在你预览之后被改动过（可能手工编辑），已拒绝写入以免覆盖。"
+                f"盘上当前 {cur} ≠ 你确认时的 {want}。请刷新页面重新预览。"))
+
+    r = _tool_edit_diff(rec["payload"]["alias"], rec["payload"]["overrides"],
+                        rec["payload"]["grade"])
+    if r["problems"]:
+        raise HTTPException(400, "校验未通过（预览后可能已有变化）：" + "；".join(r["problems"]))
+    res = config_io.write_many_atomic(r["to_write"])
+    if not res["ok"]:
+        raise HTTPException(500, (
+            f"写入失败（{res['failed']}）：{res['error']}。"
+            f"已回滚：{res['rolled_back'] or '（无需回滚）'}"))
+    config_io.audit("tools", "write",
+                    before={"alias": rec["payload"]["alias"]},
+                    after={"diff": r["diff"], "files": res["written"]},
+                    level="high", note=f"工具 {r['tool']} 改动 {len(r['diff'])} 项")
+    reload_info = config_io.reload_for("tools")
+    return {"ok": True, "diff": r["diff"], "written": res["written"],
+            "reload": reload_info,
+            "files": {"grades": config_io.file_state(_grades_path()),
+                      "overrides": config_io.file_state(_overrides_path())}}
+
+
+# ============================================================ 运行参数（P2）
+@router.get("/params")
+async def params_get(request: Request):
+    """分组列出可调参数：当前值 / 默认值 / 来源 / 取值域 / 说明。
+
+    刻意返回 `excluded`：被**有意排除**的参数连理由一起给出。
+    否则「参数表里怎么没有 HOST」会被当成漏了，下一个人会想补上它。
+    """
+    require_auth(request)
+    from . import param_spec as ps
+    ov = config_io.read_json(config_io.OVERRIDES_FILE, default={}) or {}
+    groups = []
+    for g in ps.groups():
+        items = []
+        for s in g["items"]:
+            k = s["key"]
+            items.append({**s,
+                          "value": getattr(config, k, None),
+                          "default": ps.default_value(k),
+                          "env": ps.env_name(k),
+                          "source": ps.source_of(k, ov)})
+        groups.append({"group": g["group"], "items": items})
+    return {"ok": True, "groups": groups,
+            "excluded": ps.EXCLUDED,
+            "overrides": (ov.get("params") or {}),
+            "warnings": config.param_warnings(),
+            "file": config_io.file_state(config_io.OVERRIDES_FILE),
+            "hot": True,
+            "note": ("改动**立即生效，不用重启**（全项目 0 处 `from .config import X`、"
+                     "220 处 `config.X` 属性访问）。写入 data/runtime_overrides.json，"
+                     "删掉某个键即回到环境变量/默认值。")}
+
+
+class ParamsRequest(BaseModel):
+    values: dict = {}
+    confirm_token: str = ""
+    expect_sha256: str = ""
+    reset: list[str] = []
+
+
+@router.post("/params/preview")
+async def params_preview(req: ParamsRequest, request: Request):
+    require_auth(request)
+    from . import param_spec as ps
+    values = {k: v for k, v in (req.values or {}).items()}
+    problems = ps.validate(values) if values else []
+    if not values and not req.reset:
+        problems = ["没有任何改动"]
+    if problems:
+        raise HTTPException(400, "校验未通过：" + "；".join(problems))
+    ov = config_io.read_json(config_io.OVERRIDES_FILE, default={}) or {}
+    cur = ov.get("params") or {}
+    diff = []
+    for k, v in values.items():
+        if getattr(config, k, None) != v:
+            diff.append({"key": k, "before": getattr(config, k, None), "after": v,
+                         "default": ps.default_value(k)})
+    for k in (req.reset or []):
+        if k in cur:
+            diff.append({"key": k, "before": getattr(config, k, None),
+                         "after": ps.default_value(k), "default": ps.default_value(k)})
+    if not diff:
+        raise HTTPException(400, "没有任何实际变化")
+    sha = config_io.sha256_short(config_io.OVERRIDES_FILE)
+    tok = _issue_confirm("params", "write",
+                         {"values": values, "reset": req.reset or []}, sha)
+    # 关闸门类改动按高危（它们直接改变防护强度）
+    danger = any(ps.spec_of(d["key"]) and ps.spec_of(d["key"]).get("danger")
+                 for d in diff)
+    return {"ok": True, "diff": diff, "level": "high" if danger else "mid",
+            "requires_confirm": True, "confirm_token": tok,
+            "expect_sha256": sha, "confirm_ttl": config.CONSOLE_CONFIRM_TTL,
+            "warnings": config.param_warnings()}
+
+
+@router.post("/params/commit")
+async def params_commit(req: ParamsRequest, request: Request):
+    require_auth(request)
+    from . import param_spec as ps
+    rec = _consume_confirm(req.confirm_token, "params")
+    cur_sha = config_io.sha256_short(config_io.OVERRIDES_FILE)
+    if req.expect_sha256 and cur_sha and cur_sha != req.expect_sha256:
+        raise HTTPException(409, (
+            "runtime_overrides.json 在你预览之后被改动过，已拒绝写入以免覆盖。"
+            "请刷新页面重新预览。"))
+    values = dict(rec["payload"]["values"])
+    # reset 项从覆盖文件里删掉（回到 env/默认），不是写成默认值
+    ov = config_io.read_json(config_io.OVERRIDES_FILE, default={}) or {}
+    merged = dict(ov.get("params") or {})
+    for k in rec["payload"]["reset"]:
+        merged.pop(k, None)
+    merged.update(values)
+    res = config_io.save_overrides(merged)
+    if not res["ok"]:
+        raise HTTPException(500, f"写入失败：{res['error']}")
+    applied = config_io.apply_overrides(config)
+    config_io.audit("params", "write", before={"params": ov.get("params")},
+                    after={"params": merged, "applied": applied},
+                    level="high", note=f"改动 {len(values)} 项 / 复位 {len(rec['payload']['reset'])} 项")
+    return {"ok": True, "applied": applied,
+            "values": {s["key"]: getattr(config, s["key"], None)
+                       for s in ps.SPECS},
+            "warnings": config.param_warnings(),
+            "file": config_io.file_state(config_io.OVERRIDES_FILE)}
+
+
+@router.post("/params/reset")
+async def params_reset(request: Request):
+    """清空全部运行时覆盖（回到环境变量/默认值）。高危，需确认票据。
+
+    单独开一个入口是因为它**不是「把值改成默认」而是「删掉覆盖」** ——
+    对「被环境变量设过」的参数，这两者结果不同：删掉覆盖会回到环境变量的值，
+    写成默认值则会**覆盖掉环境变量**。所以必须分开做，不能靠前端「填默认值」模拟。
+    """
+    require_auth(request)
+    ov = config_io.read_json(config_io.OVERRIDES_FILE, default={}) or {}
+    if not (ov.get("params") or {}):
+        return {"ok": True, "applied": [], "note": "本来就没有运行时覆盖。"}
+    res = config_io.write_json_atomic(config_io.OVERRIDES_FILE,
+                                     {"_说明": "（已清空）", "params": {}})
+    if not res["ok"]:
+        raise HTTPException(500, f"写入失败：{res['error']}")
+    config_io.audit("params", "reset_all", before={"params": ov.get("params")},
+                    after={"params": {}}, level="high", note="清空全部运行时覆盖")
+    return {"ok": True, "backup": res["backup"],
+            "note": "已清空。**这些值需要重启服务才会真正回到环境变量/默认值**"
+                    "（本进程内的 config 属性仍是被覆盖后的值）。"}
+
+
+# ============================================================ 合规红线与模板（P2）
+def _rules_path():
+    return config.DATA_DIR / "rules" / "compliance-redlines.md"
+
+
+@router.get("/rules")
+async def rules_get(request: Request):
+    require_auth(request)
+    text = config_io.read_text(_rules_path())
+    sections = []
+    cur = {"title": "（开头，不属于任何章节）", "start": 0}
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.startswith("## "):
+            sections.append({**cur, "end": i})
+            cur = {"title": ln[3:].strip(), "start": i}
+    sections.append({**cur, "end": len(lines)})
+    for s in sections:
+        s["chars"] = len("\n".join(lines[s["start"]:s["end"]]))
+    return {"ok": True, "text": text, "sections": sections,
+            "file": config_io.file_state(_rules_path()),
+            "note": "红线注入系统提示，**下一轮生效**（系统提示每轮重建）。"}
+
+
+class RulesRequest(BaseModel):
+    text: str = ""
+    confirm_token: str = ""
+    expect_sha256: str = ""
+
+
+@router.post("/rules/preview")
+async def rules_preview(req: RulesRequest, request: Request):
+    require_auth(request)
+    old = config_io.read_text(_rules_path())
+    new = req.text or ""
+    if new == old:
+        raise HTTPException(400, "内容没有变化")
+    if not new.strip():
+        raise HTTPException(400, "不允许把合规红线清空 —— 它会注入系统提示，清空等于移除纪律约束")
+    sha = config_io.sha256_short(_rules_path())
+    tok = _issue_confirm("rules", "write", {"text": new}, sha)
+    import difflib
+    d = list(difflib.unified_diff(old.splitlines(), new.splitlines(),
+                                  lineterm="", n=0))
+    return {"ok": True, "level": "mid", "requires_confirm": True,
+            "confirm_token": tok, "expect_sha256": sha,
+            "stats": {"before_chars": len(old), "after_chars": len(new),
+                      "before_lines": len(old.splitlines()),
+                      "after_lines": len(new.splitlines())},
+            "hunks": len([x for x in d if x.startswith("@@")]),
+            "preview": "\n".join(d[:120]),
+            "confirm_ttl": config.CONSOLE_CONFIRM_TTL}
+
+
+@router.post("/rules/commit")
+async def rules_commit(req: RulesRequest, request: Request):
+    require_auth(request)
+    rec = _consume_confirm(req.confirm_token, "rules")
+    cur = config_io.sha256_short(_rules_path())
+    if req.expect_sha256 and cur and cur != req.expect_sha256:
+        raise HTTPException(409, "红线文件在你预览之后被改动过，已拒绝写入。请重新预览。")
+    old = config_io.read_text(_rules_path())
+    res = config_io.write_text_atomic(_rules_path(), rec["payload"]["text"])
+    if not res["ok"]:
+        raise HTTPException(500, f"写入失败：{res['error']}")
+    config_io.audit("rules", "write",
+                    before={"chars": len(old)}, after={"chars": len(rec["payload"]["text"])},
+                    level="mid", note="编辑合规红线")
+    return {"ok": True, "backup": res["backup"],
+            "reload": config_io.reload_for("rules"),
+            "file": config_io.file_state(_rules_path())}
+
+
+def _templates_path():
+    return config.DATA_DIR / "invocation_templates.json"
+
+
+@router.get("/templates")
+async def templates_get(request: Request):
+    require_auth(request)
+    raw = config_io.read_json(_templates_path(), default={}) or {}
+    items = [{"alias": k, **(v if isinstance(v, dict) else {})}
+             for k, v in raw.items() if not k.startswith("_")]
+    return {"ok": True, "items": items,
+            "target_form": raw.get("_target_form", ""),
+            "note": raw.get("_说明", ""),
+            "file": config_io.file_state(_templates_path()),
+            "targets": ["url", "host", "domain", "raw", "asis"]}
+
+
+class TemplatesRequest(BaseModel):
+    items: list[dict] = []
+    confirm_token: str = ""
+    expect_sha256: str = ""
+
+
+@router.post("/templates/preview")
+async def templates_preview(req: TemplatesRequest, request: Request):
+    require_auth(request)
+    raw = dict(config_io.read_json(_templates_path(), default={}) or {})
+    old_items = {k: v for k, v in raw.items() if not k.startswith("_")}
+    problems: list[str] = []
+    new_items: dict = {}
+    for it in req.items:
+        a = str(it.get("alias") or "").strip()
+        if not a:
+            problems.append("存在没有 alias 的条目")
+            continue
+        cmd = str(it.get("cmd") or "").strip()
+        if "{exe}" not in cmd:
+            problems.append(f"{a}：cmd 必须含 {{exe}}（否则根本不知道执行什么）")
+        tgt = str(it.get("target") or "raw").strip()
+        if tgt not in ("url", "host", "domain", "raw", "asis"):
+            problems.append(f"{a}：target={tgt!r} 不是合法取值")
+        new_items[a] = {"cmd": cmd, "target": tgt}
+    if problems:
+        raise HTTPException(400, "校验未通过：" + "；".join(problems))
+    added = sorted(set(new_items) - set(old_items))
+    removed = sorted(set(old_items) - set(new_items))
+    changed = sorted(k for k in set(new_items) & set(old_items)
+                     if new_items[k] != old_items[k])
+    if not (added or removed or changed):
+        raise HTTPException(400, "没有任何改动")
+    new_raw = {k: v for k, v in raw.items() if k.startswith("_")}
+    new_raw.update(new_items)
+    sha = config_io.sha256_short(_templates_path())
+    tok = _issue_confirm("invocation_templates", "write", {"raw": new_raw}, sha)
+    return {"ok": True, "level": "mid", "requires_confirm": True,
+            "confirm_token": tok, "expect_sha256": sha,
+            "added": added, "removed": removed, "changed": changed,
+            "confirm_ttl": config.CONSOLE_CONFIRM_TTL}
+
+
+@router.post("/templates/commit")
+async def templates_commit(req: TemplatesRequest, request: Request):
+    require_auth(request)
+    rec = _consume_confirm(req.confirm_token, "invocation_templates")
+    cur = config_io.sha256_short(_templates_path())
+    if req.expect_sha256 and cur and cur != req.expect_sha256:
+        raise HTTPException(409, "调用模板文件在你预览之后被改动过，已拒绝写入。")
+    res = config_io.write_json_atomic(_templates_path(), rec["payload"]["raw"])
+    if not res["ok"]:
+        raise HTTPException(500, f"写入失败：{res['error']}")
+    config_io.audit("invocation_templates", "write",
+                    before={"count": len(req.items)}, after={"count": len(req.items)},
+                    level="mid", note="编辑调用模板")
+    return {"ok": True, "backup": res["backup"],
+            "reload": config_io.reload_for("invocation_templates"),
+            "file": config_io.file_state(_templates_path())}
+
+
+def _config_yaml_path():
+    return config.APP_DIR / "config.yaml"
+
+# 控制台允许改的密钥键（白名单）。**其余键一律原样保留** ——
+# config.yaml 是被 app/fofa.py 用自写的扁平解析器读的，乱动键名/结构会让它读不到，
+# 而表现是「填了却没生效」。所以只允许改这几个已知键的值，格式与其它行都不动。
+SECRET_KEYS = ("fofaEmail", "fofaKey", "ceyeApi", "ceyeDomain", "consolePassword")
+
+
+@router.get("/secrets")
+async def secrets_get(request: Request):
+    require_auth(request)
+    data = console_api_flat_yaml(_config_yaml_path())
+    out = []
+    for k in SECRET_KEYS:
+        v = str(data.get(k) or "")
+        out.append({"key": k, "has_value": bool(v),
+                    "masked": (config_io.mask_host(v, 2, 4) if v else ""),
+                    "is_secret": k in ("fofaKey", "ceyeApi", "consolePassword")})
+    return {"ok": True, "items": out,
+            "file": config_io.file_state(_config_yaml_path()),
+            "note": ("读取时只回显是否已填与打码值，**不下发明文**。"
+                     "写入只替换这些键的值，其它行与注释原样保留 —— "
+                     "config.yaml 由 app/fofa.py 用自写的扁平解析器读，"
+                     "改了键名或结构会导致「填了却没生效」。")}
+
+
+class SecretsRequest(BaseModel):
+    values: dict = {}
+    confirm_token: str = ""
+    expect_sha256: str = ""
+
+
+@router.post("/secrets/commit")
+async def secrets_commit(req: SecretsRequest, request: Request):
+    """写 config.yaml。低危（不改结构），但**不需要票据**是刻意的：
+    它不改变防护强度，且改错了只影响 FOFA 能不能用，一眼能看出来。"""
+    require_auth(request)
+    bad = [k for k in (req.values or {}) if k not in SECRET_KEYS]
+    if bad:
+        raise HTTPException(400, f"不允许写这些键：{bad}（只允许 {list(SECRET_KEYS)}）")
+    path = _config_yaml_path()
+    old_text = config_io.read_text(path)
+    lines = old_text.splitlines()
+    done: set[str] = set()
+    out_lines = []
+    for ln in lines:
+        s = ln.strip()
+        if ":" in s and not s.startswith("#"):
+            k = s.split(":", 1)[0].strip()
+            if k in (req.values or {}):
+                out_lines.append(f"{k}: {_yaml_scalar(req.values[k])}")
+                done.add(k)
+                continue
+        out_lines.append(ln)
+    for k, v in (req.values or {}).items():
+        if k not in done:
+            out_lines.append(f"{k}: {_yaml_scalar(v)}")
+    res = config_io.write_text_atomic(path, "\n".join(out_lines).rstrip("\n") + "\n")
+    if not res["ok"]:
+        raise HTTPException(500, f"写入失败：{res['error']}")
+    config_io.audit("secrets", "write",
+                    before={"keys": sorted(req.values.keys())},
+                    after={"kept": sorted(done)},
+                    level="mid",
+                    note="更新 config.yaml 密钥（值不写入审计）")
+    return {"ok": True, "backup": res["backup"],
+            "reload": config_io.reload_for("secrets"),
+            "file": config_io.file_state(path)}
+
+
+def _yaml_scalar(v) -> str:
+    """写回扁平 yaml 的值。字符串一律加引号并转义，避免含 `:` 或 `#` 时把行拆坏。"""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def console_api_flat_yaml(path) -> dict:
+    """读扁平 `key: value`（复用 fofa.py 那份解析器，不另写一份）。"""
+    try:
+        from .fofa import _parse_flat_yaml
+        if not path.exists():
+            return {}
+        return _parse_flat_yaml(path.read_text(encoding="utf-8", errors="ignore")) or {}
+    except Exception:                                        # noqa: BLE001
+        return {}

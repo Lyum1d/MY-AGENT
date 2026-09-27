@@ -45,6 +45,17 @@ async def _cleanup_stale_persist_dirs() -> None:
     except Exception:
         logger.warning("清理过期落盘目录失败", exc_info=True)
 
+    # v051：应用运行参数覆盖（控制台「运行参数」页写入的 runtime_overrides.json）。
+    # 必须在启动时做 —— 否则控制台写的覆盖**重启后就失效**，
+    # 而界面文案说的是「重启后仍生效」（文件里也确实写着）。实测抓出来的 gap。
+    try:
+        from . import config_io
+        _applied = config_io.apply_overrides(config)
+        if _applied:
+            logger.info("已应用运行参数覆盖 %d 项：%s", len(_applied), ", ".join(_applied))
+    except Exception:
+        logger.warning("应用运行参数覆盖失败", exc_info=True)
+
     # v047：超时/分档口径自检。
     # 「口径不一致」这类配置问题**不会自己暴露** —— 它表现为「某个工具莫名被砍」
     # 或「明明配了两个上限却只有一个生效」，而配置文件上看起来一切正常。

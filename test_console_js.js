@@ -144,6 +144,56 @@ const read = (p) => fs.readFileSync(path.join(WEB, p), 'utf8');
       return p.type === 'module' && !p.dependencies && !p.devDependencies;
     })());
 
+  /* ============ C. P2 三个页面的结构与语法 ============ */
+  console.log('\n== C. P2 页面（工具分级 / 运行参数 / 合规与模板） ==');
+  const tools = read('views/tools.js');
+  const params = read('views/params.js');
+  const rules = read('views/rules.js');
+
+  check('工具页不再用占位实现', !tools.includes('_placeholder.js'));
+  check('参数页不再用占位实现', !params.includes('_placeholder.js'));
+  check('合规页不再用占位实现', !rules.includes('_placeholder.js'));
+  check('工具页同时提示两个写入文件（不是只写一个）',
+    tools.includes('risk_grades.json') && tools.includes('tool_overrides.json'));
+  check('工具页提交带一次性票据 + 双文件哈希',
+    /confirm_token/.test(tools) && /expect_sha256/.test(tools));
+  check('工具页说明「改完必须重载 registry」',
+    /重载 registry/.test(tools));
+  check('不可编排的工具不显示等级（等级对它们无意义）',
+    /!t\.scriptable/.test(tools) && /不参与分级/.test(tools));
+  check('参数页要求不变量校验（走服务端，不自己写一套）',
+    /不变量/.test(params) && /param_warnings|校验/.test(params));
+  check('参数页说明「复位是删掉覆盖项而不是填默认值」',
+    /删掉覆盖项/.test(params) && /而不是/.test(params));
+  check('参数页把「有意排除的参数」连理由一起展示',
+    /有意排除的参数/.test(params) && /excluded/.test(params));
+  check('合规页分三个子页', /rules/.test(rules) && /templates/.test(rules)
+    && /secrets/.test(rules));
+  check('密钥页说明「只回显打码值、不下发明文」', /不下发明文/.test(rules));
+  check('密钥页说明 config.yaml 的扁平格式约束（否则填了没生效）',
+    /扁平/.test(rules));
+
+  // 语法体检：ESM 里语法错会报 SyntaxError，而浏览器绝对路径导入只会报
+  // ERR_MODULE_NOT_FOUND —— 两者可区分，所以能借 Node 单独验语法。
+  // 注：曾用 `new vm.Script(...)` 做「解析不执行」，但它在 script 模式下**不允许
+  // import 语句**（报 "Cannot use import statement outside a module"），假红。
+  // 改用动态 import + 区分错误类型：语法错报 SyntaxError；
+  // 而视图里的 `/console-assets/...` 是浏览器绝对路径，Node 解析不到，只会报
+  // ERR_MODULE_NOT_FOUND —— 后者说明**语法已经过了**。
+  let syntaxOk = true;
+  for (const f of ['tools', 'params', 'rules', 'overview', 'scope', 'audit']) {
+    try {
+      await import(pathToFileURL(path.join(WEB, 'views', f + '.js')).href);
+    } catch (e) {
+      if (e && e.code === 'ERR_MODULE_NOT_FOUND') continue;
+      syntaxOk = false;
+      console.log(`     ✗ ${f}.js: ${e.constructor.name}: `
+                + String(e.message).split('\n')[0]);
+    }
+  }
+  check('全部视图模块语法可通过 Node 解析（动态 import 区分语法错与解析不到导入）',
+    syntaxOk);
+
   console.log('\n' + '='.repeat(60));
   console.log(`结果：${ok.length} 通过 / ${fail.length} 失败`);
   if (fail.length) console.log('失败项：' + fail.join('、'));

@@ -279,6 +279,53 @@ def mask_host(host: str, head: int = 3, tail: int = 3) -> str:
 
 
 # ---------------------------------------------------------------- 重载
+def write_many_atomic(items: list[tuple[Path, Any]]) -> dict:
+    """按顺序原子写多个 JSON；**任一失败则把已写的回滚回去**。
+
+    为什么需要它（v051 工具分级页）：改一个工具的「分级」写 `risk_grades.json`，
+    改「禁用/超时/caps」写 `tool_overrides.json` —— 一次编辑可能同时动两个文件。
+    分两次 `write_json_atomic` 的话，第二次失败会留下**半个改动**：
+    分级改了、禁用没改，而操作者只看到一条报错，不知道到底生效了哪一半。
+
+    回滚靠的是 `write_json_atomic` 本来就会做的写前备份 —— 不另存副本。
+    返回 `{ok, written:[...], rolled_back:[...], error}`。
+    """
+    written: list[tuple[Path, str]] = []      # (path, 备份文件名)
+    for path, data in items:
+        res = write_json_atomic(path, data)
+        if not res["ok"]:
+            # 回滚已写的部分（用它们各自的写前备份）
+            rolled: list[str] = []
+            for p, bk in reversed(written):
+                if not bk:
+                    # 原本不存在 → 无法从备份恢复。删掉新建的文件，回到「不存在」。
+                    try:
+                        p.unlink(missing_ok=True)
+                        rolled.append(p.name)
+                    except OSError:
+                        logger.warning("回滚删除 %s 失败", p)
+                    continue
+                try:
+                    shutil.copy2(BACKUP_DIR / bk, p)
+                    rolled.append(p.name)
+                except Exception:                        # noqa: BLE001
+                    logger.warning("回滚 %s 失败", p, exc_info=True)
+            return {"ok": False, "written": [p.name for p, _ in written],
+                    "rolled_back": rolled, "error": res["error"],
+                    "failed": path.name}
+        written.append((path, res["backup"]))
+    return {"ok": True, "written": [p.name for p, _ in written],
+            "rolled_back": [], "error": ""}
+
+
+def read_text(path: Path) -> str:
+    """读文本（不存在返回空串，不抛）。"""
+    try:
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        return ""
+
+
 def reload_for(face: str) -> dict:
     """写入后按面触发重载，返回「做了什么」供前端回显。
 
@@ -314,8 +361,21 @@ def reload_for(face: str) -> dict:
 
 
 # ---------------------------------------------------------------- 运行参数覆盖
+# 首次被覆盖前各参数的**原值**快照。
+# 为什么必须有它：`setattr` 改掉 config 属性之后，**原值就找不回来了**
+# —— 环境变量与字面量默认值的差别在这一层已经看不出来（config 模块只留最终值）。
+# 没有它的话「复位」只能把文件里的键删掉，而运行中的属性仍是覆盖后的值：
+# 文件看着已复位、服务里其实没复位。这是 v051 端到端测试抓出来的。
+_ORIGINALS: dict[str, Any] = {}
+
+
 def apply_overrides(cfg=None) -> list[str]:
-    """把 `runtime_overrides.json` 里的值 setattr 到 config 模块上，返回生效的键。
+    """把 `runtime_overrides.json` 里的值 setattr 到 config 模块上，返回本次**变化**的键。
+
+    两步，顺序不能反：
+      ① **先还原**「曾经被覆盖、但现在不在覆盖文件里」的键（回到快照原值）——
+         这是「复位 / 删除某个键」能真正生效的唯一方式；
+      ② 再应用当前覆盖文件里的值（首次接触时记下原值快照）。
 
     可行性依据：全项目 **0 处** `from .config import X`，**220 处** `config.X`
     属性访问（调用时读取），所以运行时 `setattr` 立即对所有调用点生效 —— 不用重启。
@@ -324,13 +384,20 @@ def apply_overrides(cfg=None) -> list[str]:
     安全性：只接受 config 模块里**已存在且当前是 int/float/bool/str** 的名字，
     绝不凭覆盖文件创建新属性 —— 否则一个手改的覆盖文件能往 config 里塞任意东西。
     """
-    import types
     cfg = cfg or config
     data = read_json(OVERRIDES_FILE, default={}) or {}
-    if not isinstance(data, dict):
-        return []
+    params = (data.get("params") or {}) if isinstance(data, dict) else {}
     changed: list[str] = []
-    for k, v in (data.get("params") or {}).items():
+
+    # ---- ① 还原已撤销的覆盖 ----
+    for k in [k for k in _ORIGINALS if k not in params]:
+        original = _ORIGINALS.pop(k)
+        if getattr(cfg, k, None) != original:
+            setattr(cfg, k, original)
+            changed.append(k)
+
+    # ---- ② 应用当前覆盖 ----
+    for k, v in params.items():
         if not isinstance(k, str) or not k.isupper():
             continue
         cur = getattr(cfg, k, None)
@@ -349,12 +416,15 @@ def apply_overrides(cfg=None) -> list[str]:
         else:
             # 模块里没有这个名字，或类型不支持 → 跳过（不创建新属性）
             continue
+        if k not in _ORIGINALS:
+            _ORIGINALS[k] = cur                     # 首次接触：记下原值
         if getattr(cfg, k) != v:
             setattr(cfg, k, v)
             changed.append(k)
-    # 自检：覆盖之后不变量必须仍然成立，否则回滚这几项并记录
+
+    # 自检：覆盖之后不变量必须仍然成立，否则留一条明确的日志
     try:
-        warns = cfg.timeout_warnings()
+        warns = cfg.param_warnings()
     except Exception:                                    # noqa: BLE001
         warns = []
     if warns:
@@ -363,15 +433,20 @@ def apply_overrides(cfg=None) -> list[str]:
 
 
 def save_overrides(params: dict) -> dict:
-    """写 `runtime_overrides.json`（并立即 apply）。"""
-    cur = read_json(OVERRIDES_FILE, default={}) or {}
-    if not isinstance(cur, dict):
-        cur = {}
-    merged = dict(cur.get("params") or {})
-    merged.update(params or {})
+    """写 `runtime_overrides.json`（并立即 apply）。**按传入内容整份覆盖，不再二次合并。**
+
+    ⚠️ v051 修（端到端测试抓出）：原实现在这里又 `merged.update(params)` 合并了一次，
+    于是「复位」失效 —— 调用方（`params_commit`）已经算好了「删掉某个键之后」的完整字典，
+    交给本函数时又被磁盘上的旧内容**合并回来**，被删的键**原地复活**：
+    文件看着改过了、运行值也没变，而界面上「复位成功」的提示照常出现。
+
+    这是个很容易犯的错：**合并语义的函数无法表达「删除」**。
+    所以这里改成「写什么就是什么」，把合并的责任明确交给调用方
+    （它才知道这次操作是「新增/改值」还是「删除」）。
+    """
     data = {"_说明": ("控制台（/console → 运行参数）写入的本机覆盖值。"
                      "优先级高于环境变量默认值，重启后仍生效。"
                      "删掉某个键即回到 env/默认值。本文件不入库。"),
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "params": merged}
+            "params": dict(params or {})}
     return write_json_atomic(OVERRIDES_FILE, data)

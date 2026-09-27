@@ -465,3 +465,36 @@ def timeout_warnings() -> list[str]:
         if globals()[key] not in RISK_LEVELS:
             out.append(f"口径异常：{key}={globals()[key]!r} 不是合法风险等级，分档将退化为不降级。")
     return out
+
+
+def param_warnings() -> list[str]:
+    """参数自检的**唯一入口**：`timeout_warnings()` 的全部检查 + 它没覆盖的跨参数不变量。
+
+    为什么要合并到一个函数（v051 配置控制台的运行参数页要用）：
+    控制台提交前必须校验「改完会不会自相矛盾」。如果控制台自己再写一套规则，
+    就会出现两份规则、迟早漂移 —— 与 v047/v048/v050 反复踩的「同一原理落两份实现」
+    是同一件事。所以这里只有一个函数：既有检查原样复用，缺的补在这里。
+
+    与 `timeout_warnings()` 的分工：
+      · 那个函数是 **startup 自检**用的，保持原样不动（它已被测试与启动流程依赖）；
+      · 本函数是它的超集，供**提交前校验**用；startup 也可以改用它，但本次不动，避免牵动既有断言。
+    """
+    out = list(timeout_warnings())
+    # py_exec 与外部工具的空闲上限要能对得上：v047 修过一次倒挂
+    # （idle 比 py_exec 总时长还长 → py_exec 永远来不及触发空闲判定）。
+    if PY_EXEC_TIMEOUT < TOOL_IDLE_TIMEOUT:
+        out.append(
+            f"口径异常：PY_EXEC_TIMEOUT({PY_EXEC_TIMEOUT}s) < TOOL_IDLE_TIMEOUT"
+            f"({TOOL_IDLE_TIMEOUT}s)，py_exec 的空闲/总时长口径倒挂（v047 修过同类问题）。")
+    if FAILURE_SWITCH_THRESHOLD >= FAILURE_STOP_THRESHOLD:
+        out.append(
+            f"口径异常：FAILURE_SWITCH_THRESHOLD({FAILURE_SWITCH_THRESHOLD}) >= "
+            f"FAILURE_STOP_THRESHOLD({FAILURE_STOP_THRESHOLD})，切换阈值必须先于停止阈值生效。")
+    if HISTORY_KEEP_RECENT >= HISTORY_COMPRESS_AFTER_MESSAGES:
+        out.append(
+            f"口径异常：HISTORY_KEEP_RECENT({HISTORY_KEEP_RECENT}) >= "
+            f"HISTORY_COMPRESS_AFTER_MESSAGES({HISTORY_COMPRESS_AFTER_MESSAGES})，"
+            "压缩后保留条数不能多于触发条数（压缩永远不会生效）。")
+    if RUN_TOKEN_BUDGET and TOKEN_BUDGET_WARN_RATIO and not (0 < TOKEN_BUDGET_WARN_RATIO <= 1):
+        out.append(f"口径异常：TOKEN_BUDGET_WARN_RATIO={TOKEN_BUDGET_WARN_RATIO} 应在 (0, 1] 内。")
+    return out

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import re as _re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -72,22 +73,70 @@ def read(rel: str) -> str:
         return ""
 
 
-# ---------------- 路径重定向（保护真实 scope.json） ----------------
+# ---------------- 路径重定向（保护真实配置） ----------------
 class Sandbox:
-    """把控制台会写的那几个路径重定向到临时目录。"""
+    """把控制台会写的东西**全部**重定向到临时目录。
+
+    v051 起 P2 的写入面从 1 个（scope.json）扩到 6 个，其中四个是**仓库里的真实文件**：
+      · data/risk_grades.json（入库）
+      · data/tool_overrides.json（入库）
+      · data/invocation_templates.json（入库）
+      · data/rules/compliance-redlines.md（入库）
+      · config.yaml（**含用户真实 FOFA 密钥，gitignored**）
+    测试若碰它们，轻则污染仓库、重则把用户的密钥文件写坏。
+
+    两条重定向路径，缺一不可：
+      ① `config.DATA_DIR` → 临时目录。因为 `registry._load_grades()` /
+         `_load_overrides()` 也是**调用时**读 `config.DATA_DIR` ——
+         只有这样「控制台写」与「registry 重载读」才看到同一份临时文件，
+         「写完重载真的生效」这条断言才有意义。
+      ② `console_api._config_yaml_path` → 直接换成临时文件。
+         `config.yaml` 走的是 `config.APP_DIR`，而 APP_DIR 被大量模块级常量依赖，
+         **不能整体打补丁**；所以只换这一个函数（外科式）。
+    """
+
+    def __init__(self, seed: tuple[str, ...] = ()):
+        # seed：需要复制进临时 data/ 的仓库文件（相对 data/ 的路径）
+        self.seed = tuple(seed)
 
     def __enter__(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="v050_"))
-        self.saved = (config.SCOPE_FILE, config_io.AUDIT_FILE, config_io.BACKUP_DIR)
-        config.SCOPE_FILE = self.tmp / "scope.json"
-        config_io.AUDIT_FILE = self.tmp / "console_audit.jsonl"
-        config_io.BACKUP_DIR = self.tmp / "console_backups"
+        data = self.tmp / "data"
+        data.mkdir(parents=True, exist_ok=True)
+        self.saved = (config.DATA_DIR, config.SCOPE_FILE, config_io.AUDIT_FILE,
+                      config_io.BACKUP_DIR, config_io.OVERRIDES_FILE,
+                      console_api._config_yaml_path)
+        config.DATA_DIR = data
+        for rel in self.seed:
+            src = REPO / "data" / rel
+            dst = data / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.exists():
+                shutil.copy2(src, dst)
+            else:
+                dst.write_text("{}", encoding="utf-8")
+        config.SCOPE_FILE = data / "scope.json"
+        config_io.AUDIT_FILE = data / "console_audit.jsonl"
+        config_io.BACKUP_DIR = data / "console_backups"
+        config_io.OVERRIDES_FILE = data / "runtime_overrides.json"
+        # config.yaml 单独换（见类注释 ②）
+        yml = self.tmp / "config.yaml"
+        src_yml = REPO / "config.yaml"
+        yml.write_text(src_yml.read_text(encoding="utf-8", errors="ignore")
+                       if src_yml.exists()
+                       else 'fofaEmail: ""\nfofaKey: ""\n# 注释行应被保留\nceyeApi: ""\n',
+                       encoding="utf-8")
+        console_api._config_yaml_path = lambda: yml
         console_api._CONFIRMS.clear()
+        config_io._ORIGINALS.clear()
         return self
 
     def __exit__(self, *a):
-        (config.SCOPE_FILE, config_io.AUDIT_FILE, config_io.BACKUP_DIR) = self.saved
+        (config.DATA_DIR, config.SCOPE_FILE, config_io.AUDIT_FILE,
+         config_io.BACKUP_DIR, config_io.OVERRIDES_FILE,
+         console_api._config_yaml_path) = self.saved
         console_api._CONFIRMS.clear()
+        config_io._ORIGINALS.clear()
 
 
 FIXTURE = {
@@ -602,6 +651,356 @@ def test_h_wiring_and_redlines():
         check("scope.json 不存在 → 防泄露检查跳过", True)
 
 
+def test_j_tools_edit():
+    """[J] 工具与分级：白名单字段、必填理由、禁改闸门参数、双文件乐观锁。"""
+    print("\n[J] 工具与分级（写入 risk_grades + tool_overrides 两个文件）")
+    saved = config.CONSOLE_PASSWORD
+    try:
+        config.CONSOLE_PASSWORD = PW
+        with Sandbox(seed=("risk_grades.json", "tool_overrides.json")) as _sb, \
+                TestClient(app, base_url=LOOPBACK) as c:
+            c.post("/api/console/login", json={"password": PW})
+            r = c.get("/api/console/tools")
+            d = r.json()
+            check("工具清单可读", r.status_code == 200 and len(d["items"]) > 100,
+                  str(len(d.get("items", []))))
+            check("清单不重复（load 必须幂等 —— 每次提交都会重载它）",
+                  len(d["items"]) == len({x["alias"] for x in d["items"]}),
+                  f'{len(d["items"])} vs {len({x["alias"] for x in d["items"]})}')
+            check("带两个文件的哈希（乐观锁用）",
+                  bool(d["files"]["grades"]["sha256_short"])
+                  and bool(d["files"]["overrides"]["sha256_short"]))
+            check("返回可改字段白名单", "disabled" in d["editable_fields"])
+            it = d["items"][0]
+            check("每条带 in_model_list / scriptable / has_override",
+                  {"in_model_list", "scriptable", "has_override"} <= set(it))
+
+            # 找一个可编排工具做实验（非可编排的改分级应被拒）
+            scr = [x for x in d["items"] if x["scriptable"]][0]
+            ali = scr["alias"]
+            name = scr["name"]
+
+            # ---- 正例：只改分级 ----
+            r = c.post("/api/console/tools/preview",
+                       json={"alias": ali, "grade": {"level": "L1", "reason": "测试预演"}})
+            check("改分级可预览", r.status_code == 200, r.text[:120])
+            tok = r.json().get("confirm_token", "")
+            hashes = r.json().get("expect_sha256", {})
+            check("返回两个文件的哈希", set(hashes) == {"grades", "overrides"}, str(hashes))
+
+            # ---- 反例：不改理由 ----
+            r = c.post("/api/console/tools/preview",
+                       json={"alias": ali, "grade": {"level": "L1"}})
+            check("改分级不填理由被拒", r.status_code == 400 and "reason" in r.text,
+                  r.text[:100])
+
+            # ---- 反例：非法等级 ----
+            r = c.post("/api/console/tools/preview",
+                       json={"alias": ali, "grade": {"level": "L9", "reason": "x"}})
+            check("非法风险等级被拒", r.status_code == 400, r.text[:100])
+
+            # ---- 反例：闸门参数不许从工具页改 ----
+            r = c.post("/api/console/tools/preview",
+                       json={"alias": ali, "overrides": {"network_control": {"declared": True}}})
+            check("不允许改 network_control（闸门参数）",
+                  r.status_code == 400 and "闸门参数" in r.text, r.text[:130])
+            r = c.post("/api/console/tools/preview",
+                       json={"alias": ali, "overrides": {"stdin_input": "1"}})
+            check("不允许改 stdin_input", r.status_code == 400, r.text[:100])
+
+            # ---- 反例：禁用必须写理由 ----
+            r = c.post("/api/console/tools/preview",
+                       json={"alias": ali, "overrides": {"disabled": True}})
+            check("禁用不填理由被拒", r.status_code == 400 and "reason" in r.text,
+                  r.text[:110])
+
+            # ---- 正例：禁用 + 理由 ----
+            r = c.post("/api/console/tools/preview",
+                       json={"alias": ali,
+                             "overrides": {"disabled": True, "reason": "测试：脚本不可用"}})
+            check("禁用 + 理由可预览", r.status_code == 200, r.text[:120])
+            tok2, hash2 = r.json()["confirm_token"], r.json()["expect_sha256"]
+
+            # ---- 无票据提交被拒 ----
+            r = c.post("/api/console/tools/commit", json={"alias": ali, "expect_sha256": hash2})
+            check("无票据提交被拒", r.status_code == 400, str(r.status_code))
+
+            # ---- 正常提交（用 tok2）----
+            # 注意：上面那次「无票据」提交**没有消费 tok2**（它在校验 token 时就抛了），
+            # 所以 tok2 仍然有效。原来我在这里写「上次已消费掉 tok2」是**错的** ——
+            # 重放会成功，而成功才是正确行为（用例前提写错导致的假红）。
+            r = c.post("/api/console/tools/commit",
+                       json={"alias": ali,
+                             "overrides": {"disabled": True, "reason": "测试：脚本不可用"},
+                             "confirm_token": tok2, "expect_sha256": hash2})
+            check("提交成功", r.status_code == 200, r.text[:140])
+            body = r.json()
+            # 真正的「一次性」验证：拿刚用过的票据再交一次
+            r = c.post("/api/console/tools/commit",
+                       json={"alias": ali,
+                             "overrides": {"disabled": True, "reason": "测试：脚本不可用"},
+                             "confirm_token": tok2, "expect_sha256": hash2})
+            check("票据一次性（用过的票据重放被拒）", r.status_code == 400,
+                  str(r.status_code))
+            check("只写了 overrides 一个文件", body["written"] == ["tool_overrides.json"],
+                  str(body["written"]))
+            check("回显重载结果（改了没生效就白改）",
+                  bool(body["reload"]["actions"]), str(body["reload"]))
+            # ---- 关键：重载后真的生效 ----
+            from app.registry import registry as _reg
+            t = _reg.get_by_alias(ali)
+            check("重载后该工具真的被禁用", t is not None and t.disabled,
+                  str(t.disabled if t else "工具不存在"))
+            check("重载后清单仍不重复（幂等）",
+                  len(_reg.tools) == len({x.alias for x in _reg.tools}))
+            check("被禁用的工具已不在模型清单",
+                  ali not in {x.alias for x in _reg.usable_scriptable()})
+
+            # ---- 乐观锁：文件被手工改过 ----
+            r = c.post("/api/console/tools/preview",
+                       json={"alias": ali, "overrides": {"timeout": 42}})
+            tok4, hash4 = r.json()["confirm_token"], dict(r.json()["expect_sha256"])
+            hash4["overrides"] = "0" * len(hash4["overrides"])
+            r = c.post("/api/console/tools/commit",
+                       json={"alias": ali, "overrides": {"timeout": 42},
+                             "confirm_token": tok4, "expect_sha256": hash4})
+            check("overrides 哈希不符 → 409", r.status_code == 409, str(r.status_code))
+    finally:
+        config.CONSOLE_PASSWORD = saved
+
+
+def test_k_params():
+    """[K] 运行参数：白名单、取值域、跨值不变量、**热生效**、复位语义。"""
+    print("\n[K] 运行参数与闸门（热生效，不用重启）")
+    from app import param_spec as ps
+    saved = config.CONSOLE_PASSWORD
+    orig_steps = config.MAX_STEPS
+    try:
+        config.CONSOLE_PASSWORD = PW
+        # ---- 规格自洽（不依赖服务）----
+        check("规格表非空且分组有序", len(ps.SPECS) >= 20 and ps.groups())
+        noenv = [s["key"] for s in ps.SPECS if not ps.env_name(s["key"])]
+        check("每个规格项都能从 config.py 解析到环境变量名（不猜）", not noenv, str(noenv))
+        nodef = [s["key"] for s in ps.SPECS if ps.default_value(s["key"]) is None]
+        check("每个规格项都能解析到默认值", not nodef, str(nodef))
+        check("排除项都写了理由", all(e.get("why") for e in ps.EXCLUDED))
+        check("HOST/PORT 在排除表里（运行时改它们不会换端口 —— 列出来就是界面说谎）",
+              any("HOST" in e["key"] for e in ps.EXCLUDED))
+        check("CONSOLE_PASSWORD 在排除表里（循环依赖）",
+              any("CONSOLE_PASSWORD" in e["key"] for e in ps.EXCLUDED))
+
+        with Sandbox() as _sb, TestClient(app, base_url=LOOPBACK) as c:
+            c.post("/api/console/login", json={"password": PW})
+            r = c.get("/api/console/params")
+            d = r.json()
+            check("参数页可读", r.status_code == 200)
+            check("分组与项数完整",
+                  len(d["groups"]) >= 5 and sum(len(g["items"]) for g in d["groups"]) == len(ps.SPECS))
+            it = d["groups"][0]["items"][0]
+            check("每项带 当前值/默认值/来源/取值域",
+                  {"value", "default", "source", "min", "max"} <= set(it), str(it.keys()))
+            check("返回排除清单（否则会被当成漏了）", len(d["excluded"]) >= 3)
+            check("声明热生效", d["hot"] is True)
+
+            # ---- 反例 ----
+            r = c.post("/api/console/params/preview", json={"values": {"MAX_STEPS": 99999}})
+            check("超范围被拒", r.status_code == 400, r.text[:100])
+            r = c.post("/api/console/params/preview",
+                       json={"values": {"MAX_STEPS": "abc"}})
+            check("类型错被拒", r.status_code == 400, r.text[:100])
+            r = c.post("/api/console/params/preview", json={"values": {"HOST": "0.0.0.0"}})
+            check("白名单外的参数被拒（含可操作的提示）",
+                  r.status_code == 400 and "白名单" in r.text, r.text[:120])
+            r = c.post("/api/console/params/preview",
+                       json={"values": {"EXECUTION_MODE": "turbo"}})
+            check("枚举非法被拒", r.status_code == 400, r.text[:100])
+            # 跨值不变量：既有的 timeout_warnings + 我补的那几条
+            r = c.post("/api/console/params/preview",
+                       json={"values": {"TOOL_IDLE_TIMEOUT": 900}})
+            check("触发 idle>=total 不变量被拒",
+                  r.status_code == 400 and "口径异常" in r.text, r.text[:150])
+            r = c.post("/api/console/params/preview",
+                       json={"values": {"PY_EXEC_TIMEOUT": 30}})
+            check("触发 py_exec<idle 倒挂被拒",
+                  r.status_code == 400 and "倒挂" in r.text, r.text[:150])
+            r = c.post("/api/console/params/preview",
+                       json={"values": {"FAILURE_SWITCH_THRESHOLD": 9}})
+            check("触发 switch>=stop 被拒", r.status_code == 400, r.text[:120])
+            r = c.post("/api/console/params/preview", json={"values": {}})
+            check("空改动被拒", r.status_code == 400, r.text[:80])
+
+            # ---- 正例：提交后热生效 ----
+            r = c.post("/api/console/params/preview", json={"values": {"MAX_STEPS": 12}})
+            check("合法改动可预览", r.status_code == 200, r.text[:120])
+            prev = r.json()
+            check("风险等级为 mid（非闸门参数）", prev["level"] == "mid", prev["level"])
+            r = c.post("/api/console/params/commit",
+                       json={"values": {"MAX_STEPS": 12},
+                             "confirm_token": prev["confirm_token"],
+                             "expect_sha256": prev["expect_sha256"]})
+            check("提交成功", r.status_code == 200, r.text[:140])
+            check("回显即时生效项", r.json().get("applied") == ["MAX_STEPS"],
+                  str(r.json().get("applied")))
+            # 关键：**调用点**看到的值必须跟着变（不是只改了配置文件）
+            check("config.MAX_STEPS 立即变为 12（热生效）", config.MAX_STEPS == 12,
+                  str(config.MAX_STEPS))
+            check("覆盖文件已落盘",
+                  config_io.read_json(config_io.OVERRIDES_FILE, {}).get("params", {})
+                  .get("MAX_STEPS") == 12)
+            # 来源应变为 runtime
+            r = c.get("/api/console/params")
+            item = [x for g in r.json()["groups"] for x in g["items"]
+                    if x["key"] == "MAX_STEPS"][0]
+            check("来源标记为控制台覆盖", item["source"] == "runtime", item["source"])
+
+            # ---- 关闸门类：高危 ----
+            r = c.post("/api/console/params/preview", json={"values": {"ENFORCE_SCOPE": False}})
+            check("改安全闸门标记为 high", r.json().get("level") == "high",
+                  str(r.json().get("level")))
+
+            # ---- 复位语义：删覆盖 ≠ 写默认 ----
+            r = c.post("/api/console/params/preview", json={"reset": ["MAX_STEPS"]})
+            check("复位可预览", r.status_code == 200, r.text[:120])
+            prev = r.json()
+            r = c.post("/api/console/params/commit",
+                       json={"reset": ["MAX_STEPS"],
+                             "confirm_token": prev["confirm_token"],
+                             "expect_sha256": prev["expect_sha256"]})
+            check("复位提交成功", r.status_code == 200, r.text[:120])
+            check("复位后 config 回到原值", config.MAX_STEPS == orig_steps,
+                  f"{config.MAX_STEPS} vs {orig_steps}")
+            check("复位是**删掉**覆盖项而不是写默认值",
+                  "MAX_STEPS" not in (config_io.read_json(
+                      config_io.OVERRIDES_FILE, {}).get("params") or {}),
+                  str(config_io.read_json(config_io.OVERRIDES_FILE, {})))
+    finally:
+        config.MAX_STEPS = orig_steps
+        config.CONSOLE_PASSWORD = saved
+
+
+def test_l_rules_templates_secrets():
+    """[L] 合规红线 / 调用模板 / 本机密钥。"""
+    print("\n[L] 合规红线 · 调用模板 · 本机密钥")
+    saved = config.CONSOLE_PASSWORD
+    try:
+        config.CONSOLE_PASSWORD = PW
+        with Sandbox(seed=("rules/compliance-redlines.md", "invocation_templates.json")) \
+                as sb, TestClient(app, base_url=LOOPBACK) as c:
+            c.post("/api/console/login", json={"password": PW})
+
+            # ---- 红线 ----
+            r = c.get("/api/console/rules")
+            d = r.json()
+            old_text = d["text"]
+            check("红线可读", r.status_code == 200 and len(old_text) > 100,
+                  str(len(old_text)))
+            check("按 ## 分节", len(d["sections"]) >= 2, str(len(d["sections"])))
+            r = c.post("/api/console/rules/preview", json={"text": ""})
+            check("拒绝把红线清空（等于移除纪律约束）",
+                  r.status_code == 400 and "清空" in r.text, r.text[:110])
+            r = c.post("/api/console/rules/preview", json={"text": old_text})
+            check("内容无变化被拒", r.status_code == 400, r.text[:80])
+            r = c.post("/api/console/rules/preview", json={"text": old_text + "\n\n## 新增章节\n测试。"})
+            check("红线可预览", r.status_code == 200, r.text[:100])
+            prev = r.json()
+            check("预览带 diff 与行数统计",
+                  "hunks" in prev and "before_lines" in prev["stats"])
+            r = c.post("/api/console/rules/commit",
+                       json={"text": old_text + "\n\n## 新增章节\n测试。",
+                             "confirm_token": prev["confirm_token"],
+                             "expect_sha256": prev["expect_sha256"]})
+            check("红线提交成功", r.status_code == 200, r.text[:120])
+            check("红线文件真的写入了",
+                  "新增章节" in config_io.read_text(console_api._rules_path()))
+            check("审计记了这次改动",
+                  any(x["face"] == "rules" for x in
+                      config_io.read_audit(limit=50)))
+
+            # ---- 调用模板 ----
+            r = c.get("/api/console/templates")
+            d = r.json()
+            check("模板可读", r.status_code == 200 and len(d["items"]) > 0,
+                  str(len(d.get("items", []))))
+            check("带 target 合法取值清单", "url" in d["targets"])
+            items = d["items"]
+            bad = [dict(x, cmd="{args} {target}") for x in items[:1]]
+            r = c.post("/api/console/templates/preview", json={"items": bad})
+            check("cmd 缺 {exe} 被拒", r.status_code == 400 and "exe" in r.text,
+                  r.text[:110])
+            bad2 = [dict(items[0], target="ftp")]
+            r = c.post("/api/console/templates/preview", json={"items": bad2})
+            check("target 非法取值被拒", r.status_code == 400, r.text[:110])
+            # 新增一条
+            new_items = items + [{"alias": "zz_test_tool", "cmd": "{exe} {args} {target}",
+                                  "target": "raw"}]
+            r = c.post("/api/console/templates/preview", json={"items": new_items})
+            check("新增模板可预览", r.status_code == 200, r.text[:110])
+            prev = r.json()
+            check("预览列出新增项", "zz_test_tool" in prev["added"], str(prev["added"]))
+            r = c.post("/api/console/templates/commit",
+                       json={"items": new_items, "confirm_token": prev["confirm_token"],
+                             "expect_sha256": prev["expect_sha256"]})
+            check("模板提交成功", r.status_code == 200, r.text[:120])
+            saved_tpl = config_io.read_json(console_api._templates_path(), {}) or {}
+            check("模板真的写入了", "zz_test_tool" in saved_tpl)
+            check("_说明 等元键被保留（不能被整表覆盖掉）",
+                  "_说明" in saved_tpl, str(list(saved_tpl)[:3]))
+
+            # ---- 密钥 ----
+            # 把临时 config.yaml 写成确定内容：真实 config.yaml 存在（含用户密钥），
+            # 直接复制会让下面「注释是否保留」的断言依赖真实文件里恰好有注释 —— 那是脆的。
+            (sb.tmp / "config.yaml").write_text(
+                "# 本机个人配置（注释行必须保留）\n"
+                "fofaEmail: \"\"\n"
+                "fofaKey: \"\"\n"
+                "fofaSize: 100\n"
+                "customUnknownKey: keep-me\n",
+                encoding="utf-8")
+            r = c.get("/api/console/secrets")
+            d = r.json()
+            check("密钥可读", r.status_code == 200 and len(d["items"]) == 5)
+            check("不下发明文（只有 has_value 与打码）",
+                  all("masked" in x and "value" not in x for x in d["items"]),
+                  str(d["items"][0]))
+            r = c.post("/api/console/secrets/commit",
+                       json={"values": {"notAllowedKey": "x"}})
+            check("白名单外的键被拒", r.status_code == 400, r.text[:110])
+            r = c.post("/api/console/secrets/commit",
+                       json={"values": {"fofaEmail": "a@example.test",
+                                        "fofaKey": "key-with:colon#hash"}})
+            check("合法键可写", r.status_code == 200, r.text[:120])
+            yml = (sb.tmp / "config.yaml").read_text(encoding="utf-8")
+            check("值已写入 config.yaml", "a@example.test" in yml and "fofaKey:" in yml)
+            check("含冒号/井号的值被引号包住（否则扁平解析器会把行拆坏）",
+                  '"key-with:colon#hash"' in yml, yml[:200])
+            check("其它行与注释被保留（只改指定键的值）",
+                  "# 本机个人配置（注释行必须保留）" in yml and "fofaSize: 100" in yml
+                  and "customUnknownKey: keep-me" in yml, yml[:260])
+            r = c.get("/api/console/secrets")
+            check("回读显示已填且打码", any(x["key"] == "fofaEmail" and x["has_value"]
+                                      for x in r.json()["items"]))
+            check("审计不记录密钥值",
+                  "a@example.test" not in config_io.read_text(config_io.AUDIT_FILE))
+    finally:
+        config.CONSOLE_PASSWORD = saved
+
+
+def test_m_registry_idempotent():
+    """[M] `registry.load()` 必须幂等 —— 控制台的「改完重载」会反复调它。"""
+    print("\n[M] registry.load() 幂等（P2 的重载路径依赖它）")
+    from app.registry import ToolRegistry
+    r = ToolRegistry()
+    counts = []
+    for _ in range(3):
+        r.load()
+        counts.append((len(r.tools), len(r._by_alias)))
+    check("连续 3 次 load 的工具数完全一致（原来会 211→408→605 线性膨胀）",
+          len({c[0] for c in counts}) == 1, str(counts))
+    check("tools 列表与 by_alias 视图规模一致（原来两者矛盾）",
+          all(a == b for a, b in counts), str(counts))
+    check("errors 不会累积", len(r.errors) == 0, str(r.errors[:2]))
+
+
 def test_i_ui_regressions():
     """[I] 前端两个「第一次真用就中」的缺陷（v050.1 / v050.2）。
 
@@ -667,7 +1066,7 @@ def test_i_ui_regressions():
 
 def main() -> int:
     print("=" * 68)
-    print("v050 配置控制台回归（P1：口令闸门 / 白名单 CRUD / 迁移）")
+    print("v051 配置控制台回归（P1 白名单 + P2 工具分级·运行参数·合规模板）")
     print("=" * 68)
     test_a_gate()
     test_b_login()
@@ -679,6 +1078,10 @@ def main() -> int:
     test_g_migrate()
     test_h_wiring_and_redlines()
     test_i_ui_regressions()
+    test_j_tools_edit()
+    test_k_params()
+    test_l_rules_templates_secrets()
+    test_m_registry_idempotent()
     print("\n" + "=" * 68)
     print(f"结果：{PASS} 通过 / {FAIL} 失败")
     print("=" * 68)
