@@ -55,6 +55,12 @@ update.spec
 # ---- 审计 P0-4：敏感数据不得入库（2026-09-16）----
 # scope.json 本机含真实授权靶标，已移出版本控制（模板见 data/scope.example.json）
 data/scope.json
+# 控制台配置变更审计（v050）：会记录真实授权 host，入库即公开泄露
+data/console_audit.jsonl
+# 控制台写入前的配置备份（同样含真实 host）
+data/console_backups/
+# 控制台写入的本机运行参数覆盖（本机调优值，不该跟着仓库走）
+data/runtime_overrides.json
 # 损坏库备份与历史 .git 存档含真实交战数据
 data/*corrupt*
 data/*.bak_*

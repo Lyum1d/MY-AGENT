@@ -295,6 +295,26 @@ async def index():
 app.mount("/static", StaticFiles(directory=str(config.WEB_DIR)), name="static")
 
 
+# ---------- v050 配置控制台 ----------
+# 刻意只加这三行：控制台的接口在 app/console_api.py，前端在独立目录 console/。
+# 现有 web/ 一个字节都不动 —— 免得再出现「一方改动影响另一方」。
+#   · 前端外壳（HTML/CSS/JS）不含任何数据，公开可读；**所有数据与写入接口都过口令闸门**。
+#     这样登录页自己也能加载样式，不会绕成「要登录才能拿到登录页」的死循环。
+#   · 控制台自身不发起任何目标流量（见 /api/console/scope/verify 的说明）。
+from . import console_api                                        # noqa: E402
+
+app.include_router(console_api.router, prefix="/api/console", tags=["console"])
+
+
+@app.get("/console")
+async def console_index():
+    return FileResponse(config.CONSOLE_DIR / "index.html")
+
+
+app.mount("/console-assets", StaticFiles(directory=str(config.CONSOLE_DIR)),
+          name="console")
+
+
 # ---------- 状态 ----------
 @app.get("/api/health")
 async def health():

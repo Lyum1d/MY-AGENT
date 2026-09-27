@@ -406,6 +406,8 @@ src-agent/
 | `PY_EXEC_GRADE_LEVEL_LOCAL` | 分档：只读且无网络的脚本定级 | L0 | `AGENT_PY_EXEC_GRADE_LEVEL_LOCAL` |
 | `PY_EXEC_GRADE_LEVEL_NET` | 分档：仅经受控接口出网的脚本定级 | L2 | `AGENT_PY_EXEC_GRADE_LEVEL_NET` |
 | `TASK_CONSTRAINTS_ENABLED` | 任务级约束闸门（任务声明「不做字典爆破」时拒绝同类工具） | 开 | `AGENT_TASK_CONSTRAINTS` |
+| `CONSOLE_TOKEN_TTL` | 配置控制台登录票据有效期(秒) | 43200 | `AGENT_CONSOLE_TOKEN_TTL` |
+| `CONSOLE_CONFIRM_TTL` | 白名单改动的确认票据有效期(秒) | 300 | `AGENT_CONSOLE_CONFIRM_TTL` |
 | `CONFIRM_TIMEOUT` | L2/L3 等用户确认上限(秒) | 600 | `AGENT_CONFIRM_TIMEOUT` |
 | `MAX_TOOL_SCHEMAS` | 单次决策回传工具数上限 | 40 | `AGENT_MAX_TOOL_SCHEMAS` |
 | `INTEL_CAP` | 情报库每类条目上限 | 150 | `INTEL_CAP` |

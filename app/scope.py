@@ -219,18 +219,34 @@ def check_scope(target: str) -> str | None:
                 f"当前白名单：{', '.join(scope)}。"
                 f"新增授权目标请编辑 data/scope.json。")
     # ---- 端口/协议细粒度校验（仅当 host 命中的条目声明了 ports/schemes）----
+    #
+    # ⚠️ v050 修（配置控制台暴露出来的）：原实现是「遍历所有匹配条目，**任一**条命中限制
+    # 就拒绝」。当同一个 host 同时存在两条记录时 —— 一条声明了 ports、一条未声明
+    # （`ports=None` 表示不限）—— 那条「不限」的会把已声明的限制**静默放开**：
+    # 操作者在控制台把端口限制设成 [443]、界面显示「已保存」，
+    # 而实际上 80 端口照样放行。**这正是本项目最怕的一类错：配了、看起来生效、其实没生效。**
+    # 「不限」的重复条目从哪来：`domains` 兼容视图与 `targets` 结构化条目都写同一个 host 时
+    # 就会各生成一条（配置控制台的迁移与保存都会这样做）。
+    #
+    # 修法：先收集**全部**匹配条目，再按「显式声明优先」判定 ——
+    # 只要有任何一条声明了 ports/schemes，该 host 就受声明约束；
+    # 允许多条各声明一部分时取**并集**（白名单语义：被任一条授权即为授权）。
     port, scheme = _parse_port_scheme(target)
     if port is not None or scheme is not None:
-        for entry in load_scope_targets():
-            if not host_in_scope(host, [entry["host"]]):
-                continue
-            if entry["ports"] is not None and port is not None and port not in entry["ports"]:
+        matched = [e for e in load_scope_targets()
+                   if host_in_scope(host, [e["host"]])]
+        declared_ports = [e["ports"] for e in matched if e["ports"] is not None]
+        declared_schemes = [e["schemes"] for e in matched if e["schemes"] is not None]
+        if declared_ports and port is not None:
+            allowed = set().union(*declared_ports)
+            if port not in allowed:
                 return (f"目标「{host}:{port}」的端口不在授权范围内"
-                        f"（授权端口：{sorted(entry['ports'])}），已拒绝执行。")
-            if (entry["schemes"] is not None and scheme is not None
-                    and scheme not in entry["schemes"]):
+                        f"（授权端口：{sorted(allowed)}），已拒绝执行。")
+        if declared_schemes and scheme is not None:
+            allowed_s = set().union(*declared_schemes)
+            if scheme not in allowed_s:
                 return (f"目标「{scheme}://{host}」的协议不在授权范围内"
-                        f"（授权协议：{sorted(entry['schemes'])}），已拒绝执行。")
+                        f"（授权协议：{sorted(allowed_s)}），已拒绝执行。")
     return None
 
 

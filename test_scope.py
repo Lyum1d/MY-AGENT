@@ -206,6 +206,49 @@ check("超大列表文件 → 按 <oversized> 拒绝",
 check("executor.run 已接入目标列表文件复核",
       "first_unauthorized_target_list_in_argv(cmd)" in src)
 
+# ---------------------------------------------------------------------------
+print("=== 6. 端口/协议限制不得被「不限」的重复条目放开（v050）===")
+# 背景（配置控制台暴露出来的真缺陷）：`domains` 写法（不限端口/协议）与 `targets`
+# 写法（可限定）**同时**为同一个 host 存在时，会各生成一条授权条目。
+# 原实现是「遍历匹配条目，任一条命中限制就拒绝」—— 那条 `ports=None`（不限）的
+# 会让循环走完落到 `return None`，把已声明的限制**静默放开**：
+# 操作者在控制台把端口限制设成 [443]、界面显示「已保存」，而 80 照样放行。
+# 触发场景很常见：控制台的迁移与保存都会同时写 `domains` 与 `targets`。
+# 这类「配了、看起来生效、其实没生效」是本项目最怕的错，必须有测试钉住。
+
+
+def set_scope_mixed(domains, targets) -> None:
+    p = _TMP / "scope_mixed.json"
+    p.write_text(json.dumps({"domains": domains, "targets": targets},
+                            ensure_ascii=False), encoding="utf-8")
+    config.SCOPE_FILE = p
+
+
+set_scope_mixed(["a.test"], [{"host": "a.test", "ports": [443], "schemes": ["https"]}])
+check("未授权端口被拒（重复的『不限』条目不得放开限制）",
+      check_scope("http://a.test:80/") is not None,
+      str(check_scope("http://a.test:80/")))
+check("已授权端口放行", check_scope("https://a.test:443/") is None)
+check("已声明 schemes 时走协议校验（http 不在声明里）",
+      check_scope("http://a.test/") is not None)
+check("裸域名不做协议推断（避免误杀 DNS 类工具）",
+      check_scope("a.test") is None)
+
+set_scope_mixed(["b.test"], [{"host": "b.test", "ports": [80, 443]}])
+check("同一 host 多条声明取并集（白名单语义：被任一条授权即授权）",
+      check_scope("http://b.test:80/") is None
+      and check_scope("https://b.test:443/") is None)
+check("并集之外的端口仍被拒", check_scope("http://b.test:8080/") is not None)
+
+set_scope_mixed(["c.test"], [{"host": "c.test", "ports": [443]}])
+check("只有 targets 声明（无重复 domains 条目）时行为不变",
+      check_scope("http://c.test:80/") is not None
+      and check_scope("https://c.test:443/") is None)
+
+set_scope_mixed(["d.test"], [{"host": "d.test"}])
+check("两侧都未声明端口/协议 → 不做限制（向后兼容）",
+      check_scope("http://d.test:8080/") is None)
+
 config.SCOPE_FILE = _ORIG_SCOPE
 
 print(f"\n{'=' * 56}")

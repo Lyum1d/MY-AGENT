@@ -224,6 +224,19 @@ REPLAY_MIN_INTERVAL = float(os.getenv("REPLAY_MIN_INTERVAL", "0.6"))  # 全局�
 REPLAY_MAX_BODY = 4000     # 回传给模型的最大响应体长度（字符）
 SCOPE_FILE = DATA_DIR / "scope.json"  # 授权域名白名单
 
+# ---- v050 配置控制台（/console）----
+# 前端独立目录（与 web/ 物理隔离：控制台改动不会碰到作战界面，反之亦然）
+CONSOLE_DIR = APP_DIR / "console"
+# 控制台口令。**未设置时 console 路由一律拒绝（fail-closed）** ——
+# 绝不「未设置 = 不校验」：那个界面能改授权白名单，默认敞开等于把红线挂网上。
+# 也可写在本机 config.yaml 的 consolePassword（不入库），环境变量优先。
+CONSOLE_PASSWORD = os.getenv("AGENT_CONSOLE_PASSWORD", "")
+# 登录票据有效期（秒），默认 12 小时
+CONSOLE_TOKEN_TTL = int(os.getenv("AGENT_CONSOLE_TOKEN_TTL", "43200"))
+# preview → commit 的一次性确认票据存活时间（秒）。
+# 设短是刻意的：「确认」的语义是「我刚看过这份 diff」，隔夜再提交就不算确认了。
+CONSOLE_CONFIRM_TTL = int(os.getenv("AGENT_CONSOLE_CONFIRM_TTL", "300"))
+
 # 命令行工具执行前是否强制校验授权白名单（app/executor.py）。
 # 背景：白名单此前只在 HTTP 重放器（replayer）生效，命令行工具（executor）
 #   仅校验 target 格式、不校验目标是否在授权范围内，存在越权扫描缺口。
