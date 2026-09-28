@@ -1064,6 +1064,151 @@ def test_i_ui_regressions():
           not unversioned, str(unversioned))
 
 
+def test_n_v052_review_fixes():
+    """[N] v052：复审报告确认的 4 处修复（P2-A / P2-B / P2-C / P2-F）。
+
+    每一条都钉住「修复后的行为」，而不是「代码里出现了某个字符串」——
+    否则改回去也能过。
+    """
+    print("\n[N] v052 复审修复（复位即时 / 模板强制 {exe} / 黑名单统一 / 热重载）")
+    from app import executor as ex
+    from app.executor import executor as _exec
+    saved = config.CONSOLE_PASSWORD
+    saved_scope = config.SCOPE_FILE
+    try:
+        config.CONSOLE_PASSWORD = PW
+
+        # ---------- P2-A：params_reset 必须**即时还原**运行值 ----------
+        with Sandbox() as _sb, TestClient(app, base_url=LOOPBACK) as c:
+            import os
+            c.post("/api/console/login", json={"password": PW})
+            orig = config.ENFORCE_SCOPE
+            os.environ.pop("ENFORCE_SCOPE", None)
+            r = c.post("/api/console/params/preview", json={"values": {"ENFORCE_SCOPE": False}})
+            check("可预览关闭 ENFORCE_SCOPE（高危）", r.status_code == 200, r.text[:90])
+            pv = r.json()
+            r = c.post("/api/console/params/commit",
+                       json={"values": {"ENFORCE_SCOPE": False},
+                             "confirm_token": pv["confirm_token"],
+                             "expect_sha256": pv["expect_sha256"]})
+            check("已关闭 ENFORCE_SCOPE", r.status_code == 200, r.text[:90])
+            check("运行中的 ENFORCE_SCOPE 确实变成 False（热生效前提）",
+                  config.ENFORCE_SCOPE is False, str(config.ENFORCE_SCOPE))
+
+            r = c.post("/api/console/params/reset")
+            check("清空覆盖 → 200", r.status_code == 200, r.text[:90])
+            # 这一条就是 P2-A：原来只清文件、不改运行值
+            check("**复位后运行值即时还原**（原来要重启才回正）",
+                  config.ENFORCE_SCOPE == orig,
+                  f"{config.ENFORCE_SCOPE} vs {orig}")
+            check("响应里回显被还原的项",
+                  "ENFORCE_SCOPE" in (r.json().get("restored") or []),
+                  str(r.json().get("restored")))
+            check("提示文案不再说「需要重启」",
+                  "不需要重启" in (r.json().get("note") or ""),
+                  str(r.json().get("note"))[:80])
+
+        # ---------- P2-B：模板加载期强制 {exe} ----------
+        import tempfile as _tf
+        d = Path(_tf.mkdtemp(prefix="v052_tpl_"))
+        saved_data = config.DATA_DIR
+        try:
+            config.DATA_DIR = d
+            (d / "invocation_templates.json").write_text(json.dumps({
+                "_说明": "x",
+                "good_tool": {"cmd": "{exe} -u {target} {args}", "target": "url"},
+                "evil_tool": {"cmd": "sh -c {target}", "target": "raw"},
+            }, ensure_ascii=False), encoding="utf-8")
+            t = ex.load_templates()
+            check("缺 {exe} 的模板在**加载期**被丢弃（纵深防御）",
+                  "evil_tool" not in t and "good_tool" in t, str(list(t)))
+            check("问题被记录下来（供界面显示，不只留日志）",
+                  any(x["alias"] == "evil_tool" for x in ex.template_problems()),
+                  str(ex.template_problems()))
+            # 关键行为：即使模板缺失，命令首 token 仍必须是受信任的 tool.executable
+            from app.registry import registry as _reg
+            _reg.load()
+            _exec.reload_templates()
+            tool = _reg.tools[0]
+            cmd = _exec.build_command(tool, "example.com", "")
+            check("命令首 token 仍是受信任的工具路径（不会被模板换成 sh）",
+                  cmd and cmd[0] == tool.executable,
+                  f"{cmd[:1]} vs {tool.executable!r}")
+        finally:
+            config.DATA_DIR = saved_data
+            _exec.reload_templates()
+
+        # ---------- P2-C：**不采纳**（实证会破坏本机测试能力）----------
+        # 复审报告建议把 loopback/私网/元数据地址列入 `_DENY_HOSTS` 并让主闸门也查它。
+        # 实测那样会让 7 个套件 29 项失败（`test_replayer.py` 依赖「按需授权 127.0.0.1
+        # 打本机临时 HTTP 服务」）。本节钉住**不采纳**这个决定，避免以后又被"修平"。
+        d2 = Path(_tf.mkdtemp(prefix="v052_scope_"))
+        config.SCOPE_FILE = d2 / "scope.json"
+        config.SCOPE_FILE.write_text(json.dumps(
+            {"domains": ["127.0.0.1", "localhost", "ok.test"]}), encoding="utf-8")
+        check("按需授权 loopback 仍然放行（既有能力，不能被加固掉）",
+              scope.check_scope("127.0.0.1") is None,
+              str(scope.check_scope("127.0.0.1"))[:70])
+        check("按需授权 localhost 同样放行", scope.check_scope("localhost") is None)
+        config.SCOPE_FILE.write_text(json.dumps(
+            {"domains": ["ok.test"]}), encoding="utf-8")
+        check("未授权时 loopback 依然被拒（fail-closed 没放宽）",
+              scope.check_scope("127.0.0.1") is not None)
+        config.SCOPE_FILE = saved_scope
+
+        # ---------- P2-F：模板热重载 ----------
+        check("executor 提供 reload_templates()", hasattr(_exec, "reload_templates"))
+        check("重载返回模板条数（>0）", _exec.reload_templates() > 0)
+        r = config_io.reload_for("invocation_templates")
+        check("reload_for(invocation_templates) 同时重载 registry 与 executor",
+              any("registry" in a for a in r["actions"])
+              and any("executor" in a for a in r["actions"]), str(r["actions"]))
+    finally:
+        config.SCOPE_FILE = saved_scope
+        config.CONSOLE_PASSWORD = saved
+
+
+def test_o_remote_mode_not_bypassable():
+    """[O] 远程模式下 `/api/console/*` 不可绕过 —— 实证复审报告 P2-E。
+
+    报告担心「远程部署时控制台鉴权口径与作战界面不一致 → 可绕过控制台口令」。
+    实测结论：**该担心不成立**。`remote_access_token_guard` 是全局中间件，
+    非回环绑定时对**所有**路径生效；带着合法控制台 Cookie 但没有 Bearer 也是 401。
+    这条测试留在回归里，避免以后有人把中间件改成只罩某些前缀。
+    """
+    print("\n[O] 远程模式（非回环）下控制台不可绕过")
+    saved_h, saved_t, saved_pw = config.HOST, config.ACCESS_TOKEN, config.CONSOLE_PASSWORD
+    try:
+        config.CONSOLE_PASSWORD = PW
+        config.HOST = "0.0.0.0"
+
+        config.ACCESS_TOKEN = ""
+        with TestClient(app, base_url="http://10.0.0.5:8770") as c:
+            check("远程 + 未设令牌：控制台接口 401",
+                  c.get("/api/console/tools").status_code == 401)
+            check("远程 + 未设令牌：连免鉴权的 session 也 401",
+                  c.get("/api/console/session").status_code == 401)
+            check("远程 + 未设令牌：作战界面首页同样 401（口径一致）",
+                  c.get("/").status_code == 401)
+
+        config.ACCESS_TOKEN = "tok-xyz"
+        with TestClient(app, base_url="http://10.0.0.5:8770") as c:
+            c.cookies.set("console_token", "whatever")
+            r = c.get("/api/console/session")
+            check("远程：只带控制台 Cookie、无 Bearer → 401（**不可绕过**）",
+                  r.status_code == 401, f"{r.status_code} —— 200 就是真绕过")
+            r = c.get("/api/console/tools",
+                      headers={"Authorization": "Bearer tok-xyz"})
+            check("远程：带正确 Bearer 后到达控制台闸门（401 未登录，非被中间件挡）",
+                  r.status_code == 401, str(r.status_code))
+            check("远程：Bearer 不对 → 401",
+                  c.get("/api/console/tools",
+                        headers={"Authorization": "Bearer wrong"}).status_code == 401)
+    finally:
+        config.HOST, config.ACCESS_TOKEN, config.CONSOLE_PASSWORD = \
+            saved_h, saved_t, saved_pw
+
+
 def main() -> int:
     print("=" * 68)
     print("v051 配置控制台回归（P1 白名单 + P2 工具分级·运行参数·合规模板）")
@@ -1082,6 +1227,8 @@ def main() -> int:
     test_k_params()
     test_l_rules_templates_secrets()
     test_m_registry_idempotent()
+    test_n_v052_review_fixes()
+    test_o_remote_mode_not_bypassable()
     print("\n" + "=" * 68)
     print(f"结果：{PASS} 通过 / {FAIL} 失败")
     print("=" * 68)

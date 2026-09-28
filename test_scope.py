@@ -249,6 +249,37 @@ set_scope_mixed(["d.test"], [{"host": "d.test"}])
 check("两侧都未声明端口/协议 → 不做限制（向后兼容）",
       check_scope("http://d.test:8080/") is None)
 
+# ---------------------------------------------------------------------------
+print("=== 7. 「按需授权 loopback/本机」是有意保留的能力（v052 · 复审 P2-C 不采纳）===")
+# 复审报告 P2-C 建议：把 loopback / 私网 / 云元数据地址列入 `_DENY_HOSTS`，
+# 并让主闸门 `check_scope` 也查这个集合（理由：两层口径不一致）。
+#
+# **实测不采纳**：
+#   · `test_replayer.py` 的设计原文写着「唯一真发请求的一节打的是**本机临时 HTTP 服务
+#     （127.0.0.1）**，白名单临时写成 127.0.0.1，跑完即恢复」——
+#     「按需授权 loopback」是**已经在用**的能力；
+#   · 按建议改完后 **7 个套件 29 项失败**（HTTP 重放器 / 只读身份差分 / 流程绕过检测 /
+#     py_exec 与扫描器治理 / 网络层 WAF 状态机 / 低流量测试策略 / 实战缺陷修复）。
+#   结论：**删掉一项真实能力不是加固**；边界本来就由白名单保证。
+#
+# 两层「口径不同」是**有意的**：
+#   · argv 复核层处理从命令行文本**启发式抽取**的主机（来源不可信）→ 用更严的黑名单；
+#   · 主闸门处理操作者**显式声明**的目标（经过写进 scope.json 的人工确认）→ 只受白名单约束。
+# 本节把这条决策钉住，避免以后有人又"顺手修平"它。
+set_scope(["example.com", "127.0.0.1", "localhost"])
+check("主闸门：显式授权的 loopback 放行（test_replayer 的既有依赖）",
+      check_scope("127.0.0.1") is None, str(check_scope("127.0.0.1"))[:60])
+check("主闸门：显式授权的 localhost 也放行（主闸门只受白名单约束）",
+      check_scope("localhost") is None, str(check_scope("localhost"))[:60])
+check("argv 复核层：抽出来的 localhost 一律拒（黑名单只在那一层生效）",
+      first_unauthorized_host_in_argv(
+          ["t.exe", "-u", "http://localhost:8080/"]) is not None)
+set_scope(["example.com"])
+check("未授权时 loopback 依然被拒（fail-closed 没被放宽）",
+      check_scope("127.0.0.1") is not None)
+check("未授权时本地临时服务地址同样被拒",
+      check_scope("localhost") is not None)
+
 config.SCOPE_FILE = _ORIG_SCOPE
 
 print(f"\n{'=' * 56}")

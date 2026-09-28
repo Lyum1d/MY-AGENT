@@ -342,6 +342,14 @@ def reload_for(face: str) -> dict:
             before = len(registry.tools)
             registry.load()
             out["actions"].append(f"registry 重载：{before} → {len(registry.tools)} 个工具")
+            if face == "invocation_templates":
+                # v052（复审报告 P2-F）：模板还要让 executor 重新载入。
+                # `LocalExecutor.__init__` 里 `self.templates = load_templates()` 只跑一次，
+                # 而 `executor` 是模块级单例 —— 不重载的话控制台改完模板，
+                # **运行中的实例仍用旧模板**，直到重启。
+                from .executor import executor as _exec
+                n = _exec.reload_templates()
+                out["actions"].append(f"executor 模板重载：{n} 条")
         elif face == "params":
             from . import config as cfg
             changed = apply_overrides(cfg)

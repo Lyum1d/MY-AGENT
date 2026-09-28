@@ -854,11 +854,21 @@ async def params_reset(request: Request):
                                      {"_说明": "（已清空）", "params": {}})
     if not res["ok"]:
         raise HTTPException(500, f"写入失败：{res['error']}")
+    # v052（复审报告 P2-A）：**必须**补这一步。原来只写了文件、没应用 ——
+    # 于是把 ENFORCE_SCOPE 之类的闸门参数覆盖成关闭之后，再 reset，
+    # 本进程的 config.ENFORCE_SCOPE 仍是 False，而总览页读的正是它 →
+    # **界面显示「红线已关」而文件已经清空**，是最典型的「改了没生效 + 误导」。
+    # `apply_overrides` 现在会先还原 `_ORIGINALS` 里那些已撤销的覆盖，所以复位是**即时**的。
+    applied = config_io.apply_overrides(config)
     config_io.audit("params", "reset_all", before={"params": ov.get("params")},
-                    after={"params": {}}, level="high", note="清空全部运行时覆盖")
-    return {"ok": True, "backup": res["backup"],
-            "note": "已清空。**这些值需要重启服务才会真正回到环境变量/默认值**"
-                    "（本进程内的 config 属性仍是被覆盖后的值）。"}
+                    after={"params": {}, "restored": applied},
+                    level="high", note="清空全部运行时覆盖")
+    return {"ok": True, "backup": res["backup"], "restored": applied,
+            "values": {k: getattr(config, k, None)
+                       for k in (ov.get("params") or {})},
+            "warnings": config.param_warnings(),
+            "note": ("已清空并**即时还原**：" + ("、".join(applied) if applied else "无覆盖项")
+                     + "。回到环境变量/默认值，**不需要重启**。")}
 
 
 # ============================================================ 合规红线与模板（P2）
@@ -944,9 +954,17 @@ async def templates_get(request: Request):
     raw = config_io.read_json(_templates_path(), default={}) or {}
     items = [{"alias": k, **(v if isinstance(v, dict) else {})}
              for k, v in raw.items() if not k.startswith("_")]
+    # 加载期发现的问题（例如手工改写导致缺 {exe}）—— 让界面直接显示，
+    # 否则「模板被静默忽略」只留在日志里，等于没发现。
+    try:
+        from .executor import template_problems
+        problems = template_problems()
+    except Exception:                                        # noqa: BLE001
+        problems = []
     return {"ok": True, "items": items,
             "target_form": raw.get("_target_form", ""),
             "note": raw.get("_说明", ""),
+            "problems": problems,
             "file": config_io.file_state(_templates_path()),
             "targets": ["url", "host", "domain", "raw", "asis"]}
 

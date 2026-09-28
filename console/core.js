@@ -86,7 +86,7 @@ export function bindModal() {
 /* ============================================================ 小工具 */
 /* 纯函数从 lib.js 再导出 —— 拆出去是为了让 Node 能直接 import 做行为测试
  * （DOM 相关的东西留在本文件，纯逻辑在 lib.js）。视图层仍从 core.js 取。 */
-export { esc, fmtTime, alertBox, diffHtml, parseList } from '/console-assets/lib.js?v=051';
+export { esc, fmtTime, alertBox, diffHtml, parseList } from '/console-assets/lib.js?v=052';
 
 /* ============================================================ 登录 */
 export function showLogin(msg) {
@@ -115,14 +115,14 @@ async function doLogin() {
 
 /* ============================================================ 视图路由 */
 const VIEWS = {
-  overview: () => import('/console-assets/views/overview.js?v=051'),
-  scope:    () => import('/console-assets/views/scope.js?v=051'),
-  tools:    () => import('/console-assets/views/tools.js?v=051'),
-  params:   () => import('/console-assets/views/params.js?v=051'),
-  rules:    () => import('/console-assets/views/rules.js?v=051'),
-  monitor:  () => import('/console-assets/views/monitor.js?v=051'),
-  charts:   () => import('/console-assets/views/charts.js?v=051'),
-  audit:    () => import('/console-assets/views/audit.js?v=051'),
+  overview: () => import('/console-assets/views/overview.js?v=052'),
+  scope:    () => import('/console-assets/views/scope.js?v=052'),
+  tools:    () => import('/console-assets/views/tools.js?v=052'),
+  params:   () => import('/console-assets/views/params.js?v=052'),
+  rules:    () => import('/console-assets/views/rules.js?v=052'),
+  monitor:  () => import('/console-assets/views/monitor.js?v=052'),
+  charts:   () => import('/console-assets/views/charts.js?v=052'),
+  audit:    () => import('/console-assets/views/audit.js?v=052'),
 };
 const TITLES = {
   overview: '总览', scope: '授权白名单', tools: '工具与分级', params: '运行参数',

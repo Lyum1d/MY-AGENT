@@ -13,11 +13,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shlex
 import time
 from abc import ABC, abstractmethod
+
+# v052 补：本模块此前**没有 logger**，而模板校验需要在加载期留一条可追溯的告警
+# （丢弃缺 {exe} 的模板这件事必须说出来，否则就是静默改行为）。
+logger = logging.getLogger(__name__)
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -90,11 +95,24 @@ def _kill_tree(proc) -> None:
 # 开关：config.ENFORCE_SCOPE（ENFORCE_SCOPE=0 仅供临时排查，默认强制开启）。
 
 
+# 模板文件的校验问题（`load_templates` 每次调用都会重置）。
+# 为什么要有它：文件是入库的，可能被**直接改写**而绕过控制台的 preview 校验。
+# 加载期丢弃模板只留在日志里，没人看日志就等于没发现 —— 所以把问题记下来
+# 让控制台的调用模板页直接显示。
+_TEMPLATE_PROBLEMS: list[tuple[str, str]] = []
+
+
+def template_problems() -> list[dict]:
+    """最近一次加载发现的模板问题（别名 + 原因）。"""
+    return [{"alias": a, "why": w} for a, w in _TEMPLATE_PROBLEMS]
+
+
 def load_templates() -> dict[str, dict]:
     """加载调用模板。兼容两种写法：
         "ehole": "{exe} finger -u {target} {args}"            （旧，无目标形式）
         "ehole": {"cmd": "...", "target": "url"}              （新，带目标形式）
     """
+    _TEMPLATE_PROBLEMS.clear()
     p = config.DATA_DIR / "invocation_templates.json"
     if not p.exists():
         return {}
@@ -104,9 +122,24 @@ def load_templates() -> dict[str, dict]:
         if k.startswith("_"):
             continue
         if isinstance(v, str):
-            out[k] = {"cmd": v, "target": "raw"}
+            cmd, tgt = v, "raw"
         else:
-            out[k] = {"cmd": v.get("cmd", ""), "target": v.get("target", "raw")}
+            cmd, tgt = v.get("cmd", ""), v.get("target", "raw")
+        # v052（复审报告 P2-B，纵深防御）：**加载期**也强制要求 {exe}。
+        # 控制台的 preview 已经要求了（`templates_preview`），但那是**入口之一** ——
+        # 这个文件是入库的，被直接改写（或将来别的写入路径）就绕过了那道检查。
+        # 缺 {exe} 的后果不是「报错」而是**静默换掉要执行的二进制**：
+        # `_from_template` 用 `_EXE_TOKEN` 占位符还原 `tool.executable`，
+        # 没有占位符时首个 token 就是模板里写的任意字符串（例如 `sh`），
+        # 而 `tool.executable`（受信任的 TOOLBOX_ROOT 路径）被完全忽略。
+        # 这里**丢弃**该模板并留日志 —— 丢弃后走默认拼接（`{exe} {args} {target}`），
+        # 用的仍是受信任路径，行为可预期。
+        if "{exe}" not in (cmd or ""):
+            logger.warning("调用模板 %r 缺少 {exe} 占位符，已忽略该模板（走默认拼接）：%r",
+                           k, cmd)
+            _TEMPLATE_PROBLEMS.append((k, "缺少 {exe} 占位符"))
+            continue
+        out[k] = {"cmd": cmd, "target": tgt}
     return out
 
 
@@ -348,6 +381,17 @@ class LocalExecutor(Executor):
 
     def __init__(self) -> None:
         self.templates = load_templates()
+
+    def reload_templates(self) -> int:
+        """重新载入调用模板并返回条数。
+
+        v052（复审报告 P2-F）：模板在 `__init__` 只载入一次，而 `executor` 是模块级单例
+        （`executor = LocalExecutor()`）—— 于是控制台改完模板，**运行中的实例仍用旧模板**，
+        直到重启。这正是本项目反复出现的「改了没生效」。控制台的
+        `reload_for("invocation_templates")` 现在会调它。
+        """
+        self.templates = load_templates()
+        return len(self.templates)
 
     # ---------- 命令构造 ----------
     def build_command(self, tool: Tool, target: str, args: str = "") -> list[str]:

@@ -7,7 +7,7 @@
  *               只允许改值，键名与其它行原样保留，否则会出现「填了却没生效」）
  */
 import { api, esc, modal, toast, alertBox, reload, setFileHint }
-  from '/console-assets/core.js?v=051';
+  from '/console-assets/core.js?v=052';
 
 let TAB = 'rules';
 
@@ -78,6 +78,13 @@ async function drawTemplates(host) {
       `<option value="${esc(v)}"${(t.target || 'raw') === v ? ' selected' : ''}>${esc(v)}</option>`).join('')}</select></td>
     <td><button class="ghost sm" data-del="${i}">删除</button></td>
   </tr>`).join('');
+  // 加载期被丢弃的模板（例如手工改写导致缺 {exe}）必须显式提示 ——
+  // 否则「模板被静默忽略、走默认拼接」这件事只留在服务端日志里，等于没发现。
+  const probs = (d.problems || []).length
+    ? alertBox('high', `有 ${d.problems.length} 条模板在加载时被丢弃（不会生效）：`
+        + d.problems.map((p) => `${p.alias}（${p.why}）`).join('；')
+        + ' —— 已退回默认拼接「{exe} {args} {target}」，用的是受信任的工具路径。')
+    : '';
   host.innerHTML = `
     <div class="toolbar">
       <button class="primary" id="btnSave">预览并提交</button>
@@ -85,6 +92,7 @@ async function drawTemplates(host) {
       <span class="grow"></span>
       <span class="hint">共 ${TPL.length} 条</span>
     </div>
+    ${probs}
     <div class="table-wrap"><table>
       <thead><tr><th style="width:20%">alias</th><th>命令模板</th>
         <th style="width:14%">target 形态</th><th style="width:70px">操作</th></tr></thead>
