@@ -13,12 +13,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import uuid
 from typing import Any
 
-from . import config, redact
+from . import config, config_io, redact
+
+logger = logging.getLogger(__name__)
 
 STORE_VERSION = 1
 
@@ -115,20 +118,65 @@ def _default_providers() -> list[dict[str, Any]]:
 
 
 def _read() -> dict:
+    """读供应商配置。**解析失败时备份坏文件**再返回空，不静默丢密钥。
+
+    v053（审计 §2.5 修）：原实现 `except Exception: pass` → 返回 `{}`。
+    这个文件里存着**全部供应商与 API Key**，一旦内容坏掉（半截 JSON），
+    表现就是「供应商配置全没了、密钥也没了」，而**没有任何提示**，
+    用户只能重新填一遍 —— 而原因可能只是文件末尾缺了个 `}`。
+    现在解析失败会：① 留日志；② 把坏文件另存一份带时间戳的副本（供人工抢救），
+    这样"内容还能救回来"与"彻底丢了"是能区分的。
+    """
+    path = _file()
+    if not path.exists():
+        return {}
     try:
-        data = json.loads(_file().read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             return data
-    except Exception:
-        pass
+        logger.warning("供应商配置顶层不是对象（%s）：%r", path, type(data).__name__)
+        _backup_broken(path, "顶层非对象")
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning("供应商配置解析失败（%s）：%s", path, e)
+        _backup_broken(path, f"解析失败：{e}")
     return {}
 
 
+def _backup_broken(path, why: str) -> None:
+    """把坏掉的配置文件另存一份（尽力而为，失败只记日志）。"""
+    try:
+        import shutil
+        import time as _t
+        dst = path.with_suffix(f".broken_{_t.strftime('%Y%m%d_%H%M%S')}.json")
+        shutil.copy2(path, dst)
+        logger.warning("已备份损坏的供应商配置 → %s（%s）", dst.name, why)
+    except Exception:                                        # noqa: BLE001
+        logger.warning("备份损坏的供应商配置失败", exc_info=True)
+
+
 def _write(data: dict) -> None:
-    _file().parent.mkdir(parents=True, exist_ok=True)
-    _file().write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    """原子写供应商配置。
+
+    v053（审计 §2.5 修）：原来直接 `write_text` —— 截断后写入，进程在写入中途
+    被终止（保存瞬间关窗、断电）就留下**半截 JSON**，下次 `_read` 解析失败
+    即返回空 → 全部供应商与密钥静默丢失。
+
+    改为复用 `config_io.write_json_atomic`（临时文件 + `os.replace` 原子替换，
+    并把原始字节经 `fsync` 落盘）—— **不在这里另写一份原子写实现**：
+    同一原理落两份实现迟早漂移，这个项目已经为这类问题交过多次学费。
+
+    ⚠️ **`backup_first=False` 是刻意的**：`write_json_atomic` 默认会把写前副本放进
+    `data/console_backups/`（项目目录内）。而这个文件存着**全部 API Key**，
+    它之所以放在 `%USERPROFILE%` 就是为了「密钥不进项目仓库」；
+    一开备份就把密钥复制进项目目录了 —— 虽然 `data/console_backups/` 已 gitignored，
+    但那是在用「.gitignore 兜底」代替「根本不写进去」，方向反了。
+    配置损坏时的抢救副本由 `_backup_broken()` 负责，它写在**原位同目录**（仓库之外）。
+    """
+    res = config_io.write_json_atomic(_file(), data, backup_first=False)
+    if not res.get("ok"):
+        # 原子写失败必须让上层知道 —— 静默失败会让界面显示"已保存"而文件没变
+        raise OSError(f"写入供应商配置失败：{res.get('error')}")
+    logger.debug("供应商配置已原子写入 %s（备份 %s）", _file().name, res.get("backup") or "无")
 
 
 def _normalize(p: dict) -> dict:

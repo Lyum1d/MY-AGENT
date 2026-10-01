@@ -361,13 +361,47 @@ def _first_unauthorized_host_in_text(text: str, scope_list: list[str]) -> str:
     return ""
 
 
+def _read_text_multi_encoding(p: Path) -> str | None:
+    """多编码尝试读取目标列表文件；**全部失败返回 None**（调用方按 fail-closed 拒绝）。
+
+    v053（审计 §2.4 修）：原来固定 `encoding="utf-8", errors="replace"` ——
+    对 GBK / UTF-16LE（Windows 上很常见）会解出一堆替换字符，
+    `find_hosts` 可能一个主机都抽不出来，于是**校验看起来跑了、其实什么都没查**：
+    正是本项目最忌讳的「配了看起来生效、其实没生效」。
+
+    两条刻意的取舍：
+      · **严格解码，不用 `errors="replace"`** —— 宁可拒绝，也不要带着乱码继续查；
+      · **UTF-16 仅在带 BOM 时才试** —— 无 BOM 时 `utf-16` 能"成功"解出任意偶数长度
+        字节串（多半是乱码），那等于把上面那个坑换个地方重挖。
+    顺序按命中率排：UTF-8（带/不带 BOM）→ GBK → 带 BOM 的 UTF-16。
+    """
+    try:
+        raw = p.read_bytes()
+    except OSError:
+        return None
+    encs = ["utf-8-sig", "utf-8", "gbk"]
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        encs.append("utf-16")
+    for enc in encs:
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return None
+
+
 def first_unauthorized_target_list_in_argv(tokens: list[str]) -> tuple[str, str] | None:
     """扫描 argv 中「目标列表旗标 + 文件路径」，校验文件内容是否含未授权主机。
 
-    返回 (旗标, 未授权主机) 或 None（无列表参数 / 文件不可读 / 内容全部授权）。
+    返回 (旗标, 未授权主机) 或 None。第二个元素可能是**哨兵值**而非主机名：
+      · `"<oversized>"`  —— 文件超过 TARGET_LIST_MAX_BYTES
+      · `"<unreadable>"` —— 文件存在但读取/解码失败（fail-closed）
+    调用方必须对哨兵值单独措辞（不要再拼成「文件中包含目标「<oversized>」」）。
+
     - 旗标后无值（下一个 token 以 - 开头或不存在）→ 交由工具自行报错，放行；
-    - 文件不存在 / 无法读取 → 放行（执行时工具会因文件缺失而失败，不是授权问题）；
-    - 文件超过 TARGET_LIST_MAX_BYTES → 返回 (旗标, "<oversized>")，按拒绝处理。
+    - **文件不存在** → 放行（执行时工具会因文件缺失而失败，不是授权问题）；
+    - 文件存在但没有读权限 / 解码失败 → **拒绝**（见 _read_text_multi_encoding）；
+    - 文件超过 TARGET_LIST_MAX_BYTES → 拒绝。
     白名单为空时返回 ('', '')，由调用方按 fail-closed 处理。
     """
     scope_list = load_scope()
@@ -384,12 +418,19 @@ def first_unauthorized_target_list_in_argv(tokens: list[str]) -> tuple[str, str]
         p = Path(path)
         try:
             if not p.is_file():
+                # 不存在：工具自己会报错，不是授权问题 → 放行（原意保留）
                 continue
             if p.stat().st_size > TARGET_LIST_MAX_BYTES:
                 return tok, "<oversized>"
-            text = p.read_text(encoding="utf-8", errors="replace")
+            text = _read_text_multi_encoding(p)
         except OSError:
-            continue
+            # v053（审计 §2.4 修）：**存在但读不了 → 拒绝**。
+            # 原来的 `continue` 把「存在但不可读」也放行了，而注释里给的理由
+            # （「执行时工具会因文件缺失而失败」）只对**不存在**的文件成立。
+            # 权限被改、被独占锁定、路径其实是目录等都会落到这里。
+            return tok, "<unreadable>"
+        if text is None:
+            return tok, "<unreadable>"
         bad = _first_unauthorized_host_in_text(text, scope_list)
         if bad:
             return tok, bad

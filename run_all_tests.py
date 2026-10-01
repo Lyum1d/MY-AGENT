@@ -102,6 +102,7 @@ PY_TESTS = [
     ("py_exec 能力分档·交互式工具·超时口径（v047）", "test_047_fixes.py", False),
     ("文档契约·getattr 例外·任务级约束闸门（v048）", "test_048_fixes.py", False),
     ("配置控制台·口令闸门·白名单 CRUD（v050）", "test_console_api.py", False),
+    ("外部审计修复·输出回填·响铃·列表文件·原子写（v053）", "test_053_audit_fixes.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),
@@ -286,9 +287,53 @@ def run_cmd(args: list[str], timeout: int = 600) -> tuple[int, str]:
         return 124, f"超时（>{timeout}s）"
 
 
+def preflight_tmp_writable() -> str:
+    """跑回归前先确认「临时目录能写」。返回空串表示通过，否则返回一句诊断。
+
+    为什么要有这一步（v053，来自一次外部审计的教训）：
+    那次审计在受限沙箱里跑回归，**42 个套件统一用 `tempfile.mkdtemp` 建临时根**，
+    而那个环境里 `mkdtemp` **成功返回路径、随后任何写入都被拒** ——
+    于是 41 个套件以 `sqlite3.OperationalError: unable to open database file` 异常退出。
+    审计方花了大量时间去判断"这是项目缺陷还是环境缺陷"，最后只能写进报告的「局限」一节。
+
+    这类失败的特征是**症状离原因很远**（现象是"数据库打不开"，真因是沙箱 ACL），
+    所以值得在入口处直接判掉并说清楚：**这是环境问题，不是回归失败**。
+    判定方式就用一次真实的「建目录 → 写文件 → 删文件」，不猜权限。
+    """
+    import shutil
+    import tempfile as _tf
+    try:
+        d = _tf.mkdtemp(prefix="src_agent_preflight_")
+    except Exception as e:                                   # noqa: BLE001
+        return (f"临时目录无法创建（{type(e).__name__}: {e}）。"
+                "请检查 TMPDIR/TEMP 是否可写。")
+    try:
+        p = os.path.join(d, "probe.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("ok")
+        if open(p, encoding="utf-8").read() != "ok":
+            return f"临时目录写入后内容不符：{d}"
+    except Exception as e:                                   # noqa: BLE001
+        return (
+            f"**临时目录创建成功但不可写**（{d}）：{type(e).__name__}: {e}\n"
+            "  → 这会让所有用 `tempfile.mkdtemp` 建临时根的套件异常退出，"
+            "症状通常是 `sqlite3.OperationalError: unable to open database file`。\n"
+            "  → **这是运行环境问题，不是被测代码的缺陷**（已知场景：受限沙箱为新建目录"
+            "植入了对检查 API 不可见的拒绝项）。\n"
+            "  → 建议：把临时根换到工作区内（`os.makedirs` 方式创建），或在可写环境重跑。")
+    finally:
+        try:
+            shutil.rmtree(d)
+        except Exception:                                    # noqa: BLE001
+            pass
+    return ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="一键跑全部回归测试")
     ap.add_argument("--quick", action="store_true", help="跳过需要起服务的端到端测试")
+    ap.add_argument("--ignore-env", action="store_true",
+                    help="环境自检不通过时也强行继续（默认直接终止）")
     # 注意：重定向到文件时 print 默认块缓冲，汇总会卡在缓冲区里看不见
     args = ap.parse_args()
     try:
@@ -308,6 +353,18 @@ def main() -> int:
     print(f"  解释器：{PY}")
     if py_note:
         print(f"  {py_note}")
+
+    # 环境自检（v053）：临时目录不可写会让几十个套件以"数据库打不开"的形态异常退出，
+    # 而真因与代码无关。宁可在这里直接停下并说清楚，也别让人对着 41 个异常猜。
+    _pre = preflight_tmp_writable()
+    if _pre and not args.ignore_env:
+        print("\n  [环境自检] 未通过 —— 已终止，避免把环境问题误读成回归失败：")
+        for _ln in _pre.splitlines():
+            print("    " + _ln)
+        print("\n  如确认要在此环境硬跑（结果不可信），加 --ignore-env。")
+        return 2
+    print("  [环境自检] 临时目录可写 ✓"
+          if not _pre else "  [环境自检] 未通过，但 --ignore-env 已指定，继续……")
 
     need_server = not args.quick
     if need_server:

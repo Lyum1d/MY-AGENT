@@ -855,6 +855,27 @@ class SessionManager:
 sessions = SessionManager()
 
 
+def l4_no_output_feedback(tool_name: str, raw_output: str) -> str:
+    """「执行成功但无任何输出」时回喂给模型的内容（归因 L4）。
+
+    v053（审计 §2.1）修 + **抽成纯函数**：
+      · 原实现直接赋值覆盖，把原始输出整条丢掉 —— 退出码 0 但输出全是 `[错误]` 行时，
+        执行器的真实报错被吞，模型只看到「这面不存在」而换方向（正确动作是修参数/换工具）；
+      · 抽出来的理由是可测：这段逻辑原本内联在约 750 行的 `run()` 里，
+        审计方只能**复刻**一段等价代码来举证（那证明不了真实代码的行为）。
+        现在测试可以直接断言「原文必须出现在回喂内容里」。
+    """
+    raw = raw_output or "（工具无输出）"
+    return (
+        f"【{tool_name} 执行成功但无任何输出｜归因 L4】"
+        f"原始输出：\n{raw}\n"
+        "（若上面出现 `[错误]` 行，那是执行器在报错而**不是**「目标不存在该测试面」——"
+        "先按报错原文修参数或换工具。）\n"
+        "若确实没有任何输出，这可能说明目标不存在该测试面。"
+        "不要用同样参数重复调用，换一个方向或换一种手法再验证。"
+    )
+
+
 class Agent:
     def __init__(self, backend_name: str | None = None) -> None:
         # 不在初始化时钉死后端：留 None，run() 时取运行时当前后端，
@@ -2497,6 +2518,36 @@ class Agent:
     async def _execute(self, session: Session, step: Step, tool_call_id: str) -> None:
         tool = registry.get_by_alias(step.tool_alias)
         if tool is None:
+            # v053（审计 §2.2 修）：**不能静默 return**。
+            # 原实现这里什么都不做就返回，于是三件事同时发生：
+            #   ① `tool_calls`（assistant 消息里声明的调用列表）与 `role=tool` 回复
+            #      **失配** —— OpenAI 兼容端点会直接 400，整轮对话卡死；
+            #   ② `step.status` 停在构造时的 `"pending"`，而调用方只认 done/error
+            #      （见 `if step.status == "done" … elif "error"`）→ **失败计数不累加**，
+            #      连续失败熔断形同虚设；
+            #   ③ 不发事件、不落库 → 事件流里这一步凭空消失，界面看起来"卡住了"。
+            # 主路径已在 `registry.resolve(alias)` 处校验过，正常到不了这里；
+            # 但别名来自落库字段（adopt 续聊 / 外部构造都可能与当前清单不符），
+            # 属于纵深防御位点 —— 这里应该**响铃**而不是静默。
+            # 处理方式与上面「工具不存在」分支（`if tool is None:` 那处）保持一致。
+            step.status = "error"
+            step.finished_at = time.time()
+            step.output = (f"[错误] 工具别名 {step.tool_alias} 在当前工具清单中不存在"
+                           "（可能是历史会话留下的旧别名，或工具清单已变更）。本步未执行。")
+            await session.emit({"type": "step_start", "step": self._step_dict(step)})
+            await session.emit({"type": "error",
+                                "data": f"已拦截不存在的工具别名：{step.tool_alias}"})
+            session.messages.append({
+                "role": "tool", "tool_call_id": tool_call_id,
+                "content": step.output + " 请从当前可用工具清单中重新选择工具，不要沿用这个别名。",
+            })
+            logger.warning("拦截不存在的工具别名（_execute 纵深防御）：alias=%r",
+                           step.tool_alias)
+            try:
+                store.save_step(session.id, self._step_dict(step))
+            except Exception:
+                pass
+            await session.emit({"type": "step_done", "step": self._step_dict(step)})
             return
 
         step.status = "running"
@@ -2599,11 +2650,15 @@ class Agent:
             step.attribution = "L4"
             # 退出码 0 但完全没有输出：多数情况说明「这个面不存在」，
             # 明确告诉模型这本身算一种结论，别重复调用同一工具同一参数。
-            content = (
-                f"【{step.tool_name} 执行成功但无任何输出｜归因 L4】"
-                "这可能说明目标不存在该测试面。不要用同样参数重复调用，"
-                "换一个方向或换一种手法再验证。"
-            )
+            #
+            # v053（审计 §2.1 修）：**必须回填原始输出**。原实现这里写的是
+            # `content = (...)` —— 直接赋值覆盖，把上面刚算好的 content（= step.output）
+            # 整条丢掉。后果不是"少显示一段"：退出码 0 但输出**全是 `[错误]` 行**的场景
+            # （执行器自身报错、被前置逻辑拦下等），原始报错原文被吞掉，
+            # 模型只看到「这可能说明目标不存在该测试面」→ **误判成"这面不用做"而换方向**，
+            # 而正确动作是修参数或换工具。这与 `_attribute_failure` 分层归因的目的正好相反。
+            # 现在与上面 `if not ok:` 分支统一为「追加原文，而非替换」。
+            content = l4_no_output_feedback(step.tool_name, content)
         if len(content) > config.MAX_OUTPUT_CHARS:
             content = content[: config.MAX_OUTPUT_CHARS] + f"\n…（输出过长已截断，共 {len(step.output)} 字符）"
         session.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": content})

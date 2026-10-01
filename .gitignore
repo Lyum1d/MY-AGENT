@@ -65,3 +65,11 @@ data/runtime_overrides.json
 data/*corrupt*
 data/*.bak_*
 .git_broken*/
+
+# 审计/排障临时目录（本机一次性产物，含测试 DB 与权限还原记录，不要入库）
+/.audit-tmp/
+/.acl-recovery/
+
+# 外部审计报告（v053）：属审计方产物，不是项目交付物；且含真实域名与内部细节，
+# 不该随公开仓库发布。保留在本机工作区供查阅。
+审计报告.md
