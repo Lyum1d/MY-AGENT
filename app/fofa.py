@@ -22,24 +22,11 @@ from . import config
 FOFA_API = "https://fofa.info/api/v1/search/all"
 
 
-def _parse_flat_yaml(text: str) -> dict:
-    """无 pyyaml 时的极简解析：只支持本项目 config.yaml 用到的扁平 key: value。
-
-    背景：config.yaml 此前只在装了 pyyaml 时才能读，而 requirements.txt 没声明该依赖，
-    导致 FOFA 永远提示「未配置」。这里补一个内置兜底，装不装 pyyaml 功能都可用。
-    不追求通用 YAML 语义（嵌套/列表/多行），够用即可；有 pyyaml 时优先走 pyyaml。
-    """
-    out: dict[str, object] = {}
-    for line in (text or "").splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line or ":" not in line or line.startswith("-"):
-            continue
-        key, val = line.split(":", 1)
-        key, val = key.strip(), val.strip().strip('"').strip("'")
-        if not key:
-            continue
-        out[key] = int(val) if val.isdigit() else val
-    return out
+# v056：解析器已抽到中性模块 app/flat_config.py（config.py 也要用它，
+# 而 fofa 在模块级 import config，直接互相依赖会循环）。
+# 这里**保留 `_parse_flat_yaml` 这个名字**只是为了不动既有调用点
+# （`_load_fofa_conf` 与 `console_api._flat_yaml`），实现只有一份。
+from .flat_config import parse_flat_yaml as _parse_flat_yaml
 
 
 def _load_fofa_conf() -> dict[str, str]:

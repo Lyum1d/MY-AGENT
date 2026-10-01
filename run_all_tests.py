@@ -103,6 +103,7 @@ PY_TESTS = [
     ("文档契约·getattr 例外·任务级约束闸门（v048）", "test_048_fixes.py", False),
     ("配置控制台·口令闸门·白名单 CRUD（v050）", "test_console_api.py", False),
     ("外部审计修复·输出回填·响铃·列表文件·原子写（v053）", "test_053_audit_fixes.py", False),
+    ("隐私修复·工具箱路径不写死（v056）", "test_056_privacy_fixes.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

@@ -21,7 +21,7 @@
     }
   },
   "dirsearch": {
-    "caveat": "target 由系统自动以 -u 注入，不要在 args 里重复写 -u（重复会导致崩溃）。不要臆造本工具不支持的旗标（如 --depth 会触发 'no such option' 报错退出）；如需限定扩展名请用 -e（例如 -e php,html）。【字典用法·v039】本工具的默认字典在**工具箱自己的目录**里（E:\\...\\tools\\gui_scan\\dirsearch\\db\\），而 py_exec 的会话目录与它是**两套执行环境**，历史上有过传 py_exec 落盘字典报 'wordlist does not exist' 的实测失败。**推荐做法**：① 用平台内置小字典，传绝对路径 `-w \\\"C:\\\\Users\\\\Lianaxber\\\\WorkBuddy\\\\2026-08-29-08-01-25\\\\src-agent\\\\data\\\\wordlists\\\\common-small.txt\\\"`（约 60 条，敏感后缀已分散排布）；② 或不传 -w 用其自带字典（但条数多、耗时不可控）。**低配额目标建议改用 py_exec + safe_http_request 逐点探测**（串行、配额精确、每步可解释）。",
+    "caveat": "target 由系统自动以 -u 注入，不要在 args 里重复写 -u（重复会导致崩溃）。不要臆造本工具不支持的旗标（如 --depth 会触发 'no such option' 报错退出）；如需限定扩展名请用 -e（例如 -e php,html）。【字典用法·v039】本工具的默认字典在**工具箱自己的目录**里（E:\\...\\tools\\gui_scan\\dirsearch\\db\\），而 py_exec 的会话目录与它是**两套执行环境**，历史上有过传 py_exec 落盘字典报 'wordlist does not exist' 的实测失败。**推荐做法**：① 用平台内置小字典，传绝对路径 `-w \\\"data\\\\wordlists\\\\common-small.txt\\\"`（约 60 条，敏感后缀已分散排布）；② 或不传 -w 用其自带字典（但条数多、耗时不可控）。**低配额目标建议改用 py_exec + safe_http_request 逐点探测**（串行、配额精确、每步可解释）。",
     "allowed_flags": [
       "--url",
       "--bypass",

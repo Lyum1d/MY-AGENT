@@ -282,4 +282,7 @@ def export_report(project_id: str) -> str:
 
 
 def toolbox_root() -> str:
+    # v056：未配置时返回明确文案，而不是让人以为工具箱在 "./"
+    if not getattr(config, "TOOLBOX_ROOT_SET", True):
+        return "（未配置 TOOLBOX_ROOT）"
     return str(config.TOOLBOX_ROOT)

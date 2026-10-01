@@ -12,13 +12,51 @@ WEB_DIR = APP_DIR / "web"
 DATA_DIR.mkdir(exist_ok=True, parents=True)
 
 # 天狐渗透工具箱根目录。
-# 团队协作时每位成员工具箱存放位置不同，优先读环境变量 TOOLBOX_ROOT；
-# 未设置时回退到本机默认路径（仅作个人兜底，不要依赖它跨机生效）。
-TOOLBOX_ROOT = Path(
-    os.getenv(
-        "TOOLBOX_ROOT",
-        r"E:\BaiduNetdiskDownload\天狐渗透工具箱-社区版V3.0+4.0更新升级包\天狐渗透工具箱-社区版V3.0",
-    )
+#
+# v056 改：**不再写死默认路径**。原来这里硬编码了一个本机绝对路径
+#   `E:\<网盘下载目录>\天狐渗透工具箱-…`
+# 带来三重问题：
+#   ① **隐私**：公开仓库里暴露作者的本机目录结构（同一问题在
+#      `data/wordlists/common-small.txt` 与 `data/tool_overrides.json` 也各有一处，一并修掉）；
+#   ② **可用性**：这条路径在任何人机器上都不存在，而它被当成"默认值"——
+#      新 clone 的人得不到「未配置」的明确提示，只会看到一堆"工具文件缺失"；
+#   ③ **违反本项目自己的约定**：项目说明写着「工具箱路径由环境变量 TOOLBOX_ROOT
+#      指定，**不要写死路径**」。
+#
+# 现在按三级解析（越靠前越优先）：
+#   1. 环境变量 `TOOLBOX_ROOT` —— 跨机协作的正规做法，也是文档里的说法；
+#   2. 本机 `config.yaml` 的 `toolboxRoot` —— 该文件**不入库**，天然适合放本机路径；
+#      项目已经用它存 FOFA 密钥与控制台口令，**不新增机制**；
+#   3. 都没有 → 视为**未配置**（`TOOLBOX_ROOT_SET = False`），由 registry / health /
+#      启动信息给出"请先配置"的明确提示，而不是含糊的"找不到工具清单"。
+def _toolbox_root_raw() -> str:
+    """工具箱根目录的原始字符串（未配置时为空串）。"""
+    env = (os.getenv("TOOLBOX_ROOT") or "").strip()
+    if env:
+        return env
+    # 从中性模块读，**不反向依赖 config** —— 否则与 fofa.py 形成循环导入
+    from .flat_config import read_flat_yaml
+    v = str(read_flat_yaml(APP_DIR / "config.yaml").get("toolboxRoot") or "").strip()
+    # 扁平解析器**不做 YAML 转义处理**：若有人按 YAML 习惯写成
+    #     toolboxRoot: "D:\\tbox"      （双反斜杠）
+    # 解出来就是 `D:\\tbox`（两个反斜杠）→ 路径是错的，且报错信息看着还挺像。
+    # 这里把连续双反斜杠折成单个，让「裸写」与「带引号双写」两种写法都能用。
+    # ⚠️ 例外：UNC 路径（`\\server\share`）本来就以双反斜杠开头，不能折。
+    if v and not v.startswith("\\\\"):
+        v = v.replace("\\\\", "\\")
+    return v
+
+
+TOOLBOX_ROOT_RAW = _toolbox_root_raw()
+TOOLBOX_ROOT_SET = bool(TOOLBOX_ROOT_RAW)
+# 未配置时用空 Path（在 Windows 上等价于当前目录）。**不要**把它当有效路径用：
+# 消费方必须先看 TOOLBOX_ROOT_SET —— health / registry / run.py 都已按此处理。
+TOOLBOX_ROOT = Path(TOOLBOX_ROOT_RAW) if TOOLBOX_ROOT_SET else Path("")
+
+TOOLBOX_ROOT_HELP = (
+    "未配置工具箱根目录。请任选一种方式："
+    "① 设置环境变量 TOOLBOX_ROOT=<天狐渗透工具箱根目录>；"
+    "② 在本机 config.yaml 写 `toolboxRoot: <路径>`（该文件不入库）。"
 )
 
 # ---------- 工具箱内置运行时 ----------

@@ -8,7 +8,7 @@
 #   3. 只放**通用敏感路径**（后台/配置/备份/上传/接口文档），不放业务路径。
 #
 # 用法（dirsearch）：
-#   -w "C:\Users\Lianaxber\WorkBuddy\2026-08-29-08-01-25\src-agent\data\wordlists\common-small.txt"
+#   -w "data\wordlists\common-small.txt"
 #   -t 1 --delay 1 --max-time 180 -i 200,301,302,403
 #
 # 注意：不要把本文件路径替换成 py_exec 会话目录下的临时文件 —— dirsearch 与 py_exec

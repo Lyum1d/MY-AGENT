@@ -351,8 +351,13 @@ async def health():
         scope_warn = ("授权白名单为空（data/scope.json 缺失或解析失败）：所有命令行工具、"
                       "HTTP 重放器与 py_exec 都会被拒绝执行。")
     return {
-        "toolbox": str(config.TOOLBOX_ROOT),
-        "toolbox_exists": config.TOOLBOX_ROOT.exists(),
+        # v056：未配置时 `TOOLBOX_ROOT` 是空 Path（= 当前目录），
+        # 直接 str() 会显示 "."、exists() 会是 True —— **那样 health 就在说谎**。
+        # 所以显式区分"未配置"与"配了但目录不存在"。
+        "toolbox": str(config.TOOLBOX_ROOT) if config.TOOLBOX_ROOT_SET else "",
+        "toolbox_configured": config.TOOLBOX_ROOT_SET,
+        "toolbox_exists": config.TOOLBOX_ROOT_SET and config.TOOLBOX_ROOT.exists(),
+        "toolbox_hint": "" if config.TOOLBOX_ROOT_SET else config.TOOLBOX_ROOT_HELP,
         "registry": registry.stats(),
         "llm": llm,
         "current_backend": backend.name,

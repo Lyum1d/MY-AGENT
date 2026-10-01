@@ -202,8 +202,12 @@ def main():
     print("=" * 60)
     print("  SRC 渗透 Agent · 本地控制台")
     print("=" * 60)
-    print(f"  工具箱：{config.TOOLBOX_ROOT}")
-    print(f"  工具箱存在：{config.TOOLBOX_ROOT.exists()}")
+    # v056：未配置时不要说 "./" 与 True（那会让人以为没问题）
+    if config.TOOLBOX_ROOT_SET:
+        print(f"  工具箱：{config.TOOLBOX_ROOT}")
+        print(f"  工具箱存在：{config.TOOLBOX_ROOT.exists()}")
+    else:
+        print(f"  工具箱：**未配置** —— {config.TOOLBOX_ROOT_HELP}")
     print(f"  模型：{config.OLLAMA_MODEL} @ {config.OLLAMA_BASE_URL}")
     print(f"  地址：{url}")
     print("=" * 60)

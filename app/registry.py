@@ -204,7 +204,12 @@ class ToolRegistry:
 
         tools_json = config.TOOLBOX_ROOT / "config" / "tools.json"
         if not tools_json.exists():
-            self.errors.append(f"找不到工具清单：{tools_json}")
+            # v056：区分「没配工具箱根目录」与「配了但这个路径下没有清单」——
+            # 前者是新 clone 的常见状态，含糊的"找不到工具清单"会让人去翻文件系统。
+            if not getattr(config, "TOOLBOX_ROOT_SET", True):
+                self.errors.append(config.TOOLBOX_ROOT_HELP)
+            else:
+                self.errors.append(f"找不到工具清单：{tools_json}")
             return self
 
         raw = json.loads(tools_json.read_text(encoding="utf-8"))
