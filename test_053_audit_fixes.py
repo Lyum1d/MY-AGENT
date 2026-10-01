@@ -194,6 +194,50 @@ def test_target_list_file():
         r = scope.first_unauthorized_target_list_in_argv(["t.exe", "-l", str(big)])
         check("超过大小上限 → 拒绝且标记 <oversized>",
               r is not None and r[1] == "<oversized>", str(r))
+
+        # ---------- v054：审计二次复核发现的两处「仍会静默放行」 ----------
+        print("  -- v054 补：目录路径 / 二进制「成功」解码 --")
+
+        # §3.1 目录路径：原来 `is_file()` 为 False 就 continue → 静默放行
+        adir = TMP / "adir_054"
+        adir.mkdir(exist_ok=True)
+        r = scope.first_unauthorized_target_list_in_argv(["t.exe", "-l", str(adir)])
+        check("「-l 指向目录」→ 拒绝（原来静默放行；且旧注释声称会走 OSError 分支，实际不可达）",
+              r is not None and r[1] == "<unreadable>", str(r))
+
+        # §3.2 二进制被「成功」解码：该串以 FF FE 开头 → 命中 UTF-16 BOM 白名单，
+        # 即使后面是二进制也会"解码成功"，解出含私有使用区码位的乱码 → 抽不出主机 → 放行
+        binfile = TMP / "bin_054.txt"
+        binfile.write_bytes(bytes([0xFF, 0xFE, 0x00, 0x81, 0x99, 0xAB, 0xCD, 0xEF]))
+        r = scope.first_unauthorized_target_list_in_argv(["t.exe", "-l", str(binfile)])
+        check("二进制文件（带 UTF-16 BOM、能被「成功」解码）→ 拒绝（原来静默放行）",
+              r is not None and r[1] == "<unreadable>", str(r))
+        # 判据是**字符类**而非"控制字符占比"：该例解出 0 个控制字符，但有私有使用区码位
+        check("字符类判据能识别这类乱码（含私有使用区码位）",
+              scope._looks_like_text("脀ꮙ\uefcd") is False,
+              repr(scope._looks_like_text("脀ꮙ\uefcd")))
+        check("正常中文文本仍判为文本（不能误伤）",
+              scope._looks_like_text("扫描目标如下\nevil.example.net\n") is True)
+        check("正常 ASCII 主机列表仍判为文本",
+              scope._looks_like_text("a.test\nsub.a.test\n") is True)
+        check("空文本判为文本（空文件不该被当成乱码）",
+              scope._looks_like_text("") is True)
+
+        # 反例：正常文件必须照常工作（这两处修复不能顺带误伤）
+        for label, data, want in (
+                ("UTF-8 全授权", "a.test\nsub.a.test\n".encode(), None),
+                ("含未授权", "a.test\nevil.example.net\n".encode(), "evil.example.net"),
+                ("GBK 中文注释", "扫描目标\nevil.example.net\n".encode("gbk"),
+                 "evil.example.net"),
+                ("带 BOM 的 UTF-16", "evil.example.net\n".encode("utf-16"),
+                 "evil.example.net"),
+                ("空文件", b"", None),
+                ("只有注释", "# 说明\n\n".encode(), None)):
+            p = TMP / f"c054_{abs(hash(label))}.txt"
+            p.write_bytes(data)
+            r = scope.first_unauthorized_target_list_in_argv(["t.exe", "-l", str(p)])
+            got = r[1] if r else None
+            check(f"未误伤：{label}", got == want, f"{got!r}（期望 {want!r}）")
     finally:
         config.SCOPE_FILE = saved
 

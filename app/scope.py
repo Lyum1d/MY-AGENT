@@ -361,6 +361,37 @@ def _first_unauthorized_host_in_text(text: str, scope_list: list[str]) -> str:
     return ""
 
 
+def _looks_like_text(s: str) -> bool:
+    """解码"成功"了但结果不像文本 → 判定为解码失败（v054，审计 §3.2 复核发现）。
+
+    为什么"严格解码"还不够：**能"成功"解出二进制的编码不止一个**。
+      · 无 BOM 的 `utf-16` 能解出任意偶数长度字节串 —— 已用「仅带 BOM 才试」挡住；
+      · **带 BOM 的 `utf-16`** 同样危险：文件恰好以 `FF FE`/`FE FF` 开头时，
+        后面哪怕是二进制也会被"成功"解出来（实测：`ff fe 00 81 99 ab cd ef`
+        → `'脀ꮙ\uefcd'`）；
+      · `gbk` 是双字节编码，**绝大多数**字节对都合法，性质相同。
+    于是「解码失败 → fail-closed」这条防线在这些编码上会被绕过：解出乱码 →
+    `find_hosts` 抽不出主机名 → **静默放行**（正是本项目最忌讳的形态）。
+
+    判据用**字符类**而不是"控制字符占比"：上面那个例子解出来 0 个控制字符，
+    但含**私有使用区**码位（U+E000–U+F8FF）—— 那是误码的典型落点，
+    而正常的目标列表（ASCII 主机名 / 中文注释）不会出现它。
+    """
+    if not s:
+        return True                     # 空文件不算"不像文本"
+    bad = 0
+    for ch in s:
+        o = ord(ch)
+        if (ch == "\ufffd"                                  # 替换字符
+                or (o < 32 and ch not in "\t\r\n")           # 控制字符（保留制表/换行）
+                or o == 0x7F
+                or 0xE000 <= o <= 0xF8FF                     # 私有使用区
+                or 0xFFF0 <= o <= 0xFFFF):                   # 特殊区（含 FFFD 之外的非字符）
+            bad += 1
+    # 容忍 1%：正常文本里偶尔会出现罕见的合法码位，但不会成片出现
+    return bad / max(len(s), 1) <= 0.01
+
+
 def _read_text_multi_encoding(p: Path) -> str | None:
     """多编码尝试读取目标列表文件；**全部失败返回 None**（调用方按 fail-closed 拒绝）。
 
@@ -374,19 +405,28 @@ def _read_text_multi_encoding(p: Path) -> str | None:
       · **UTF-16 仅在带 BOM 时才试** —— 无 BOM 时 `utf-16` 能"成功"解出任意偶数长度
         字节串（多半是乱码），那等于把上面那个坑换个地方重挖。
     顺序按命中率排：UTF-8（带/不带 BOM）→ GBK → 带 BOM 的 UTF-16。
+
+    v054（审计 §3.2 复核）：解码成功后**再加一道字符类判据**（见 `_looks_like_text`）——
+    因为能"成功"解出二进制的编码不止一个，"解码没抛异常"并不等于"解出来的是文本"。
     """
     try:
         raw = p.read_bytes()
     except OSError:
         return None
+    if not raw:
+        return ""                       # 空文件：交给调用方按"内容为空"处理
     encs = ["utf-8-sig", "utf-8", "gbk"]
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
         encs.append("utf-16")
     for enc in encs:
         try:
-            return raw.decode(enc)
+            text = raw.decode(enc)
         except (UnicodeDecodeError, LookupError):
             continue
+        if not _looks_like_text(text):
+            # 解"成功"了但不像文本（二进制/未知编码）→ 继续试下一种；全都不行就返回 None
+            continue
+        return text
     return None
 
 
@@ -417,17 +457,23 @@ def first_unauthorized_target_list_in_argv(tokens: list[str]) -> tuple[str, str]
             continue
         p = Path(path)
         try:
-            if not p.is_file():
-                # 不存在：工具自己会报错，不是授权问题 → 放行（原意保留）
+            # v054（审计 §3.1 复核）：**存在但不是普通文件 → 拒绝**。
+            # 原来只有一句 `if not p.is_file(): continue`，而它对**目录**同样成立 ——
+            # 于是 `-l <目录>` 会在读取之前就 continue 掉、**静默放行**；
+            # 我 v053 写的注释「路径其实是目录等都会落到这里（OSError 分支）」
+            # **与代码不符**（`is_file()` 先返回 False 就跳走了，那条分支对目录不可达）。
+            # 现在把「不存在」与「存在但不是普通文件」分开：
+            #   · 不存在 → 放行（工具自己会报错，不是授权问题）；
+            #   · 存在但不是普通文件（目录/设备/命名管道…）→ 无法校验内容 → fail-closed。
+            if not p.exists():
                 continue
+            if not p.is_file():
+                return tok, "<unreadable>"
             if p.stat().st_size > TARGET_LIST_MAX_BYTES:
                 return tok, "<oversized>"
             text = _read_text_multi_encoding(p)
         except OSError:
-            # v053（审计 §2.4 修）：**存在但读不了 → 拒绝**。
-            # 原来的 `continue` 把「存在但不可读」也放行了，而注释里给的理由
-            # （「执行时工具会因文件缺失而失败」）只对**不存在**的文件成立。
-            # 权限被改、被独占锁定、路径其实是目录等都会落到这里。
+            # 存在但读不了（权限被改、被独占锁定等）→ 拒绝
             return tok, "<unreadable>"
         if text is None:
             return tok, "<unreadable>"
