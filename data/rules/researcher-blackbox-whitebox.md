@@ -1,49 +1,53 @@
-# Playwright Browser MCP — Always Prefer for Browser Work
+# 黑白盒漏洞研究方法论（researcher）
 
-This rule applies to **every session**. The official Claude Code browser-control MCP is **Playwright MCP** (`@playwright/mcp`), configured globally as the Grok MCP server named `playwright`.
+> ⚠️ **本文头部为重建内容**（原文不可恢复）。丢失与重建的明细见文末「重建记录」，
+> 正文中凡重建之处均标有 ⚠️。**该文件的原文从未进入 git，上游包仓库也没有更早版本。**
 
-## Mandatory tool routing
+## 1. 用途
 
-Whenever the user asks to do any of the following, **do not** use shell/`npx playwright` scripts, raw Chrome CDP hacks, or built-in `web_fetch`/`open_page` as a substitute for interactive control:
+黑盒与白盒是**同一套研究方法的两条腿**：黑盒靠请求试探目标的**行为**，
+白盒靠阅读目标的**实现**。二者产出都汇入 `vuln-report-format` 的取舍闸门，
+**落不落只认那份格式**。
 
-- open / control a real browser
-- click, type, scroll, fill forms, submit
-- take page snapshots / screenshots of a live UI
-- verify UI after code changes
-- navigate multi-step web flows
-- extract content that needs JS rendering or authenticated pages
-- generate PDF from a page
-- run browser-based QA / smoke checks
+- 黑盒的价值筛选与能力矩阵 → 见 §6（此处不重复）；
+- 白盒的完整流程（索引 → 定候选 → 判可达 → 变体分析 → 出证据）→ 见 §3。
 
-**Always:**
+## 2. 共同纪律
 
-1. Call `search_tool` with query like `playwright browser navigate snapshot click` (or the needed action) first.
-2. Call the discovered tools via `use_tool` with fully-qualified names such as `playwright__browser_navigate`, `playwright__browser_snapshot`, `playwright__browser_click`, etc.
-3. Prefer **accessibility snapshots** over screenshots when understanding page structure; use vision/screenshot tools when visual verification is required.
-4. Keep the browser session open across multi-step tasks; do not relaunch unnecessarily.
+1. **一切发现先当候选**：模型对代码或流量的**复述不算证据**——
+   只有可被独立复核的原文片段（`文件:行号` + 该处原文 / 原始请求响应）才算；
+2. **判「不可达」也是有效结论**，必须记录，避免反复重挖同一个点；
+3. 结论要能回答四个问题：输入是否可控 / 过滤能否绕 / 前置条件 / 能否出 PoC
+   —— **答不出任一项就降级为候选**（详见 Phase 6 与 `vuln-report-format`）。
 
-## When NOT to use Playwright MCP
+> ⚠️ 原文的 §1、§2 已被覆盖、无法恢复；上面两节是按本文件其余部分（§4~§10 的体例、
+> Phase 1~6 的要求）重建的**最小必要前言**，**不保证与原意一致**。
 
-- Pure static HTTP fetch of a public URL with no interaction → built-in `web_fetch` / `web_search` is fine.
-- Local file edits, git, terminal, code analysis → built-in tools only.
-- The `playwright` MCP server is disabled or `search_tool` returns no playwright tools → report that clearly and fall back.
+## 3. 白盒源码审计流程（Phase 0～6）
 
-## Auto-invocation checklist
+### 3.0 先看哪里（优先级）
 
-Before answering browser-related requests with only text or shell:
-
-- [ ] Did I `search_tool` for playwright?
-- [ ] Did I use `playwright__*` tools for actual control?
-- [ ] Did I avoid inventing bash one-liners to drive the browser?
-
-If any checkbox fails and the task needs a real browser, **stop and call the MCP**.
-
-## Session expectation
-
-Playwright MCP is **always enabled** in `~/.grok/config.toml` as `[mcp_servers.playwright]`. Treat it as a first-class tool path, not an optional plugin the user must re-enable each time.
-） | 不可信输入最密集 |
+| # | 位置 | 为什么优先 |
+|---|---|---|
+| 1 | ⚠️ 外部输入直达危险 Sink、中途未见净化的路径 | ⚠️ 命中即高危，可达性最容易确认 |
+| 2 | ⚠️ 外部输入入口（HTTP 参数 / 文件上传 / 反序列化点 / 模板注入点） | 不可信输入最密集 |
 | 3 | 历史 CVE 相邻代码（读修复 commit → 同模块） | 同类错误会重复 |
 | 4 | 新功能 / 新 API | 测试不充分 |
+
+> ⚠️ **本表第 1、2 行的原文已丢失**（第 2 行仅「不可信输入最密集」一格是原文残留）。
+> 第 1 行按本文件 Phase 3（Sink 逆向追踪）的取向补写、第 2 行由残留依据反推位置列，
+> **均为推断，不保证与原意一致**。第 3、4 行是原文，未改动。
+
+### Phase 0：取得代码与确定范围（⚠️ 重建）
+
+> ⚠️ **Phase 0 的原文已丢失**（§10 写着「白盒 Phase0～6」，而覆盖区之后的标题从 Phase 1 开始）。
+> 按 Phase 1~6 的次序补写为**开工前三件事**，**不保证与原意一致**：
+
+1. **确认审计授权**：这份代码凭什么可以审？（开源项目 / 书面授权）——与授权红线同一条纪律；
+2. **取得完整源码**：是「可编译的完整仓库」，还是「部分文件 / 只有反编译产物」
+   —— 这决定处于**全白 / 半白 / 灰盒**哪一层，而**层级决定结论上限**；
+3. **确定审计范围**：本次看哪些模块、哪些入口；**不看的要写明**——否则「没有发现」无法解释。
+
 
 ### Phase 1：建立心智模型（不要跳过）
 
@@ -247,3 +251,27 @@ git config --global https.proxy http://127.0.0.1:7897
 ## 10. 一句话
 
 **黑盒 SRC 价值矩阵 + 落不落只认 vuln-report-format；白盒 Phase0～6；中文、可复现。**
+
+---
+
+## 11. 重建记录（v057）
+
+本文件头部曾在**源头**被污染，本次修复清掉污染并重建了丢失部分。逐条留证：
+
+| 项 | 状态 | 依据 |
+|---|---|---|
+| 第 1~43 行 Playwright 内容 | **删除**（无损） | 与 `playwright-browser-mcp.md` 前 43 行**逐字相同**，内容在该文件完整存在 |
+| 文件标题 | **重建** | 原文丢失；按 §10「黑盒 SRC 价值矩阵 + 白盒 Phase0～6」的定位取名 |
+| §1、§2 | **重建为最小必要前言** | 原文丢失、细节无法推断；只写「用途」与「共同纪律」并指向 §3/§6 |
+| §3 的标题 | **重建** | Phase 1~6 需要归属章节；§4 已存在，故补为 §3 |
+| **Phase 0** | **重建** | §10 明写「Phase0～6」，而存活标题从 Phase 1 起 → Phase 0 原文也丢了 |
+| 优先级表的**表头与前两行** | **重建**（第 2 行的依据列是原文残留） | 第 44 行 `) \| 不可信输入最密集 \|` 是表中间行的尾部 |
+| 表的第 3、4 行、Phase 1~6、§4~§10 | **原文，未改动** | — |
+
+**为什么是重建而不是恢复**：该文件在本地仓库里**只有 1 个提交**（引入即破损）；
+上游包仓库 `baianquanzu/6kskill` 的 `main` 与本机快照是**同一个 commit**，也没有更早版本。
+**三处都查过，原文不可得。**
+
+**给下一位读者的提醒**：本文件里凡标 ⚠️ 的段落是**推断**，不是原始方法论。
+若日后拿到原始方法论包，应当用**原文覆盖**这些段落，而不是在其上继续叠加
+——这正是当初出问题的原因（在破损的底子上继续写）。
