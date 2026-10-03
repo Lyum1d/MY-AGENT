@@ -21,6 +21,7 @@ from . import config, store
 from . import graph
 from . import kb, fofa
 from .codebase import tools as codebase_tools          # v063 白盒 code_* 的执行体
+from .codebase import evidence as codebase_evidence    # v064 白盒证据主闸门
 from .codebase.tools import ALIASES as CODE_TOOL_ALIASES
 from . import pyexec
 from . import pyexec_grade
@@ -44,8 +45,9 @@ logger = logging.getLogger(__name__)
 #   ① 不进「本轮已尝试过的工具」提醒 → 模型可能反复读同一篇、反复搜同一个词；
 #   ② search_history 只搜 steps 表 → 这些动作检索不到；
 #   ③ 审计层面没有任何痕迹（只有 SSE 里一闪而过的 reasoning）。
-# 这个集合同时用于「按内容回查事实来源」时排除内置步骤 —— 它们的 output 是知识库正文
-# 或操作回执，拿它当工具执行证据会把因果图连到错误的地方。
+# 这个集合决定「走不走风险闸门」（旁路、但必须留痕）。
+# ⚠️ 它**不再**兼任「输出能不能当证据」的判据 —— 那个用途已拆到下面的
+# `NON_EVIDENCE_BUILTIN_TOOLS`（两者目的不同，混用会让白盒事实挂错溯源）。
 BUILTIN_STEP_TOOLS = frozenset({
     "note_fact", "search_history", "propose_branch", "split_task",
     "kb_search", "kb_read", "fofa_search",
@@ -54,6 +56,26 @@ BUILTIN_STEP_TOOLS = frozenset({
     # 免得 registry 的 specs、这里的集合、以及 handler 的分派三处各写一份、迟早漂移。
     *CODE_TOOL_ALIASES,
 })
+
+#: 「输出**不能**当工具执行证据」的内置工具。
+#:
+#: 白盒 `code_*` **刻意不在此列**：它们的输出是从受控根里读出来的**真实代码**
+#: （含 `文件:行号` 与原文），是货真价实的工具执行证据；
+#: 而 `kb_read` 的正文是知识库示例、`note_fact`/`search_history` 的回执是操作记录。
+#:
+#: ⚠️ 这两个集合的**用途不同，别混用**：
+#:   · `BUILTIN_STEP_TOOLS`（12 个）→ 决定「走不走风险闸门」（都走旁路、都留痕）；
+#:   · `NON_EVIDENCE_BUILTIN_TOOLS`（7 个）→ 决定「它的输出能不能当证据」。
+#: 同一个集合被两处用、而目的已经分叉 —— 这种情况必须拆，否则白盒事实要么没有溯源、
+#: 要么被挂到无关的网络步骤上（因果图会连出错误的边）。
+NON_EVIDENCE_BUILTIN_TOOLS = BUILTIN_STEP_TOOLS - frozenset(CODE_TOOL_ALIASES)
+
+# 白盒 NO_EVIDENCE 计数（v064）。
+# 规格 §6 建议把它**计入统计** —— 「模型编了」从一句无从衡量的直觉，
+# 变成一条结构化、可计数的事件，用来判断白盒能力是否在退化。
+# 用单元素列表而非全局 int：便于在函数里原地自增（Python 的闭包/全局语义在这容易写错）。
+_NO_EVIDENCE_COUNT = [0]
+
 
 # 记忆注入上限（值在 config 里，可用环境变量调；超限会在注入块尾部写明未展示条数）
 FACT_INJECT_MAX = config.FACT_INJECT_MAX
@@ -782,10 +804,18 @@ def attribute_source_step(session: "Session", content: str) -> str:
     """
     if not session.steps:
         return ""
-    # 内置步骤的 output 是知识库正文/操作回执，不能当工具执行证据
-    steps = [st for st in session.steps if st.tool_alias not in BUILTIN_STEP_TOOLS]
+    # 不能当证据的内置步骤（知识库正文 / 操作回执）要排除；
+    # ⚠️ 但**白盒 code_* 不排除**（v064）—— 它们的输出是从受控根读出的真实代码，
+    # 正是白盒事实该有的溯源依据。用 `NON_EVIDENCE_BUILTIN_TOOLS` 而不是
+    # `BUILTIN_STEP_TOOLS`，否则代码类事实会挂到无关的网络步骤上、因果图连错边。
+    steps = [st for st in session.steps if st.tool_alias not in NON_EVIDENCE_BUILTIN_TOOLS]
     if not steps:
-        return session.steps[-1].id
+        # v064：这里原先回退到 `session.steps[-1].id`，但上面那句注释写的是
+        # 「回退到最近的一个**非内置**步骤」—— 代码与注释不一致，而后果正是注释警告的事：
+        # 把事实挂到知识库/操作类步骤上，因果图连出 `Evidence(kb_read) → KeyFact` 的错误边；
+        # 更麻烦的是它会因「有 step_id」而让这条事实被判成 **verified**（冒充已证）。
+        # 没有可用作证据的步骤时**宁缺勿错**：不给溯源，事实自然落到 candidate。
+        return ""
     tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9._:/-]{3,}", content or "")[:8]
     if tokens:
         for st in reversed(steps):
@@ -1750,9 +1780,14 @@ class Agent:
         return，整轮产出在记忆层面归零 —— 实测上一轮 3 步全部成功、产出 57 条存活子域，
         情报库仍然是 0 行，而且没有任何提示。
 
-        只取**真实外部工具**的输出：内置 kb_read 的正文里全是 target.com 这类占位示例，
-        一起抽进来会往情报库灌假主机。
-        """
+只取**真实外部工具**的输出：内置 kb_read 的正文里全是 target.com 这类占位示例，
+一起抽进来会往情报库灌假主机。
+
+⚠️ 白盒 code_* 也**一并排除**（这里用整个 `BUILTIN_STEP_TOOLS`，与
+`attribute_source_step` 刻意不同）：情报库抽的是**主机/域名**，而代码正文里
+"看起来像域名"的字符串更多（示例、注释、依赖名），灌进来只会更脏。
+两处用途不同，所以用的集合也不同 —— 这是**有意的**，不是漏改。
+"""
         if not session.project:
             return
         try:
@@ -1856,10 +1891,29 @@ class Agent:
                 # 来源步骤按事实正文回查（见 attribute_source_step），
                 # 不再无脑取 steps[-1]——那会把 A 的产出挂到后执行的 B 上。
                 src_step = attribute_source_step(session, content)
+                # ---- 白盒证据主闸门（v064，实施规格 §4.3）----
+                # 引用了**代码位置**的事实必须能被白盒工具输出检回：
+                #   · 检不回 → 记候选 + 回喂明确要求补证据（NO_EVIDENCE，防编造的主闸门）；
+                #   · 检得回 → **仍然是候选** —— §4.3 的表写得很清楚：
+                #     「模型给出代码片段且确实来自工具输出」仍为 candidate，因为**代码存在 ≠ 可达**。
+                #     能升 verified 的只有人工复核，或工具证实了完整数据流（那是判定层的产出）。
+                # 不涉及代码引用时 `v.status` 为空串，**保持原行为不变**。
+                v = codebase_evidence.verify(content, session.steps)
+                if v.status == "no_evidence":
+                    _NO_EVIDENCE_COUNT[0] += 1
+                    logger.warning("白盒事实缺证据 NO_EVIDENCE #%d：%s（内容：%s）",
+                                   _NO_EVIDENCE_COUNT[0], v.reason, content[:120])
                 rec = store.add_fact(session.project, content[:500], source="agent",
-                                     session_id=session.id, step_id=src_step)
+                                 session_id=session.id, step_id=src_step,
+                                 status="candidate" if v.status else "")
                 graph.on_fact_added(session.project, rec)
-                note = f"已记录已证事实 #{rec.get('id','')}：{content[:120]}"
+                if v.status:
+                    note = f"已记录**候选**事实 #{rec.get('id','')}：{content[:120]}"
+                    note += f"\n（白盒证据校验：{v.reason}）"
+                    if v.feedback:
+                        note += "\n" + v.feedback
+                else:
+                    note = f"已记录已证事实 #{rec.get('id','')}：{content[:120]}"
             except Exception as e:
                 note = f"记录事实失败：{e}"
         session.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": note})
