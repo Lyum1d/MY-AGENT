@@ -112,6 +112,7 @@ PY_TESTS = [
     ("白盒依赖清单 SBOM（v062）", "test_062_codebase_sbom.py", False),
     ("白盒工具接线（v063）", "test_063_codebase_tools.py", False),
     ("白盒证据闸门（v064）", "test_064_codebase_evidence.py", False),
+    ("白盒召回基准（v065）", "test_065_recall_baseline.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

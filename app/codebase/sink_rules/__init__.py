@@ -51,7 +51,10 @@ COMMON: list[SinkRule] = [
          "源码内嵌私钥",
          "判断这把私钥用于什么（代码签名 / SSH / 服务间认证）"),
     rule("secret.assignment", "*", "hardcoded_secret",
-         r"(?i)\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|client[_-]?secret"
+         # ⚠️ 这里**不能用 `\b`**：`DB_PASSWORD` / `MY_API_KEY` 的变量名前缀是下划线，
+         # 而 `_` 属于 word 字符 → `\bpassword` 根本不成立，于是最典型的硬编码口令全漏掉。
+         # 召回基准第一次跑就抓到了这一条（`py_hardcoded_secret` 没打到）。
+         r"(?i)(?<![A-Za-z0-9])(?:api[_-]?key|secret[_-]?key|access[_-]?token|client[_-]?secret"
          r"|auth[_-]?token|private[_-]?key|passwd|password)\b\s*[:=]\s*['\"][^'\"]{12,}['\"]",
          "疑似把密钥/口令直接写在代码里",
          "先排除示例值；真实的要确认它是否有权限、以及是否已进过公开仓库"),

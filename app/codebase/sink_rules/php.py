@@ -44,7 +44,9 @@ RULES: list[SinkRule] = [
     # ---------- SQL ----------
     rule("php.sqli.concat", "php", "sqli",
          r"(?:mysql|mysqli|pg|sqlite)[_a-z]*query\s*\([^;]{0,120}?\$"
-         r"|->(?:query|exec|prepare|execute)\s*\([^;]{0,120}?\$",
+         # `(?<!\[)` 用来排除**参数化绑定**：`->execute([$name])` 里的 `$` 紧跟在 `[` 后，
+         # 那是绑定数组而不是"SQL 串里拼变量"。召回基准的负样本 `neg_php_prepared` 抓到的。
+         r"|->(?:query|exec|prepare|execute)\s*\([^;]{0,120}?(?<!\[)\$",
          "SQL 语句里直接拼接变量 —— 经典注入",
          "看是否用了预处理（参数化）；拼接的是标识符还是值；有无 addslashes 这类不充分的转义"),
 
