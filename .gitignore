@@ -81,3 +81,7 @@ data/*.bak_*
 白盒审计_实施规格.md
 其余方向与总路线图.md
 二进制方向_更新方向与计划.md
+
+# 白盒 codebase 授权记录（v058）：记录本机代码根路径与审计对象，
+# 与 data/scope.json 同级敏感 —— 严禁入库。
+data/codebases.json
