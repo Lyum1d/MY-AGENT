@@ -107,6 +107,7 @@ PY_TESTS = [
     ("规则文件守卫·无复制粘贴污染（v057）", "test_057_rules_integrity.py", False),
     ("白盒受控根校验（v058）", "test_058_codebase_paths.py", False),
     ("白盒代码入库（v059）", "test_059_codebase_ingest.py", False),
+    ("白盒代码索引（v060）", "test_060_codebase_index.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),
