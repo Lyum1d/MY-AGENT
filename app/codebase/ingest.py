@@ -126,6 +126,7 @@ class IngestResult:
     skipped_dirs: dict[str, int]
     oversized: list[str]
     supported: bool                  # 是否含首批支持分析的语言
+    truncated: bool = False          # 是否因 MAX_FILES 提前停止（summary 里要显示）
     dry_run: bool = False
     warnings: list[str] = field(default_factory=list)
 
@@ -321,7 +322,8 @@ def ingest(source, *, codebase_id: str | None = None, source_kind: str = "openso
         file_count=len(scan.files), by_lang=dict(scan.by_lang),
         build_files=list(scan.build_files), total_bytes=scan.total_bytes,
         skipped_dirs=dict(scan.skipped_dirs), oversized=scan.oversized[:20],
-        supported=supported, dry_run=dry_run, warnings=warnings)
+        supported=supported, truncated=scan.truncated,
+        dry_run=dry_run, warnings=warnings)
 
     if dry_run:
         return res

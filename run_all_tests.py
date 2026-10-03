@@ -110,6 +110,7 @@ PY_TESTS = [
     ("白盒代码索引（v060）", "test_060_codebase_index.py", False),
     ("白盒代码检索与 sink 规则库（v061）", "test_061_codebase_search.py", False),
     ("白盒依赖清单 SBOM（v062）", "test_062_codebase_sbom.py", False),
+    ("白盒工具接线（v063）", "test_063_codebase_tools.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),
