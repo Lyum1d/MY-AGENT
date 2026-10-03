@@ -85,3 +85,6 @@ data/*.bak_*
 # 白盒 codebase 授权记录（v058）：记录本机代码根路径与审计对象，
 # 与 data/scope.json 同级敏感 —— 严禁入库。
 data/codebases.json
+
+# 白盒入库落盘的代码（v059）：这是**被测目标的源码**，不是本项目资产 —— 严禁入库
+data/codebases/

@@ -159,6 +159,45 @@ def test_reparse_escape():
         skip("junction 逃逸", "无法创建 junction")
 
 
+# ---------------------------------------------------------------- 短名/长名
+def test_short_long_name():
+    r"""Windows 的 8.3 短名与长名是**同一个位置的两种写法**。
+
+    这条是实做 ingest 时发现的：`tempfile` 返回形如 `<盘>:/<用户目录>/<前 6 字母大写>~1/...`，
+    而 `.resolve()` 会把它展开成完整用户名的那一版 ——
+    直接比字符串就会误判。受控根校验之所以不受影响，是因为**两边都先 resolve**。
+
+    （本函数用**原始字符串**写文档：路径里的反斜杠不必转义，也避免无效转义告警。
+    注释里**不写真实用户名** —— 本项目 v056 的护栏会扫已跟踪文件，
+    写进去就会红；那正是它该有的作用。）
+    """
+    print("\n=== 短名/长名：同一个位置的两种写法 ===")
+    # 本机 `tempfile.mkdtemp()` 返回的是 **8.3 短名**（如 `...\LIANAX~1\...`），
+    # 而 `.resolve()` 会展开成长名 —— 正好白得一组"同一位置的两种写法"，不必去调 cmd。
+    short_form = str(CB_ROOT)                      # 可能是短名
+    long_form = str(CB_ROOT.resolve())             # resolve 后是长名
+    if short_form.lower() == long_form.lower():
+        skip("短名等价性", f"本机 tempfile 未给出短名（{short_form}）—— 用例前置不成立")
+        return
+    check("前置自检：两种写法指向同一位置",
+          pathlib.Path(short_form).resolve() == pathlib.Path(long_form).resolve(),
+          f"{short_form} vs {long_form}")
+    # ① 根用长名、候选用短名 → 应放行（两边都会 resolve，写法不影响判定）
+    try:
+        got = P.resolve_in_root(pathlib.Path(long_form),
+                                str(pathlib.Path(short_form) / "src" / "main.py"))
+        check("根用长名 + 候选用短名 → 正确接受", got.name == "main.py", str(got))
+    except P.PathEscapeError as e:
+        check("根用长名 + 候选用短名 → 正确接受", False, str(e)[:60])
+    # ② 反过来：根用短名、候选用长名 → 也应放行
+    try:
+        got = P.resolve_in_root(pathlib.Path(short_form),
+                                str(pathlib.Path(long_form) / "src" / "main.py"))
+        check("根用短名 + 候选用长名 → 正确接受", got.name == "main.py", str(got))
+    except P.PathEscapeError as e:
+        check("根用短名 + 候选用长名 → 正确接受", False, str(e)[:60])
+
+
 # ---------------------------------------------------------------- 授权记录
 def test_codebases_record():
     print("\n=== codebase 授权记录（既是授权凭据，也是审计记录）===")
@@ -240,6 +279,7 @@ def main() -> int:
     test_allow()
     test_deny()
     test_reparse_escape()
+    test_short_long_name()
     test_codebases_record()
     test_within_normcase()
     print("\n" + "=" * 68)
