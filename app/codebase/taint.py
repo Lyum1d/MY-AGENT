@@ -35,6 +35,26 @@
   **是否真的可利用仍然要靠模型读上下文**（与「sink 命中≠漏洞」同一条纪律）。
 - **不做别名/数组/字段传播**：`a.b` / `arr[i]` 只按字面变量名跟踪。
 
+## v071 追加：**命令执行器变量**（`runners`）
+
+除了「污点」，本层还顺带跟踪**另一类正交的信息**：哪些变量持有**命令执行器**。
+
+    Runtime r = Runtime.getRuntime();     // ← r 不是「污点」（不含用户输入）
+    Process p = r.exec(cmd + bar);        // ← 但 r 是执行器，这行就是命令执行 sink
+
+**为什么必须单独跟踪**：`sink_rules` 的 `_CMD_CALL` 只认字面量
+`Runtime.getRuntime().exec(`。实测 OWASP Benchmark 的 cmdi 真漏洞里
+**35 个中 27 个**写成「先存变量、再 `r.exec(...)`」—— 那 27 个**一个都打不中**。
+
+**为什么不直接把正则放宽成 `.exec(`**：那会裸奔（`.exec(` 会吃到一切同名方法）。
+v069 已用「删掉宽口径 `.load(`」证明过这条教训。正确做法是**在变量层面判类型**，
+而不是在方法名层面放宽。
+
+**与污点的关系**：两者**正交且互相独立**——
+`r` 是执行器但不是污点；`param` 是污点但不是执行器。
+所以它们是 `TaintResult` 上**两个独立的字段**，不是一个合并的集合。
+合并会让「这个变量脏不脏」和「这个变量能不能执行命令」互相污染。
+
 ## 输出是**候选**，不是漏洞
 
 本层只把「原来打不中的形态」提升为**可被规则命中的候选**。命中之后该验证什么，
@@ -98,6 +118,33 @@ _LHS_NAME = re.compile(
 #: （`$` 非 word 字符，`\bparam` 能匹配到 `param`，但我们要连 `$` 一起抠出来统一处理）。
 _IDENT = re.compile(rf"(?<![A-Za-z0-9_])(\$?[A-Za-z_]\w*)")
 
+#: 「命令执行器」的右值形态（v071）—— 赋值给变量后，该变量可以 `.exec(...)`。
+#:
+#: ## 为什么需要单独跟踪这一类
+#:
+#: v069 的 `_CMD_CALL` 只认字面量 `Runtime.getRuntime().exec(`。但真实 Java 代码
+#: 几乎一律先存变量。**实测 OWASP Benchmark：cmdi 真漏洞 35 个里 27 个是这种写法**
+#: （`Runtime r = Runtime.getRuntime(); Process p = r.exec(...)`），
+#: 那 27 个**一个都打不中** —— 这是比「跨行污染」更彻底的结构性漏报。
+#:
+#: ## 为什么不直接把规则放宽成 `.exec(`
+#:
+#: 因为那会**裸奔**：`.exec(` 会匹配到 `ProcessBuilder.exec` 之外的一切同名方法
+#: （各类框架、测试库都有 `exec`）—— v069 已用「删除宽口径 `.load(`」证明过这条教训：
+#: **宁可用精确的白名单形态，也不要一个看起来很能打的宽正则**。
+#: 所以做法是：**在变量层面判类型**（这个变量是不是从 `Runtime.getRuntime()` 来的），
+#: 而不是在方法名层面放宽。
+#:
+#: 收集范围（刻意保守，只收真的能执行命令的）：
+#:   - `Runtime.getRuntime()`
+#:   - `new ProcessBuilder(...)` / `ProcessBuilder` 的静态工厂
+#: 不收 `ProcessBuilder` 实例**经 `.command()` 后**的形态 —— 那属于容器间接污染，
+#: 是有意留到后续版本、且需要突破「不做数组/字段传播」边界的独立议题。
+_RUNNER_RHS = re.compile(
+    r"(?:\bRuntime\s*\.\s*getRuntime\s*\(\s*\))"
+    r"|(?:\bnew\s+(?:[\w.]+\.)?ProcessBuilder\s*\()"
+)
+
 
 def _norm(name: str) -> str:
     """变量名归一：**去掉 PHP 的 `$` 前缀**。
@@ -121,9 +168,20 @@ class TaintResult:
     tainted: dict[int, set[str]] = field(default_factory=dict)
     """行号 → 该行**之后**处于污点状态的变量集合（含该行赋值产生的）。"""
 
+    runners: dict[int, set[str]] = field(default_factory=dict)
+    """行号 → 该行之后持有**命令执行器**的变量集合（v071）。
+
+    `Runtime r = Runtime.getRuntime();` → 从这一行起 `r` 是执行器。
+    用途见 `_RUNNER_RHS` 的说明：让 `.exec(` 的**调用者变量**能判出来。
+    """
+
     def at(self, line: int) -> set[str]:
         """取「第 line 行被处理完时」的污点集合（供 sink 匹配时查）。"""
         return self.tainted.get(line, set())
+
+    def runners_at(self, line: int) -> set[str]:
+        """取「第 line 行被处理完时」的命令执行器变量集合。"""
+        return self.runners.get(line, set())
 
 
 def _lhs_name(lhs: str) -> str:
@@ -158,6 +216,7 @@ def analyze(lines: list[str], lang: str) -> TaintResult:
     """
     res = TaintResult()
     cur: set[str] = set()
+    runners: set[str] = set()
     for i, line in enumerate(lines, 1):
         m = _ASSIGN.match(line)
         if m:
@@ -180,10 +239,26 @@ def analyze(lines: list[str], lang: str) -> TaintResult:
                     # 不含任何污点成分 → **覆盖即净化**（`param = "safe"`；
                     # 纯常量拼接 `"a" + "b"` 也走这里，同样安全）
                     cur = cur - {name}
+
+                # ---- 命令执行器变量（v071）：与污点是**正交**的两件事 ----
+                # 同一条赋值同时更新两个集合：`Runtime r = Runtime.getRuntime();`
+                # 里 `r` **不是污点**（它不含用户输入），但它是**执行器**。
+                # ⚠️ 合并成一个集合会让「r 本身脏不脏」和「r 能不能执行命令」
+                # 互相污染 —— 后者是类型信息，前者是数据流信息。
+                if _RUNNER_RHS.search(rhs):
+                    runners = runners | {name}
+                else:
+                    runners = runners - {name}                # 覆盖即失效（重赋值就不是执行器了）
         res.tainted[i] = set(cur)
+        res.runners[i] = set(runners)
     return res
 
 
 def tainted_names_at(res: TaintResult, line: int) -> set[str]:
     """便捷取数：第 line 行当时处于污点的变量集合。"""
     return res.at(line)
+
+
+def runner_names_at(res: TaintResult, line: int) -> set[str]:
+    """便捷取数：第 line 行当时持有**命令执行器**的变量集合。"""
+    return res.runners_at(line)

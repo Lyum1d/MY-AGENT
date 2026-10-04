@@ -57,8 +57,30 @@ class SinkRule:
     留空表示本规则不参与跨行污染检测（默认）—— **不要滥用**：
     每开一条就多一类命中，且放进来的是**间接形态**（更弱，需要模型往上追）。
     """
+    # --- v071：调用者变量（可选）---------------------------------------------
+    #
+    # ## 第三类结构性漏报：sink 的**调用者本身**是个变量
+    #
+    #     Runtime r = Runtime.getRuntime();
+    #     Process p = r.exec(cmd + param);        // ← `_CMD_CALL` 完全匹配不到
+    #
+    # `call_pattern` 解决的是「**参数**是变量」（值在别处拼好）；
+    # 这里解决的是「**调用者**是变量」（执行器在别处取得）。两者正交：
+    # 前者靠「括号里有没有污点变量」判，后者靠「调用者是不是执行器变量」判。
+    #
+    # ⚠️ 为什么不放宽 `pattern`：把 `Runtime.getRuntime().exec(` 改成 `.exec(`
+    # 会匹配任意对象的 `exec` 方法 → 裸奔（v069 删宽口径 `.load(` 的同族教训）。
+    # 正确做法是**变量层面的类型判定** —— 由 `search.py` 配合 `taint.py` 的
+    # `runners` 集合完成。
+    runner_pattern: str = ""
+    """匹配「调用者是变量」的危险调用，**第一个捕获组必须是调用者名**。
+
+    命中后由 `search.py` 查 `taint.runners`：只有当那个变量确实持有命令执行器
+    （`Runtime.getRuntime()` / `new ProcessBuilder(...)`）时才产出命中。
+    """
     _rx: re.Pattern | None = field(default=None, compare=False, repr=False)
     _crx: re.Pattern | None = field(default=None, compare=False, repr=False)
+    _rrx: re.Pattern | None = field(default=None, compare=False, repr=False)
 
     def regex(self) -> re.Pattern:
         if self._rx is None:
@@ -75,7 +97,15 @@ class SinkRule:
             object.__setattr__(self, "_crx", re.compile(self.call_pattern))
         return self._crx
 
+    def runner_regex(self) -> re.Pattern | None:
+        """调用者变量专用的正则（**必须含一个捕获组** = 调用者名）；未配置为 `None`。"""
+        if not self.runner_pattern:
+            return None
+        if self._rrx is None:
+            object.__setattr__(self, "_rrx", re.compile(self.runner_pattern))
+        return self._rrx
+
 
 def rule(rid: str, lang: str, kind: str, pattern: str, why: str, hint: str = "",
-         call_pattern: str = "") -> SinkRule:
-    return SinkRule(rid, lang, kind, pattern, why, hint, call_pattern)
+         call_pattern: str = "", runner_pattern: str = "") -> SinkRule:
+    return SinkRule(rid, lang, kind, pattern, why, hint, call_pattern, runner_pattern)

@@ -201,13 +201,20 @@ def search_sinks(codebase_id: str, *, kinds=None, langs=None,
                  limit: int = MAX_HITS) -> list[Hit]:
     """按危险 sink 规则库检索。`kinds`/`langs` 可缩小范围（如只看 rce）。
 
-    ## 两层匹配（v069）—— 一行可以产出**两条**命中
+    ## 三层匹配（v071）—— 一行可以产出**多条**命中
 
     1. **行级证据**：规则自己的 `pattern` 命中 —— 「这一行本身就能看出危险」
        （如 `.executeQuery("... " + param)`）。`extractor` 为 `lexical`/`ast`；
     2. **跨行证据**：规则的 `call_pattern` 命中**且**该次调用的括号内出现
        **同一函数内的污点变量**（由 `taint.py` 推出）—— 「危险值在上一行拼好」。
-       `extractor` 为 `taint`/`taint(lexical)`。
+       `extractor` 为 `taint`/`taint(lexical)`，`rule_id` 带 `@taint`；
+    3. **执行器变量证据**（v071 新增）：规则的 `runner_pattern` 命中**且**捕获到的
+       调用者确实持有命令执行器（`Runtime.getRuntime()` / `new ProcessBuilder(...)`）
+       —— 「执行器在别处取得」。`extractor` 为 `runner`，`rule_id` 带 `@runner`。
+
+    ②③ 是**正交**的：② 管「**参数**是变量」，③ 管「**调用者**是变量」。
+    实测（OWASP BenchmarkJava）② 缺了会漏掉全部 sqli/pathtraver 主力形态，
+    ③ 缺了会漏掉 cmdi 的 **27/35**。
 
     ## 为什么不是「命中一个就 return」（v069 第一版的错误）
 
@@ -215,8 +222,8 @@ def search_sinks(codebase_id: str, *, kinds=None, langs=None,
     两条平行规则的 `pattern` 相同 → 要么行级命中先 return，要么行级不命中时
     「本行根本没有这个调用」，taint 分支判「括号里」无从下手。
 
-    现在改成**两层各跑各的、都收集**：同一行可能同时给出「行级」与「跨行」两条线索，
-    它们是**不同强度**的证据，都该交给模型（`why`/`hint` 已明确区分）。
+    现在改成**三层各跑各的、都收集**：同一行可能同时给出多条线索，
+    它们是**不同强度/不同性质**的证据，都该交给模型（`why`/`hint` 已明确区分）。
     为控总量，`limit` 仍然生效（按文件+行号顺序截断）。
     """
     want_kinds = {k.lower() for k in kinds} if kinds else None
@@ -234,6 +241,19 @@ def search_sinks(codebase_id: str, *, kinds=None, langs=None,
             taint_cache[rel] = Taint.analyze(src, lang)
         return Taint.tainted_names_at(taint_cache[rel], lineno)
 
+    def _runners_at(rel: str, lineno: int, lang: str) -> set[str]:
+        """同一份分析结果里的**命令执行器变量**集合（v071）。
+
+        ⚠️ 复用 `taint_cache` —— `TaintResult` 同时带污点与执行器两套信息，
+        重算一遍纯属浪费（一个文件会被逐行问很多次）。
+        """
+        if rel not in taint_cache:
+            src = lines_cache.get(rel)
+            if src is None:
+                return set()
+            taint_cache[rel] = Taint.analyze(src, lang)
+        return Taint.runner_names_at(taint_cache[rel], lineno)
+
     def matcher(rel, lang, lineno, line, idx):
         found: list[Hit] = []
         for r in S.rules_for(lang):
@@ -246,26 +266,44 @@ def search_sinks(codebase_id: str, *, kinds=None, langs=None,
                     scope=_enclosing(idx, rel, lineno),
                     extractor="ast" if lang == "python" else "lexical"))
             crx = r.call_regex()
-            if crx is None:
-                continue
-            cm = crx.search(line)
-            if not cm:
-                continue
-            names = _tainted_at(rel, lineno, lang)
-            if not names:
-                continue
-            lines = lines_cache.get(rel)
-            if not lines or not _tainted_in_args(lines, lineno, cm.start(), names):
-                continue
-            found.append(Hit(
-                file=rel, line=lineno, text=line, lang=lang, kind=r.kind,
-                rule_id=r.id + "@taint",
-                why=f"[跨行污染] {r.why} —— 危险值在**本行之外**拼好，这里只是把变量传进来",
-                hint=(f"⚠️ 本行括号内的变量是**污点**（由上方赋值拼入外部输入）。"
-                      f"**先读那个变量的赋值行**确认它确实由外部输入拼成，再判断可达性；"
-                      f"{r.hint}"),
-                scope=_enclosing(idx, rel, lineno),
-                extractor="taint" if lang == "python" else "taint(lexical)"))
+            if crx is not None:
+                cm = crx.search(line)
+                if cm:
+                    names = _tainted_at(rel, lineno, lang)
+                    lines = lines_cache.get(rel)
+                    if names and lines and _tainted_in_args(lines, lineno, cm.start(), names):
+                        found.append(Hit(
+                            file=rel, line=lineno, text=line, lang=lang, kind=r.kind,
+                            rule_id=r.id + "@taint",
+                            why=f"[跨行污染] {r.why} —— 危险值在**本行之外**拼好，"
+                                f"这里只是把变量传进来",
+                            hint=(f"⚠️ 本行括号内的变量是**污点**（由上方赋值拼入外部输入）。"
+                                  f"**先读那个变量的赋值行**确认它确实由外部输入拼成，再判断可达性；"
+                                  f"{r.hint}"),
+                            scope=_enclosing(idx, rel, lineno),
+                            extractor="taint" if lang == "python" else "taint(lexical)"))
+            # ---- 第三层：调用者变量（v071）----
+            # 「执行器在别处取得」—— 与跨行污染正交（那里是「参数在别处拼好」）。
+            # 判据是**类型信息**（调用者是不是命令执行器），不是宽度。
+            rrx = r.runner_regex()
+            if rrx is not None:
+                rm = rrx.search(line)
+                if rm and rm.groups():
+                    caller = Taint._norm(rm.group(1))
+                    runners = _runners_at(rel, lineno, lang)
+                    if caller in runners:
+                        found.append(Hit(
+                            file=rel, line=lineno, text=line, lang=lang, kind=r.kind,
+                            rule_id=r.id + "@runner",
+                            why=f"[执行器变量] {r.why} —— 本行用的是**变量形式的执行器**"
+                                f"（`{caller}` 由上方 `Runtime.getRuntime()` / "
+                                f"`new ProcessBuilder(...)` 取得），"
+                                f"旧的字面量 pattern 结构上匹配不到",
+                            hint=(f"⚠️ `{caller}` 已确认是命令执行器（不是任意对象的同名方法）。"
+                                  f"**往上读那个变量的赋值行**确认来源，再判断参数是否可控；"
+                                  f"{r.hint}"),
+                            scope=_enclosing(idx, rel, lineno),
+                            extractor="runner"))
         return found or None
 
     # 预读文件内容供污染分析用（_scan 自己也会读，但两者互不干扰）
@@ -302,7 +340,6 @@ def search_sinks(codebase_id: str, *, kinds=None, langs=None,
     # 稳定排序：同一行内**行级证据排在前**（强度更高），再按规则 id
     hits.sort(key=lambda h: (h.file, h.line, h.rule_id.endswith("@taint"), h.rule_id))
     return hits
-
 
 # ---------------------------------------------------------------- 正则检索
 

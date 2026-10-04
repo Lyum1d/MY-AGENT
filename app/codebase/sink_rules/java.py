@@ -50,7 +50,35 @@ _SQL_CALL_BARE = (r"\.(?:executeQuery|executeUpdate|execute|prepareStatement|pre
 #: 同上 + 开头括号（跨行污染用：只认调用，不要求参数里有 `+`）
 _SQL_CALL = _SQL_CALL_BARE + r"\s*\("
 #: 命令执行的「调用名」pattern
-_CMD_CALL = r"\bRuntime\s*\.\s*getRuntime\s*\(\s*\)\s*\.\s*exec\s*\(|\bProcessBuilder\s*\("
+#:
+#: ## v071：调用者变量盲区（实测驱动，**不是**猜的）
+#:
+#: 原来只认字面量 `Runtime.getRuntime().exec(`。但真实 Java 代码几乎一律先存变量：
+#:
+#:     Runtime r = Runtime.getRuntime();
+#:     Process p = r.exec(cmd + param);        // ← 旧 pattern 完全匹配不到
+#:
+#: **OWASP Benchmark 实测**：cmdi 真漏洞 35 个里 **27 个是这种写法**
+#: （`_cmdi_miss.py` 普查：27/27 未命中的文件都是
+#: 「`Runtime.getRuntime()` 赋值给变量」+「`.exec(` 由变量调用」）。
+#:
+#: ## 为什么不写成 `\.exec\s*\(`
+#:
+#: 那会匹配任意对象的任意 `exec` 方法（各类框架/测试库都有）→ **裸奔**。
+#: v069 删掉宽口径 `.load(` 就是因为同一个错误：**看起来能打，实际在制造误报**。
+#:
+#: ## 正确做法：**调用者必须是「执行器变量」**
+#:
+#: `search.py` 里对 `_CMD_EXEC_ON_VAR` 命中的行，会去 `taint.py` 新加的
+#: `runners` 集合里查「这个调用者是不是从 `Runtime.getRuntime()` /
+#: `new ProcessBuilder(...)` 来的」。是才产出命中 —— 精度由**类型判定**保证，
+#: 而不是靠正则有多宽。
+_CMD_EXEC_LITERAL = r"\bRuntime\s*\.\s*getRuntime\s*\(\s*\)\s*\.\s*exec\s*\("
+#: `r.exec(` / `pb.exec(` —— 调用者是**变量**（不是 `Runtime.getRuntime()` 字面量）。
+#: 单独一条是为了让 `search.py` 能把它路由到「执行器变量」判定。
+_CMD_EXEC_ON_VAR = r"\b(\w+)\s*\.\s*exec\s*\("
+
+_CMD_CALL = _CMD_EXEC_LITERAL + r"|\bProcessBuilder\s*\("
 
 RULES: list[SinkRule] = [
     # ---------- 命令执行 ----------
@@ -59,7 +87,10 @@ RULES: list[SinkRule] = [
          "执行系统命令；参数可控即可 RCE",
          "追参数拼接方式（数组传参比字符串拼接安全）；有无白名单",
          # 跨行形态：`argList.add("cat " + param);` → `new ProcessBuilder(argList)`
-         call_pattern=_CMD_CALL),
+         call_pattern=_CMD_CALL,
+         # v071：`Runtime r = Runtime.getRuntime();` → `r.exec(...)`。
+         # 由 search.py 用 taint 的 runners 集合判「调用者是不是真的执行器」。
+         runner_pattern=_CMD_EXEC_ON_VAR),
 
     # ---------- 反序列化（Java 最典型的高危类） ----------
     rule("java.deser.objectinput", "java", "deserialization",
