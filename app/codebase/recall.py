@@ -39,6 +39,7 @@ import pathlib
 import tempfile
 from dataclasses import dataclass, field
 
+from .. import config
 from . import index as I
 from . import ingest as G
 from . import paths as P
@@ -63,6 +64,10 @@ class Case:
     expect_rules: list[str] = field(default_factory=list)
     # 负样本：**不该**命中的规则
     forbid_rules: list[str] = field(default_factory=list)
+    #: 负样本的作用范围（只检查命中里 `file` 含这个子串的）。
+    #: ⚠️ 真实项目必须有它：整个仓库里别处当然会有这些规则命中，
+    #: 不限定范围的话，真实项目的负样本**永远会"失败"**，等于没测。
+    forbid_in: str = ""
     # 已知误报：说明原因后单列，不参与"必须通过"
     known_fp: str = ""
     note: str = ""
@@ -230,6 +235,52 @@ CORPUS: list[Case] = [
 ]
 
 
+#: 本机真实项目用例的配置文件（**不入库**）。
+#:
+#: 为什么不在代码里直接写 `dir=` 的绝对路径：那是**本机路径、带用户名**，
+#: 进公开仓库既泄露本机信息、又会直接触发 v056 的隐私护栏（v059 就被抓过一次）。
+#: 所以沿用 `data/scope.json` / `data/codebases.json` 的同一套约定：
+#: **机制入库（本文件 + `*.example` 模板），本机路径写在被 gitignore 的 json 里。**
+REAL_CASES_FILE = config.DATA_DIR / "recall_real.json"
+
+
+def load_real_cases(path: pathlib.Path | None = None) -> list[Case]:
+    """读本机真实项目用例。文件不存在/解析失败一律返回空表（**不抛异常**）。
+
+    返回空表是正常状态：没配真实项目时，基准只跑内置语料 —— 不该因此报错。
+    """
+    import json
+    p = pathlib.Path(path) if path else REAL_CASES_FILE
+    try:
+        if not p.exists():
+            return []
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:                                        # noqa: BLE001
+        return []
+    items = raw.get("cases") if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        return []
+    out: list[Case] = []
+    for it in items:
+        if not isinstance(it, dict) or not it.get("id") or not it.get("dir"):
+            continue                                        # 缺字段直接忽略（宁少不错）
+        if not pathlib.Path(it["dir"]).is_dir():
+            continue                                        # 目录不在（换机器了）→ 跳过
+        out.append(Case(
+            id=str(it["id"]),
+            kind=str(it.get("kind") or "positive"),
+            lang=str(it.get("lang") or ""),
+            dir=str(it["dir"]),
+            expect_loc=list(it.get("expect_loc") or []),
+            expect_rules=list(it.get("expect_rules") or []),
+            forbid_rules=list(it.get("forbid_rules") or []),
+            forbid_in=str(it.get("forbid_in") or ""),
+            known_fp=str(it.get("known_fp") or ""),
+            note=str(it.get("note") or ""),
+        ))
+    return out
+
+
 # ---------------------------------------------------------------- 跑分
 
 @dataclass
@@ -253,14 +304,38 @@ class Report:
     def negatives(self) -> list[CaseResult]:
         return [r for r in self.results if r.case.kind == "negative"]
 
+    # ---- 按来源分开：内置语料（稳定、可卡阈值） vs 本机真实项目（取决于本机有没有检出）----
+    @property
+    def builtin_results(self) -> list[CaseResult]:
+        return [r for r in self.results if not r.case.dir]
+
+    @property
+    def real_results(self) -> list[CaseResult]:
+        return [r for r in self.results if r.case.dir]
+
+    def recall_of(self, subset: list[CaseResult]) -> float:
+        p = [r for r in subset if r.case.kind == "positive"]
+        return (sum(1 for r in p if r.ok) / len(p)) if p else 0.0
+
+    def precision_of(self, subset: list[CaseResult]) -> float | None:
+        """负样本通过率。**没有负样本时返回 None**（=「未测」，不是 0%）。
+
+        ⚠️ 这里踩过一次：原先无负样本时返回 0.0，于是真实项目那一栏显示「精确性 0%」——
+        而事实是**根本没测精确性**（那批用例全是正样本）。
+        **把「没测」显示成「0 分」比不显示更有害** —— 看的人会以为规则在误报。
+        """
+        n = [r for r in subset if r.case.kind == "negative" and not r.case.known_fp]
+        if not n:
+            return None
+        return sum(1 for r in n if r.ok) / len(n)
+
     def recall(self) -> float:
         p = self.positives
         return (sum(1 for r in p if r.ok) / len(p)) if p else 0.0
 
-    def precision(self) -> float:
-        """负样本通过率 —— 只认「没被已知误报豁免」的那些。"""
-        n = [r for r in self.negatives if not r.case.known_fp]
-        return (sum(1 for r in n if r.ok) / len(n)) if n else 0.0
+    def precision(self) -> float | None:
+        """负样本通过率 —— 只认「没被已知误报豁免」的那些。无负样本时返回 None（未测）。"""
+        return self.precision_of(self.results)
 
     def failed(self) -> list[CaseResult]:
         return [r for r in self.results if not r.ok and not r.case.known_fp]
@@ -269,13 +344,28 @@ class Report:
         lines = ["=" * 68,
                  "白盒召回基准",
                  "=" * 68,
-                 f"  正样本 {len(self.positives)} 个；负样本 {len(self.negatives)} 个"
-                 f"（其中 {len([r for r in self.negatives if r.case.known_fp])} 个为已知误报）",
-                 f"  召回率   = {self.recall():.0%}",
-                 f"  精确性   = {self.precision():.0%}（负样本通过率）"]
-        for r in self.results:
+                 "【内置语料】（稳定，可卡硬阈值）",
+                 f"  正样本 {len(self.positives) - len([r for r in self.real_results if r.case.kind == 'positive'])} 个；"
+                 f"负样本 {len(self.negatives) - len([r for r in self.real_results if r.case.kind == 'negative'])} 个"
+                 f"（其中 {len([r for r in self.negatives if r.case.known_fp and not r.case.dir])} 个为已知误报）",
+                 f"  召回率   = {self.recall_of(self.builtin_results):.0%}",
+                 f"  精确性   = {self.precision_of(self.builtin_results):.0%}（负样本通过率）"]
+        for r in self.builtin_results:
             mark = "PASS" if r.ok else ("KNOWN-FP" if r.case.known_fp else "FAIL")
             lines.append(f"  [{mark:>8}] {r.case.id:<24} {r.detail}")
+        if self.real_results:
+            rp = self.precision_of(self.real_results)
+            lines += ["", "【本机真实项目】（取决于本机有没有检出那份代码）",
+                      f"  召回率   = {self.recall_of(self.real_results):.0%}"
+                      f"（{sum(1 for r in self.real_results if r.case.kind == 'positive' and r.ok)}"
+                      f"/{len([r for r in self.real_results if r.case.kind == 'positive'])}）",
+                      "  精确性   = " + (f"{rp:.0%}" if rp is not None
+                                        else "（本批未含负样本 → **未测**，不是 0 分）")]
+            for r in self.real_results:
+                mark = "PASS" if r.ok else ("KNOWN-FP" if r.case.known_fp else "FAIL")
+                lines.append(f"  [{mark:>8}] {r.case.id:<24} {r.detail}")
+        else:
+            lines += ["", "【本机真实项目】未配置（见 data/recall_real.json.example）"]
         if self.known_fp_triggered:
             lines.append("")
             lines.append("  ⚠️ 已知误报被触发（**不掩盖、不阻塞**，但要知道它还在）：")
@@ -316,11 +406,13 @@ def run_case(case: Case, workspace: pathlib.Path) -> CaseResult:
                                  f"实际命中 {shown}）")
             return CaseResult(case, ok, detail, shown)
 
-        # 负样本：不该命中 forbidden 规则
-        bad = sorted(set(case.forbid_rules) & got_rules)
+        # 负样本：不该命中 forbidden 规则（可限定在 `forbid_in` 指定的文件范围内）
+        sub_hits = [h for h in hits if not case.forbid_in or case.forbid_in in h.file]
+        bad = sorted(set(case.forbid_rules) & {h.rule_id for h in sub_hits})
         ok = not bad
-        detail = ("未误报 ✓" if ok else f"**误报**：{bad} @ {shown}")
-        return CaseResult(case, ok, detail, shown)
+        scope = f"（限于 {case.forbid_in}）" if case.forbid_in else ""
+        detail = ("未误报 ✓" if ok else f"**误报**：{bad} @ {sorted({h.loc for h in sub_hits})[:3]}")
+        return CaseResult(case, ok, detail + scope, [h.loc for h in sub_hits][:4])
 
 
 class _patched:
@@ -348,9 +440,15 @@ class _patched:
         return False
 
 
-def evaluate(cases: list[Case] | None = None, workspace: pathlib.Path | None = None) -> Report:
-    """跑一遍全部样本，返回报告。"""
-    cases = CORPUS if cases is None else cases
+def evaluate(cases: list[Case] | None = None, workspace: pathlib.Path | None = None,
+             include_real: bool = True) -> Report:
+    """跑一遍全部样本。
+
+    默认 = **内置语料** + **本机真实项目用例**（后者读 `data/recall_real.json`，没有就跳过）。
+    两者在报告里**分开统计**：内置语料稳定、可以卡硬阈值；真实项目取决于本机有没有检出那份代码。
+    """
+    if cases is None:
+        cases = list(CORPUS) + (load_real_cases() if include_real else [])
     tmp = pathlib.Path(workspace) if workspace else pathlib.Path(
         tempfile.mkdtemp(prefix="recall_"))
     tmp.mkdir(parents=True, exist_ok=True)

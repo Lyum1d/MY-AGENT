@@ -92,3 +92,8 @@ data/codebases/
 # 白盒索引产物（v060）：含**被测代码里的字符串**（可能就有硬编码密钥）——
 # 与入库代码同级敏感，严禁入库。
 data/codebases_index/
+
+# 真实项目的召回用例（v067）：含**本机检出目录的绝对路径**（带用户名）——
+# 与 data/scope.json / data/codebases.json 同级敏感，严禁入库。
+# 机制入的是 data/recall_real.json.example（模板，无本机路径）。
+data/recall_real.json

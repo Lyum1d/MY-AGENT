@@ -82,21 +82,58 @@ def main() -> int:
           str(real_store) not in str(tmp) and tmp.exists())
 
     print("\n=== ③ 卡住阈值（这是 A8「能回答涨了还是跌了」的落点）===")
-    check("召回率 = 100%（**掉了就是回归**）", rep.recall() == 1.0,
-          f"{rep.recall():.0%}；失败项：{[r.case.id for r in rep.failed()]}")
-    check("精确性 = 100%（负样本不许误报）", rep.precision() == 1.0,
-          f"{rep.precision():.0%}；失败项：{[r.case.id for r in rep.failed()]}")
-    check("没有未解释的失败项",
-          not rep.failed(), str([r.case.id for r in rep.failed()]))
+    # ⚠️ 硬阈值只看**内置语料** —— 它稳定、可复现；
+    # 真实项目那批取决于本机有没有检出那份代码，不能用来做环境相关的硬卡点。
+    b_recall = rep.recall_of(rep.builtin_results)
+    b_prec = rep.precision_of(rep.builtin_results)
+    check("内置语料召回率 = 100%（**掉了就是回归**）", b_recall == 1.0,
+          f"{b_recall:.0%}；失败项：{[r.case.id for r in rep.builtin_results if not r.ok]}")
+    check("内置语料精确性 = 100%（负样本不许误报）", b_prec == 1.0,
+          f"{b_prec:.0%}；失败项：{[r.case.id for r in rep.builtin_results if not r.ok]}")
+    check("内置语料没有未解释的失败项",
+          not [r for r in rep.builtin_results if not r.ok and not r.case.known_fp],
+          str([r.case.id for r in rep.builtin_results if not r.ok and not r.case.known_fp]))
     check("已知误报列表已清空（两条规则 bug 已修）",
           not rep.known_fp_triggered, str(rep.known_fp_triggered))
 
+    print("\n=== ③-b 「没测」不等于「0 分」（这个语义我踩过一次）===")
+    check("无负样本时 precision_of 返回 None 而不是 0.0",
+          rep.precision_of([r for r in rep.builtin_results if r.case.kind == "positive"]) is None)
+    check("有负样本时返回真实比例", isinstance(b_prec, float))
+
+    print("\n=== ③-c 真实项目用例（配了才跑；DVWA 那批是实测基线）===")
+    real = rep.real_results
+    if not real:
+        print("  [SKIP] 未配置 data/recall_real.json —— 真实项目用例跳过"
+              "（模板见 data/recall_real.json.example）")
+    else:
+        r_recall = rep.recall_of(real)
+        r_prec = rep.precision_of(real)
+        n_pos = len([r for r in real if r.case.kind == "positive"])
+        n_neg = len([r for r in real if r.case.kind == "negative"])
+        print(f"  读到真实用例 {len(real)} 条（正 {n_pos} / 负 {n_neg}）")
+        check("真实项目召回 = 100%（DVWA 6 个已知漏洞点全打中）",
+              r_recall == 1.0,
+              f"{r_recall:.0%}；失败：{[r.case.id for r in real if not r.ok]}")
+        if r_prec is not None:
+            check("真实项目精确性 = 100%（安全实现版 impossible.php 不误报）",
+                  r_prec == 1.0,
+                  f"{r_prec:.0%}；失败：{[r.case.id for r in real if not r.ok]}")
+        else:
+            print("  [SKIP] 真实用例未含负样本 → 精确性未测")
+
     print("\n=== ④ 每条正样本必须给出**可引用的位置**（不是只给个规则名）===")
-    bad = [r.case.id for r in rep.positives if not r.case.expect_loc]
-    check("正样本都带 `文件:行号` 期望答案", not bad, str(bad))
-    hit_loc = [r for r in rep.positives if any(l in r.hits for l in r.case.expect_loc)]
+    builtin_pos = [r for r in rep.builtin_results if r.case.kind == "positive"]
+    bad = [r.case.id for r in builtin_pos if not r.case.expect_loc]
+    check("内置正样本都带 `文件:行号` 期望答案", not bad, str(bad))
+    hit_loc = [r for r in builtin_pos if any(l in r.hits for l in r.case.expect_loc)]
     check("命中的位置都在实际命中里（含具体行号）",
-          len(hit_loc) == len(rep.positives), f"{len(hit_loc)}/{len(rep.positives)}")
+          len(hit_loc) == len(builtin_pos), f"{len(hit_loc)}/{len(builtin_pos)}")
+    real_pos = [r for r in rep.real_results if r.case.kind == "positive"]
+    if real_pos:
+        check("真实项目用例也都带具体行号（不是只给文件名）",
+              all(any(":" in l for l in r.case.expect_loc) for r in real_pos),
+              str([r.case.id for r in real_pos if not all(":" in l for l in r.case.expect_loc)]))
 
     print("\n" + "=" * 68)
     print(f"结果：{len(ok)} 通过 / {len(fail)} 失败")
