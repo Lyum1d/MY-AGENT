@@ -35,6 +35,95 @@
   **是否真的可利用仍然要靠模型读上下文**（与「sink 命中≠漏洞」同一条纪律）。
 - **不做别名/数组/字段传播**：`a.b` / `arr[i]` 只按字面变量名跟踪。
 
+## v072 追加：**容器追加式污染**（`container.add(...)`）
+
+第三类结构形态（前两类：跨行赋值 v069、执行器变量 v071）：
+
+    java.util.List<String> argList = new java.util.ArrayList<String>();
+    argList.add("cmd.exe");
+    argList.add("echo " + param);        // ← 污点**经 .add() 进入容器**
+    pb.command(argList);                 // ← sink 参数是容器，不是污点变量
+
+**为什么必须单独处理**：`analyze()` 原来只看**赋值**（`lhs = rhs`）。
+`argList.add(污点)` 既不是赋值、也不清除任何东西 —— `argList` **从头到尾不在污点集合里**，
+于是 `pb.command(argList)` 参数被判为「不脏」。实测 cmdi 里 **10 处**这种写法。
+
+### ⚠️⚠️ 实测结论：这两处修正对 Benchmark 的命中数**增量为 0**（必须写下来）
+
+`_v072_diff.py` 用 `git stash` 把本文件还原到 v071，同一批 669 个文件跑两遍，
+**逐行逐规则**比对命中集合：**1487 → 1487，新增 0，消失 0**。
+
+为什么修了却没变——**因为原来的「漏报」本来就不在这两处**：
+
+1. `java.rce.runtime_exec` 的 `pattern` 里已经有 `\bProcessBuilder\s*\(`，
+   它**不关心括号里是什么**。所以 `new ProcessBuilder(argList)` 那行
+   **v071 就已经命中了**；容器污点只是让 `@taint` 通道**多报一条重复的**。
+2. 该规则的 `call_pattern` 与原 `pattern` **逐字节相同** —— 按下面的「平行规则」教训，
+   这条 `@taint` 通道是**纯冗余**，永远与 `[line]` 同生共死。
+3. `.command(argList)` 那行确实**没被任何通道匹配**（`_CMD_CALL` 没有 `.command(` 分支），
+   但全库只有 5 处 `.command(`，且那 5 个文件**都已经**因为同一文件里的
+   `new ProcessBuilder(` 行而命中 → 补上也**不增加召回**。
+
+**所以本修正的价值是「正确性」而不是「召回」**：它让 taint 层对
+「全限定泛型声明」和「容器追加」两种形态不再视而不见。
+真正的召回缺口在**控制流分支合并**（见下），那是另一件事。
+
+**判据（有意保守）**：
+- 只认**已知的容器方法名**（`add`/`addAll`/`put`/`append`/`push`/`offer`），
+  **不写成「任意 `.方法(`」** —— 否则 `logger.add(...)`/`pool.add(...)` 之类全进来。
+- 实参含**已有污点变量**或**外部输入起点** → 容器进污点集（与赋值通道同判据）。
+- ⚠️ **追加式，不是覆盖式**：`.add()` **不清除**容器原有污点（与「覆盖即净化」正交）。
+  容器被**赋值**（`argList = ...`）时才按赋值规则处理 —— 两个通道各管各的。
+- ⚠️ **不处理 `.add()` 的逆操作**：`.remove(0)` / `.clear()` / `.get(i)` **不做传播**。
+  那是真正的**数组/字段传播**（见下方「不做」），属独立议题：
+  它需要下标语义、且会显著放大误报面（v072 有意留到后续版本）。
+
+## ⚠️⚠️ 已知最大缺口：**控制流分支不合并**（v072 查明，**未修**）
+
+本层是**直线分析**：按源码顺序走一遍，**后一条赋值覆盖前一条**。
+于是**分支结构天然出错** —— 最后一次赋值（文本顺序最后的那个分支）说了算。
+
+实测 OWASP Benchmark 的 `switch` 形态（169 个用例里有 **129 个**用这个结构）：
+
+    String guess = "ABC";
+    char switchTarget = guess.charAt(2);      // ← 'C'
+    switch (switchTarget) {
+        case 'A': bar = param; break;          // ← 有污点
+        case 'B': bar = "bobs_your_uncle"; break;
+        case 'C':
+        case 'D': bar = param; break;          // ← 有污点（且**这条真的会执行**）
+        default:  bar = "bobs_your_uncle"; break;  // ← 文本上最后；本层按它清掉 bar
+    }
+    ProcessBuilder pb = new ProcessBuilder(argList);   // ← argList 收了 bar → 实际有污点
+
+本层在 `default` 那行把 `bar` 清掉 → 下游判「不脏」→ **真漏洞漏报**。
+
+### 为什么**不能**简单地改成「分支取并集」
+
+看起来正确修法是：遇 `if`/`switch` 时**快照**污点集，块结束时取**并集**。
+但实测发现这条路**会把精确性打穿**：
+
+| 用例 | `guess.charAt(N)` | 实际走的 case | 标注 | 并集后的结果 |
+|---|---|---|---|---|
+| `BenchmarkTest00077` | `charAt(2)` → `'C'` | `case 'C'` → `bar = param` | **true** | 命中 ✓ 对 |
+| `BenchmarkTest00310` | `charAt(1)` → `'B'` | `case 'B'` → `bar = "bob"` | **false** | 命中 ✗ **误报** |
+| `BenchmarkTest00659` | `charAt(1)` → `'B'` | 同上 | **false** | 命中 ✗ **误报** |
+
+三者的 `switch` 段**逐字节相同**，唯一区别是 `charAt` 的**下标**（`2` vs `1`），
+而 Benchmark 自己在注释里写了 "condition 'B', which is **safe**"。
+**要判对必须做常量折叠**（推出 `guess = "ABC"` → `charAt(1) = 'B'` → 走 `case 'B'`）
+—— 那是**值级分析**，不是词法/污点层能做的事（那是判定层/模型的活）。
+
+全库统计：`charAt(2)` **26 个文件**（真漏洞）vs `charAt(1)` **26 个文件**（安全），
+**几乎 1:1** —— 换句话说，改「并集」会**同时**捞回 ~26 个真漏洞、
+**同时**制造 ~26 个误报（在那 129 个 `switch` 用例上更多）。
+**净收益接近零，而精确性会明显下降**，所以 v072 **有意不做**。
+
+**正确的下一步不是改本层**，而是：
+① 维持本层保守（宁可漏、不可误报），
+② 让**判定层（模型）**去读 `switch` 上下文判可达性（与 §4.1 分工一致），
+③ 若真要自动做，得先有**常量折叠**能力（独立议题，见 MEMORY 待办）。
+
 ## v071 追加：**命令执行器变量**（`runners`）
 
 除了「污点」，本层还顺带跟踪**另一类正交的信息**：哪些变量持有**命令执行器**。
@@ -99,11 +188,20 @@ _IDENT_BODY = r"\$?[A-Za-z_]\w*"
 
 #: 赋值语句：`<左值> = <右值>;`。左值只取简单标识符/带类型声明（不做复杂解析）。
 #: **两个捕获组**：① 左值 ② 右值。
+#:
+#: ⚠️ **v072 修正「带类型声明」分支允许 `.`**（即允许**全限定类型名**）：
+#: 原写法 `[A-Za-z_][\w<>\[\],\s]*?` **不允许 `.`**，于是
+#: `java.util.List<String> argList = new java.util.ArrayList<String>();`
+#: **整行匹配失败** —— 该变量从此不进污点分析，连"覆盖即净化"都没发生过。
+#: 这是 v069「全限定名盲区」在 **taint 层的复现**（v069 修的是规则 `pattern` 层，
+#: 漏掉了 taint 层；同一类错误在同一版的两个地方只修了一处）。
+#: **实测影响面：全库 591 行**（`java.util.List` 93 / `Map` 88 / `HashMap` 123 / `Enumeration` 287）。
+#: 放开 `.` 后正样本 6/9 → 9/9，负样本误匹配 3/12 **不变**（见 `test_072`）。
 _ASSIGN = re.compile(
     r"^\s*("
     r"\$?[A-Za-z_][\w.]*"                                     # 变量名（PHP 可带 `$`）
     r"|(?:var|let|const)\s+\$?[A-Za-z_]\w*"                    # var/let/const 声明
-    r"|(?:final\s+)?[A-Za-z_][\w<>\[\],\s]*?\s+\$?[A-Za-z_]\w*"  # 带类型声明
+    r"|(?:final\s+)?[A-Za-z_][\w.<>\[\],\s]*?\s+\$?[A-Za-z_]\w*"  # 带类型声明（v072 起允许全限定名）
     r")"
     r"\s*=\s*(?!=)(.+?);?\s*$"
 )
@@ -143,6 +241,23 @@ _IDENT = re.compile(rf"(?<![A-Za-z0-9_])(\$?[A-Za-z_]\w*)")
 _RUNNER_RHS = re.compile(
     r"(?:\bRuntime\s*\.\s*getRuntime\s*\(\s*\))"
     r"|(?:\bnew\s+(?:[\w.]+\.)?ProcessBuilder\s*\()"
+)
+
+#: 容器**追加**方法（v072）：`<容器>.<方法>(<实参>)`。**两个捕获组**：① 容器 ② 实参。
+#:
+#: ## 为什么必须是白名单
+#:
+#: 若写成 `(\w+)\s*\.\s*\w+\s*\(([^)]*)\)`（任意方法），`logger.info(param)`、
+#: `resp.setHeader(param)`、`sb.append(...)` 全都进来 —— 那会把**任何一个收污点的对象**
+#: 都标成「容器污点」，等于让污点集快速饱和，sink 层将大面积误报。
+#: 只认真的「往集合里塞值」的语义（见下），与《教训库》「宁要精确白名单，
+#: 不要看起来很能打的宽正则」一致（v069 删 `.load(` 同族）。
+#:
+#: 白名单覆盖实测用到的：`List/ArrayList`（`add`/`addAll`）、`Map/HashMap`（`put`/`putAll`）、
+#: `StringBuilder/StringBuffer`（`append`）、`Deque/Stack`（`push`/`offer`/`addLast`）。
+_CONTAINER_ADD = re.compile(
+    r"\b(\$?[A-Za-z_]\w*)\s*\.\s*"
+    r"(add|addAll|put|putAll|append|push|offer|addLast|addFirst)\s*\(([^)]*)\)"
 )
 
 
@@ -185,11 +300,29 @@ class TaintResult:
 
 
 def _lhs_name(lhs: str) -> str:
-    """从赋值左值里取变量名：`String sql` → `sql`，`argList` → `argList`，`$x` → `x`。"""
+    """从赋值左值里取变量名：`String sql` → `sql`，`argList` → `argList`，`$x` → `x`。
+
+    ## ⚠️ v072 修正：类型前缀必须允许 `.`（全限定名）
+
+    原正则的类型前缀是 `[A-Za-z_<>\\[\\],\\s]*?` —— **没有 `.`**。于是
+    `java.util.List<String> argList` 里 `java.util.List<String>` **吃不下**，
+    整个匹配失败 → 返回 `""` → **该变量名抠不出来**。
+
+    后果比 `_ASSIGN` 不匹配更隐蔽：`analyze()` 是
+
+        name = _lhs_name(lhs_raw)
+        if name:            # ← 空字符串 → **整个传播分支静默跳过**
+            ...
+
+    —— `_ASSIGN` 不匹配是「这一行没看见」，这里却是「**看见这行了，但变量名是空的**」，
+    两者都让 `java.util.List<String> x = ...` 的 `x` 永远不进污点集合。
+    **实测这是 v069「全限定名盲区」在 taint 层的第二处**（第一处是 `_ASSIGN` 本身）。
+    影响面 591 行（`List` 93 / `Map` 88 / `HashMap` 123 / `Enumeration` 287）。
+    """
     s = lhs.strip()
     # 去掉修饰符与类型
     s = re.sub(r"^(?:final|var|let|const)\s+", "", s)
-    m = re.match(r"^[A-Za-z_<>\[\],\s]*?(\$?[A-Za-z_]\w*(?:\s*\.\s*\w+|\s*\[[^\]]*\])*)\s*$", s)
+    m = re.match(r"^[A-Za-z_.<>\[\],\s]*?(\$?[A-Za-z_]\w*(?:\s*\.\s*\w+|\s*\[[^\]]*\])*)\s*$", s)
     return _norm(m.group(1).replace(" ", "")) if m else ""
 
 
@@ -249,6 +382,19 @@ def analyze(lines: list[str], lang: str) -> TaintResult:
                     runners = runners | {name}
                 else:
                     runners = runners - {name}                # 覆盖即失效（重赋值就不是执行器了）
+        else:
+            # ---- 容器追加式污染（v072）----
+            # `argList.add("echo " + param)` —— 这是**赋值之外**的第二条污染通道。
+            # ⚠️ 必须放在 `else`（非赋值行）里：`x = y.add(..)` 这种既赋值又追加的行，
+            #    赋值通道已经把 `x` 处理了，此处不重复。
+            # ⚠️ 追加**不清除**（`.add` 是往容器里加，不是覆盖容器）。
+            for cm in _CONTAINER_ADD.finditer(line):
+                cname = _norm(cm.group(1))
+                cargs = cm.group(3)
+                if cname in _STOPWORDS:
+                    continue
+                if _is_source(lang, cargs) or (_names(cargs) & cur):
+                    cur = cur | {cname}
         res.tainted[i] = set(cur)
         res.runners[i] = set(runners)
     return res

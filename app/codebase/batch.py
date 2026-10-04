@@ -85,11 +85,17 @@ v069/v070 的召回分母用的是**官方标注的全部条数**。这个口径
 | 类别 | 旧口径（全部标注） | 新口径（仅可命中） |
 |---|---|---|
 | cmdi | 20/126 = 15.9% | **20/35 = 57.1%** |
-| crypto | 37/130 = 28.5% | **37/37 = 100.0%** |
-| hash | 38/129 = 29.5% | **38/38 = 100.0%** |
+| crypto | 37/130 = 28.5% | **37/37 = 100.0%**（文件级）|
+| hash | 38/129 = 29.5% | **38/38 = 100.0%**（文件级）|
 | pathtraver | 38/133 = 28.6% | **38/38 = 100.0%** |
 | sqli | 28/272 = 10.3% | **28/64 = 43.8%** |
 | **小计** | 161/790 = 20.4% | **161/212 = 75.9%** |
+
+⚠️ **v072 补注**：上表「新口径」里的 crypto/hash 是**文件级**召回。
+按**本类别规则**（两者都映射到 `weak_crypto`）算，只有 **19/37 = 51.4%** 与 **28/38 = 73.7%** ——
+那多出来的是**别的 kind 在同一个文件里的命中**，不是 `weak_crypto` 规则的功劳。
+一类两 kind（crypto/hash 共用 `weak_crypto`）时这个差尤其大。
+**所以 v072 起 `render()` 的召回也改成 kind 级为主**（与精确性对称），见 `Category.render`。
 
 **为什么当时没发现**：本机那份检出是**部分检出**（大概率是分批 clone 或只取了前一段），
 而评测集的标注是**全量**的。两边条数不一样这个事实，在只看百分比时**完全看不出来**
@@ -216,14 +222,42 @@ class Category:
         return (self.kindhit_vuln / seen) if seen else None
 
     def render(self, width: int = 14) -> str:
-        s = (f"  {self.name:<{width}} 召回 {self.vuln_hit:4d}/{self.vuln_total:4d} "
-             f"= {self.recall:5.1%}   误报 {self.safe_hit:4d}/{self.safe_total:4d}   "
-             f"精确性 " + self._fmt_prec())
+        """渲染一行。**召回与精确性都必须 kind 级为主**（v072 修正）。
+
+        ## ⚠️ 原来混了口径（v071 遗留缺陷）
+
+        原写法是「文件级召回 + kind 级精确性」：
+
+            f"召回 {self.vuln_hit}/{self.vuln_total} = {self.recall:.1%} ... 精确性 {kind 级}"
+
+        于是**同一行里两个口径**。后果被实测抓出来：`crypto` 显示「召回 100%」，
+        但那 100% 是**文件级**的（靠别的 kind 在同一文件里命中凑的）；
+        按本类别规则（`weak_crypto`）算只有 **51.4%**。
+        报告里两个数字并排，读者会默认它们同口径 —— **比只显示一个更误导**。
+
+        现在改为**两边都以 kind 级为主**，文件级在括号里（与 `_fmt_prec_pair` 对称）。
+        """
+        s = (f"  {self.name:<{width}} 召回 " + self._fmt_recall()
+             + f"   误报 {self.safe_hit:4d}/{self.safe_total:4d}   精确性 "
+             + self._fmt_prec())
         # 缺口只在真的存在时补一句 —— 本机是全量检出时这一行不该出现（别加噪音）
         miss = self.vuln_missing + self.safe_missing
         if miss:
             s += f"   [标注另有 {miss} 条无源码，已排除]"
         return s
+
+    def _fmt_recall(self) -> str:
+        """召回渲染：**kind 级为主，文件级在括号里**。
+
+        两者相等时（cmdi/pathtraver 这种「一类一 kind、规则的 shape 也专一」）不重复显示。
+        """
+        kf, lf = self.recall_kind, self.recall
+        bar = f"{self.kindhit_vuln:4d}/{self.vuln_total:4d}" if self.vuln_total else "   0/   0"
+        if self.vuln_total == 0:
+            return f"{bar} =（未测）"
+        if abs(kf - lf) < 5e-4:
+            return f"{bar} = {kf:5.1%}"
+        return f"{bar} = {kf:5.1%}（文件级 {self.vuln_hit}/{self.vuln_total} = {lf:.1%}）"
 
     def _fmt_prec(self) -> str:
         """精确性渲染：**kind 级为主，文件级在括号里**（见模块级 `_fmt_prec_pair`）。"""
@@ -338,14 +372,16 @@ class BatchReport:
         for c in covered:
             lines.append(c.render())
         lines.append("")
-        lines.append("  小计（{n} 个类别）：召回 {vh}/{v} = {r:.1%}   误报 {sh}/{s}   "
-                     "精确性 {p}".format(
-                         n=len(covered), vh=t["vuln_hit"], v=t["vuln_total"],
-                         r=t["recall"], sh=t["safe_hit"], s=t["safe_total"],
+        lines.append("  小计（{n} 个类别）：**召回（本类别 kind）** {kv}/{v} = {kr:.1%}"
+                     "   误报 {sh}/{s}   精确性 {p}".format(
+                         n=len(covered), kv=t["kindhit_vuln"], v=t["vuln_total"],
+                         kr=t["recall_kind"], sh=t["safe_hit"], s=t["safe_total"],
                          p=_fmt_prec_pair(t["precision_kind"], t["precision"])))
         if covered and abs(t["recall_kind"] - t["recall"]) > 1e-9:
-            lines.append(f"     （其中**本类别 kind** 命中 {t['kindhit_vuln']}"
-                         f" = {t['recall_kind']:.1%}；其余是别类规则在同一文件里的命中）")
+            lines.append(f"     （文件级召回 {t['vuln_hit']}/{t['vuln_total']}"
+                         f" = {t['recall']:.1%} —— 比 kind 级多出的 "
+                         f"{t['vuln_hit'] - t['kindhit_vuln']} 个是**别类规则在同一文件里命中的**，"
+                         f"不是本类别规则的功劳）")
         # ⚠️ 这些类别**有规则但本机没有可测的源码** → 报「召回 0%」是把「没测」
         # 说成「0 分」（v067 同族错误）。单列并写明原因。
         if untested:
