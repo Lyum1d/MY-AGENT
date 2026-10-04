@@ -27,6 +27,19 @@
 在 `REAL_CASES` 里加一条（`dir=` 指向它 + `expect` 写已知的修复点位置），
 同一个跑分器就能算真实召回。**机制是本版交付物，语料可以持续长。**
 
+## ③ 批量基准（v070）：真实仓库 + 官方标注
+
+单点模型回答不了「**这个仓库里 272 个 SQL 注入用例，你打中了几个**」——
+那是**批量**的，见 `batch.py`：吃「一个仓库 + 一份逐用例标注 CSV」，
+按类别算真实召回/精确性。首个接入 **OWASP BenchmarkJava v1.2**（2740 条官方标注）。
+
+> ⚠️ **DVWA 的 100% 是假的**：那是我们手工挑的点，规则还是照着那个形态调的。
+> 真实项目的形态（跨行污染、全限定名、跨行参数区）**完全不同**。
+> 要回答「规则在真实项目上到底行不行」，只有拿带官方标注的评测集跑这一条路。
+
+三个来源在报告里**分开统计**：内置语料卡硬阈值；`recall_real`（单点真实用例）
+与 `recall_batch`（批量评测集）**只报数，不卡阈值**（取决于本机有没有检出那份代码）。
+
 ## 已知误报（不藏起来）
 
 有些用例是**已知会红**的（规则本身的精度问题）。它们不写进"必须通过"的断言里，
@@ -295,6 +308,9 @@ class CaseResult:
 class Report:
     results: list[CaseResult] = field(default_factory=list)
     known_fp_triggered: list[str] = field(default_factory=list)
+    #: 批量基准（真实仓库 + 官方标注）—— 与上面的单点用例**互不影响**。
+    #: 单点 = 内置语料 + 自己挑的真实点；批量 = 评测集整体召回。
+    batches: list = field(default_factory=list)
 
     @property
     def positives(self) -> list[CaseResult]:
@@ -341,6 +357,11 @@ class Report:
         return [r for r in self.results if not r.ok and not r.case.known_fp]
 
     def render(self) -> str:
+        # ⚠️ 精确性是 `float | None` —— **无负样本时是 None（未测），不是 0.0**。
+        # 这里必须分两条路渲染：直接 `:.0%` 格式化 None 会 TypeError
+        # （v070 加批量基准时被 test_070 撞出来：真实跑总会带内置语料，
+        #  所以这条路径一直没被走到 —— 但「只跑批量、不跑单点」是完全合法的用法）。
+        b_prec = self.precision_of(self.builtin_results)
         lines = ["=" * 68,
                  "白盒召回基准",
                  "=" * 68,
@@ -349,7 +370,8 @@ class Report:
                  f"负样本 {len(self.negatives) - len([r for r in self.real_results if r.case.kind == 'negative'])} 个"
                  f"（其中 {len([r for r in self.negatives if r.case.known_fp and not r.case.dir])} 个为已知误报）",
                  f"  召回率   = {self.recall_of(self.builtin_results):.0%}",
-                 f"  精确性   = {self.precision_of(self.builtin_results):.0%}（负样本通过率）"]
+                 "  精确性   = " + (f"{b_prec:.0%}（负样本通过率）" if b_prec is not None
+                                   else "（本批未含负样本 → **未测**，不是 0 分）")]
         for r in self.builtin_results:
             mark = "PASS" if r.ok else ("KNOWN-FP" if r.case.known_fp else "FAIL")
             lines.append(f"  [{mark:>8}] {r.case.id:<24} {r.detail}")
@@ -372,6 +394,10 @@ class Report:
             for cid in self.known_fp_triggered:
                 c = next(x for x in self.results if x.case.id == cid).case
                 lines.append(f"    · {cid}：{c.known_fp}")
+        # 批量基准（真实仓库 + 官方标注）单列 —— 它是**真实召回**，不是形态样本
+        if self.batches:
+            from . import batch as B
+            lines += ["", B.render_all(self.batches)]
         lines.append("=" * 68)
         return "\n".join(lines)
 
@@ -441,11 +467,17 @@ class _patched:
 
 
 def evaluate(cases: list[Case] | None = None, workspace: pathlib.Path | None = None,
-             include_real: bool = True) -> Report:
+             include_real: bool = True, include_batch: bool = True) -> Report:
     """跑一遍全部样本。
 
-    默认 = **内置语料** + **本机真实项目用例**（后者读 `data/recall_real.json`，没有就跳过）。
-    两者在报告里**分开统计**：内置语料稳定、可以卡硬阈值；真实项目取决于本机有没有检出那份代码。
+    默认 = **内置语料** + **本机真实项目用例**（读 `data/recall_real.json`，没有就跳过）
+    + **批量基准**（读 `data/recall_batch.json`，没有就跳过）。
+    三者在报告里**分开统计**：内置语料稳定、可以卡硬阈值；真实项目与批量基准
+    取决于本机有没有检出那份代码，**只报数、不卡阈值**。
+
+    `include_batch=False` 可跳过批量基准 —— 它要**整仓入库 + 建索引**
+    （OWASP Benchmark 858 文件约 2 秒），日常快速回归时可以不要
+    （内置语料那批是秒级的）。
     """
     if cases is None:
         cases = list(CORPUS) + (load_real_cases() if include_real else [])
@@ -460,6 +492,10 @@ def evaluate(cases: list[Case] | None = None, workspace: pathlib.Path | None = N
             rep.results.append(CaseResult(c, False, f"用例执行出错：{type(e).__name__}: {e}"))
     rep.known_fp_triggered = [r.case.id for r in rep.results
                               if r.case.known_fp and not r.ok]
+    if include_batch:
+        from . import batch as B
+        # 批量基准**不抛异常**（`evaluate_batches` 自己兜底），所以这里不用 try
+        rep.batches = B.evaluate_batches(workspace=tmp / "_batch")
     return rep
 
 

@@ -115,6 +115,7 @@ PY_TESTS = [
     ("白盒召回基准（v065）", "test_065_recall_baseline.py", False),
     ("白盒 KB 篇目（v068）", "test_068_kb_whitebox_docs.py", False),
     ("白盒跨行污染（v069）", "test_069_taint_crossline.py", False),
+    ("白盒批量基准（v070）", "test_070_batch_benchmark.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

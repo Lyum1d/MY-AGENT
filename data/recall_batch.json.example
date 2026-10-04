@@ -1,0 +1,47 @@
+{
+  "_说明": [
+    "本机「批量基准」配置（模板）。批量基准 = **真实仓库 + 官方标注** → 按类别算真实召回/精确性。",
+    "用法：复制成 data/recall_batch.json，把 dir 改成你本机检出目录的绝对路径。",
+    "为什么本机路径不写进代码：它是本机信息（带用户名），进公开仓库既泄露信息、",
+    "又会触发本项目 v056 的隐私护栏。所以机制入库、路径入本机（与 data/scope.json 同约定）。",
+    "",
+    "★ 与 data/recall_real.json 的区别（别混）：",
+    "   recall_real = **单点**用例（自己挑的 文件:行号）→ 测「这个已知点打不打得到」；",
+    "   recall_batch = **批量**评测集（官方逐用例标注）→ 测「这个类别整体召回多少」。",
+    "   后者才是能回答「规则在真实项目上到底行不行」的那个。",
+    "",
+    "★ 三条纪律：",
+    "   ① 标注文件格式：一行一条 `用例名,类别,true/false[,CWE]`，`#` 开头是注释；",
+    "      默认在 dir 下找 expectedresults*.csv，也可用 ground_truth 字段指定文件名；",
+    "   ② category_kind 是把**官方类别名**映射到**本 Agent 的 kind**；",
+    "      **没映射的类别 = 本 Agent 能力外**，报告里单列为「能力外」，低召回属预期、不是缺陷；",
+    "   ③ 本模块**不做环境相关硬卡点**（取决于本机有没有检出代码），只报数。"
+  ],
+  "batches": [
+    {
+      "name": "owasp-benchmark-java-1.2",
+      "dir": "<本机 OWASP BenchmarkJava 检出目录>",
+      "ground_truth": "expectedresults-1.2.csv",
+      "source_kind": "opensource",
+      "category_kind": {
+        "cmdi": "rce",
+        "sqli": "sqli",
+        "pathtraver": "path_traversal",
+        "crypto": "weak_crypto",
+        "hash": "weak_crypto"
+      },
+      "_未映射类别的现状": [
+        "ldapi / securecookie / trustbound / weakrand / xpathi / xss —— 本 Agent 目前没有对应规则，",
+        "报告里会单列为「能力外」。要让它们进召回，得先补规则（不是改这个文件能解决的）。"
+      ],
+      "_实测基线（v069 探针，2026-10-04）": {
+        "cmdi": "召回 20/126 = 15.9%",
+        "crypto": "召回 37/130 = 28.5%",
+        "hash": "召回 38/129 = 29.5%",
+        "pathtraver": "召回 38/133 = 28.6%",
+        "sqli": "召回 28/272 = 10.3%",
+        "小计": "召回 161/790 = 20.4%"
+      }
+    }
+  ]
+}

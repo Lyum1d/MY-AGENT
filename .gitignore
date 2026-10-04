@@ -97,3 +97,7 @@ data/codebases_index/
 # 与 data/scope.json / data/codebases.json 同级敏感，严禁入库。
 # 机制入的是 data/recall_real.json.example（模板，无本机路径）。
 data/recall_real.json
+
+# 批量基准评测集配置（v070）：同样含**本机检出目录的绝对路径**，同理 gitignore。
+# 机制入的是 data/recall_batch.json.example（模板，无本机路径）。
+data/recall_batch.json
