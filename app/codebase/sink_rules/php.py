@@ -79,4 +79,39 @@ RULES: list[SinkRule] = [
          r"\bheader\s*\(\s*['\"]Location:\s*['\"]?\s*\.?\s*\$",
          "Location 头由变量拼接 —— 开放重定向（常用于钓鱼/绕过校验）",
          "看是否能重定向到站外；是否被用作 OAuth/回调链的一环"),
+
+    # ---------- XSS（v066 补：DVWA 实测暴露的缺口 —— 16 条 PHP 规则里唯独没有 xss）----------
+    # ⚠️ 这几条都带**同一行内的转义黑名单**（`htmlspecialchars` / `htmlentities` / `urlencode`
+    # / `strip_tags` / `filter_var`）：XSS 规则最容易犯的错就是把已经转义的安全写法也报出来。
+    # 行内黑名单是个粗判据（跨行拼接判不了），所以 `hint` 里明确要求去追输出路径上的转义。
+    rule("php.xss.superglobal_to_html", "php", "xss",
+         r"^(?!.*(?:htmlspecialchars|htmlentities|htmlspecialchars_decode|urlencode"
+         r"|strip_tags|filter_var))"
+         r"(?=.*<[A-Za-z/!])"
+         r".*\$_(?:GET|POST|REQUEST|COOKIE)\b",
+         "把请求变量拼进 HTML 片段 —— 输出时未转义即反射型 XSS",
+         "**DVWA 这类「先拼进 $html、之后才 echo」的写法就是它**："
+         "要顺着这个变量找到真正的输出点，看那里有没有转义"),
+    rule("php.xss.echo_var", "php", "xss",
+         r"^(?!.*(?:htmlspecialchars|htmlentities|urlencode|strip_tags|filter_var))"
+         r".*\b(?:echo|print)\b[^;]{0,120}?\$",
+         "把变量直接输出到页面 —— 内容可由用户影响时即 XSS。",
+         "追这个变量能否到请求参数 / 数据库里的用户内容（存储型）；"
+         "以及它在到达输出前有没有被转义。"
+         "⚠️ 这是**宽口径**规则（`echo` 一个变量在 PHP 里太普遍，DVWA 上命中 58 处、"
+         "其中真 XSS 只占一部分）—— 它是为「存储型 XSS 的输出端**没有它就全漏**」而留的，"
+         "命中请当**低置信候选**看待，必须先追来源再下结论。"),
+    # ⚠️ 已知边界（v066 实测，DVWA）：**存储型 XSS 的输出点常常命中不了**。
+    # DVWA 的 `xss_s` 是「输入在 source/*.php 入库 → 输出在 index.php 拼 `$page['body']`」，
+    # 输出那一行拼的是**数据库结果变量**、没有超级全局变量 → 单文件规则覆盖不到。
+    # 这是**单文件静态规则的固有边界**（与 `fi` 模块「输入与 sink 分居两个文件」同构），
+    # **不该靠放宽规则去硬凑**（那会疯狂误报）；跨文件那条链路由判定层追。
+    rule("php.xss.short_echo", "php", "xss",
+         r"<\?=(?!.*(?:htmlspecialchars|htmlentities))[^?]{0,120}?\$",
+         "PHP 短输出标签直接打印变量（等价于 echo）",
+         "同 echo：追变量来源能不能到用户输入"),
+    rule("php.debug.dump", "php", "debug",
+         r"\b(?:var_dump|print_r|phpinfo|debug_zval_dump)\s*\(",
+         "调试输出 —— 把内部结构/配置回显给访问者（信息泄露）",
+         "确认这行是否在生产可达的路径上"),
 ]

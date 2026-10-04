@@ -92,6 +92,21 @@ CORPUS: list[Case] = [
         "$obj = unserialize($data);",
     ], expect_loc=["app.php:4"], expect_rules=["php.deser.unserialize"],
         note="cookie 反序列化（真实案例：多款 PHP 框架的 remember-me）"),
+    Case("php_xss_reflected", "positive", "php", "xss_r.php", [
+        "<?php",
+        "// 形态取自 DVWA 反射型 XSS：**先拼进变量、之后才输出**",
+        "if( array_key_exists( \"name\", $_GET ) && $_GET[ 'name' ] != NULL ) {",
+        "    $html .= '<pre>Hello ' . $_GET[ 'name' ] . '</pre>';",
+        "}",
+    ], expect_loc=["xss_r.php:4"], expect_rules=["php.xss.superglobal_to_html"],
+        note="DVWA 真实形态：sink 是「拼 HTML」，输出点可能在**另一个文件**（跨文件是判定层的活）"),
+    Case("php_xss_echo", "positive", "php", "out.php", [
+        "<?php",
+        "// 形态：把数据库里存的用户内容直接输出（存储型 XSS 的输出端）",
+        "$name = $row['name'];",
+        "echo $name;",
+    ], expect_loc=["out.php:4"], expect_rules=["php.xss.echo_var"],
+        note="存储型 XSS 的输出端（DVWA xss_s 的 index.php 就是这个形态）"),
 
     # ---------------- Java ----------------
     Case("java_jndi", "positive", "java", "Lookup.java", [
@@ -199,6 +214,19 @@ CORPUS: list[Case] = [
              "⚠️ 本条**曾经是已知误报**：规则匹配「括号内有 $」，把 `execute([$name])`"
              "（参数化绑定）也算进去了 —— 是本基准第一次跑就抓出来的，"
              "已用 `(?<!\\[)` 排除「$ 紧跟 `[`」这种绑定数组形态。留在这里当回归钉。"),
+    Case("neg_php_escaped_echo", "negative", "php", "safe_out.php", [
+        "<?php",
+        "// 已转义的输出 —— XSS 规则**不该**报它（这是这类规则最容易犯的误报）",
+        "echo htmlspecialchars( $name, ENT_QUOTES, 'UTF-8' );",
+        "echo '<h1>Hello</h1>';",
+    ], forbid_rules=["php.xss.echo_var", "php.xss.superglobal_to_html"],
+        note="转义过 / 纯静态的 echo **不该**被判 XSS"),
+    Case("neg_php_concat_escaped", "negative", "php", "safe_concat.php", [
+        "<?php",
+        "// 拼了 HTML 也拼了请求变量，但**经过转义** —— 不该报",
+        "$html .= '<pre>' . htmlspecialchars( $_GET['name'] ) . '</pre>';",
+    ], forbid_rules=["php.xss.superglobal_to_html"],
+        note="同行有转义函数时不该报 —— 行内黑名单就是为它准备的"),
 ]
 
 
