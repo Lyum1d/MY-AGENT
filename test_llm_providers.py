@@ -49,6 +49,17 @@ def req(method, path, body=None):
             return resp.status, json.loads(resp.read().decode() or "{}")
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode() or "{}")
+    except urllib.error.URLError as e:
+        # ⚠️ v073 修：**必须**捕 URLError 并在 import 期就挡住。
+        # 原来只捕 HTTPError，服务没起时顶层那行 `req(GET /api/llm/providers)`
+        # 直接抛未捕获的 URLError → 整个脚本 import 阶段就崩、一行结果都没有。
+        # 在 run_all_tests 眼里这就是「退出码 1 + 没有统计行」→ 被报成「异常」，
+        # 而真相只是「服务没跑」。**服务不可达是环境，不是产品失败。**
+        raise ServiceUnavailable(str(e))
+
+
+class ServiceUnavailable(RuntimeError):
+    """服务在 8770 不可达。**环境问题，不是回归失败。**"""
 
 
 def check(name, cond, extra=""):
@@ -69,7 +80,19 @@ def skip(name, why):
 
 # 运行前的供应商：跑完必须**还回去**。原来收尾硬切 ollama，于是每次回归都把用户的
 # 模型选择改掉，下次实战前还得手工切回来（2026-09-23 / 09-25 实测各踩一次）。
-_oc, _od = req("GET", "/api/llm/providers")
+#
+# ⚠️ v073：这一段是**模块顶层**，服务不可达会直接崩掉整个脚本（见 req() 的 URLError 说明）。
+# 所以先用一次探测把「服务是否在跑」定下来；不在跑就**打印结果行 + 退出 0**，
+# 让 run_all_tests 读成「跳过」而不是「异常」。
+try:
+    _oc, _od = req("GET", "/api/llm/providers")
+except ServiceUnavailable as _e:
+    print(f"== 服务未就绪 ==")
+    print(f"  目标 {BASE} 不可达：{str(_e)[:120]}")
+    print()
+    print("结果：0 通过 / 0 失败 / 1 跳过")
+    print(f"跳过项：全量（服务未在 {BASE} 运行 —— 环境问题，非回归）")
+    raise SystemExit(0)
 ORIGINAL_PROVIDER = _od.get("current", "") if _oc == 200 else ""
 
 
@@ -220,4 +243,9 @@ if FAIL:
     print("失败项：" + "、".join(FAIL))
 if SKIPPED:
     print("跳过项：" + "、".join(SKIPPED))
-    raise SystemExit(1)
+
+# ⚠️ v073 修：这里原来无条件 `raise SystemExit(1)`（只要有跳过项）。
+# 那与文件头 skip() 的设计**自相矛盾** —— 跳过是「环境不满足」，不是失败。
+# 后果：run_all_tests 见退出码非 0 且没有失败统计行语境，把正常跳过记成「异常」。
+# 现在的口径：**只有真的失败才非 0**；跳过不影响退出码（在结果行里写明即可）。
+raise SystemExit(1 if FAIL else 0)
