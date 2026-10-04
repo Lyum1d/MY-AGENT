@@ -32,6 +32,7 @@ from . import index as I
 from . import ingest as G
 from . import paths as P
 from . import sink_rules as S
+from . import taint as Taint
 
 #: 检索返回条数上限（返回太多既稀释注意力、也吃上下文）
 MAX_HITS = 300
@@ -149,27 +150,157 @@ def _scan(codebase_id: str, matcher, *, langs=None, limit=MAX_HITS,
 
 # ---------------------------------------------------------------- sink 检索
 
+#: 调用参数的括号区（取第一对括号内的内容，够用于本层判断）。
+#: ⚠️ `[^()]` 之外的字符类是 `[\s\S]` 的语义 —— 由调用方把**多行拼成一段**再喂进来，
+#: 这样「调用名一行、参数在下一行」的写法（Benchmark 里大量存在）才判得了：
+#:
+#:     connection.prepareStatement(          ← 调用名在这里
+#:         sql, ResultSet.TYPE_SCROLL_INSENSITIVE);   ← 参数在下一行
+_CALL_ARGS = re.compile(r"\(([^()]*(?:\([^()]*\)[^()]*)*)\)")
+
+#: 跨行找参数时最多往后看多少行（够覆盖格式化后的多行调用，又不会吃到别处的代码）
+_CALL_LOOKAHEAD = 6
+
+
+def _name_in(name: str, text: str) -> bool:
+    """`text` 里是否出现**变量 `name`**（容忍 PHP 的 `$` 前缀）。
+
+    `name` 来自污点集（已归一、不带 `$`），而源码里 PHP 变量带 `$` ——
+    所以两边都按「可选 `$` + 名字 + 非标识符边界」来比。
+    """
+    return bool(re.search(rf"\$?{re.escape(name)}(?![A-Za-z0-9_])", text))
+
+
+def _tainted_in_args(lines: list[str], lineno: int, col: int,
+                     tainted: set[str]) -> bool:
+    """从「第 `lineno` 行的第 `col` 列」起，**最近的括号区**内是否出现污点变量。
+
+    `col` 由 `call_pattern` 的匹配起点给出 —— 因此判的**一定是这次调用**的括号，
+    不会把同一行里无关调用的参数算进来。
+
+    ⚠️ **必须支持跨行**（v069 实测）：Benchmark 里大量写法是
+
+        connection.prepareStatement(
+            sql, ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+
+    —— 调用名和参数**不在同一行**。只在单行里找括号会直接判否，
+    实测 247 个漏报的 sqli 用例里 20 个属于这一类（占「本该命中」的全部）。
+    """
+    if lineno < 1 or lineno > len(lines):
+        return False
+    # 把「本行的 col 之后」+「后面几行」拼成一段，再找第一对括号
+    chunk = "\n".join([lines[lineno - 1][col:]] + lines[lineno:lineno + _CALL_LOOKAHEAD])
+    am = _CALL_ARGS.search(chunk)
+    if not am:
+        return False
+    args = am.group(1)
+    return any(_name_in(v, args) for v in tainted)
+
+
 def search_sinks(codebase_id: str, *, kinds=None, langs=None,
                  limit: int = MAX_HITS) -> list[Hit]:
-    """按危险 sink 规则库检索。`kinds`/`langs` 可缩小范围（如只看 rce）。"""
+    """按危险 sink 规则库检索。`kinds`/`langs` 可缩小范围（如只看 rce）。
+
+    ## 两层匹配（v069）—— 一行可以产出**两条**命中
+
+    1. **行级证据**：规则自己的 `pattern` 命中 —— 「这一行本身就能看出危险」
+       （如 `.executeQuery("... " + param)`）。`extractor` 为 `lexical`/`ast`；
+    2. **跨行证据**：规则的 `call_pattern` 命中**且**该次调用的括号内出现
+       **同一函数内的污点变量**（由 `taint.py` 推出）—— 「危险值在上一行拼好」。
+       `extractor` 为 `taint`/`taint(lexical)`。
+
+    ## 为什么不是「命中一个就 return」（v069 第一版的错误）
+
+    第一版写成 `if pattern命中: return` / `elif taint命中: return`，**整层成了死代码**：
+    两条平行规则的 `pattern` 相同 → 要么行级命中先 return，要么行级不命中时
+    「本行根本没有这个调用」，taint 分支判「括号里」无从下手。
+
+    现在改成**两层各跑各的、都收集**：同一行可能同时给出「行级」与「跨行」两条线索，
+    它们是**不同强度**的证据，都该交给模型（`why`/`hint` 已明确区分）。
+    为控总量，`limit` 仍然生效（按文件+行号顺序截断）。
+    """
     want_kinds = {k.lower() for k in kinds} if kinds else None
     want_langs = {l.lower() for l in langs} if langs else None
 
+    # 按文件缓存：行内容 + 污染分析（一个文件会被逐行问很多次，不缓存会重复解析）
+    taint_cache: dict[str, Taint.TaintResult] = {}
+    lines_cache: dict[str, list[str]] = {}
+
+    def _tainted_at(rel: str, lineno: int, lang: str) -> set[str]:
+        if rel not in taint_cache:
+            src = lines_cache.get(rel)
+            if src is None:
+                return set()
+            taint_cache[rel] = Taint.analyze(src, lang)
+        return Taint.tainted_names_at(taint_cache[rel], lineno)
+
     def matcher(rel, lang, lineno, line, idx):
+        found: list[Hit] = []
         for r in S.rules_for(lang):
             if want_kinds and r.kind not in want_kinds:
                 continue
-            if not r.regex().search(line):
+            if r.regex().search(line):
+                found.append(Hit(
+                    file=rel, line=lineno, text=line, lang=lang, kind=r.kind,
+                    rule_id=r.id, why=r.why, hint=r.hint,
+                    scope=_enclosing(idx, rel, lineno),
+                    extractor="ast" if lang == "python" else "lexical"))
+            crx = r.call_regex()
+            if crx is None:
                 continue
-            return Hit(file=rel, line=lineno, text=line, lang=lang, kind=r.kind,
-                       rule_id=r.id, why=r.why, hint=r.hint,
-                       scope=_enclosing(idx, rel, lineno),
-                       extractor="ast" if lang == "python" else "lexical")
-        return None
+            cm = crx.search(line)
+            if not cm:
+                continue
+            names = _tainted_at(rel, lineno, lang)
+            if not names:
+                continue
+            lines = lines_cache.get(rel)
+            if not lines or not _tainted_in_args(lines, lineno, cm.start(), names):
+                continue
+            found.append(Hit(
+                file=rel, line=lineno, text=line, lang=lang, kind=r.kind,
+                rule_id=r.id + "@taint",
+                why=f"[跨行污染] {r.why} —— 危险值在**本行之外**拼好，这里只是把变量传进来",
+                hint=(f"⚠️ 本行括号内的变量是**污点**（由上方赋值拼入外部输入）。"
+                      f"**先读那个变量的赋值行**确认它确实由外部输入拼成，再判断可达性；"
+                      f"{r.hint}"),
+                scope=_enclosing(idx, rel, lineno),
+                extractor="taint" if lang == "python" else "taint(lexical)"))
+        return found or None
 
-    hits = _scan(codebase_id, matcher, langs=want_langs, limit=limit)
-    # 稳定排序：可回归
-    hits.sort(key=lambda h: (h.file, h.line, h.rule_id))
+    # 预读文件内容供污染分析用（_scan 自己也会读，但两者互不干扰）
+    t = _collect(codebase_id, want_langs)
+    for fp in t.files:
+        rel = fp.relative_to(t.root).as_posix()
+        try:
+            lines_cache[rel] = fp.read_text(encoding="utf-8",
+                                            errors="replace").splitlines()
+        except OSError:
+            continue
+
+    hits: list[Hit] = []
+    idx = I.load(codebase_id)
+    scanned = 0
+    for fp in t.files:
+        rel = fp.relative_to(t.root).as_posix()
+        lang = t.lang_of[rel]
+        try:
+            text = fp.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            scanned += 1
+            if scanned > MAX_SCAN_LINES:
+                break
+            got = matcher(rel, lang, lineno, line, idx)
+            if got:
+                hits.extend(got)
+                if len(hits) >= limit:
+                    break
+        if scanned > MAX_SCAN_LINES or len(hits) >= limit:
+            break
+    # 稳定排序：同一行内**行级证据排在前**（强度更高），再按规则 id
+    hits.sort(key=lambda h: (h.file, h.line, h.rule_id.endswith("@taint"), h.rule_id))
     return hits
 
 

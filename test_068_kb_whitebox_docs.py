@@ -76,8 +76,12 @@ def main() -> int:
         body = r.get("content", "")
         check(f"kb_read('{fn}') 成功且非空", bool(body) and "error" not in r,
               r.get("error", ""))
-        check(f"{fn} 读全文未截断（默认 8000 字符上限内）",
-              not body.endswith("…（已截断）"), f"total_chars={r.get('total_chars')}")
+        # 篇目别写太长：长到默认上限就必然被截，而**截了模型会以为看完了**。
+        # ⚠️ 这里只断言「长度」这一个**会真的失败**的条件 —— 不加「有没有告知截断」那种
+        # 恒真断言（那种断言给了假的信心，比不写更坏；见 MEMORY.md 的教训库）。
+        total = r.get("total_chars") or len(body)
+        check(f"{fn} 长度在 8000 字符以内（默认上限下读得全，不靠截断）",
+              total <= 8000, f"total_chars={total}")
 
     # 篇目里不该出现「本机路径」（与 v056 隐私护栏同一条纪律）
     bad_path = []
@@ -121,11 +125,53 @@ def main() -> int:
     # --------------------------------------------------- ③ 提到的 rule_id 真实存在
     print("\n=== ③ 篇目提到的每个 rule_id 都真实存在于规则库 ===")
     real_ids = {r.id for r in S.ALL}
+    # ⚠️ 抽 rule_id 时**不能只按 `java.` / `php.` 前缀**抽 —— 那会把源码里的包名
+    # `java.io.FileInputStream` 当成 `java.io` 这个「规则」。真实规则的形态是
+    # `<语言>.<短名>` 或 `<语言>.<分类>.<短名>`（2~3 段），所以**先按真实 id 集合做词法锚定**：
+    # 用一个「最长匹配」的思路 —— 凡是文档里出现的、能**精确等于**某个真实 id 的串才算；
+    # 外加允许 `@taint` 后缀。这样 `java.io` 自然不会命中（它不在真实集合里）。
+    def _extract_rule_ids(text: str) -> set[str]:
+        found: set[str] = set()
+        for m in re.finditer(r"[A-Za-z_][a-z0-9_]*\.[a-z0-9_.]+", text):
+            tok = m.group(0)
+            # 逐段回退，找最长的真实前缀（`java.sqli.concat@taint` → `java.sqli.concat`）
+            parts = tok.split(".")
+            for n in range(len(parts), 1, -1):
+                cand = ".".join(parts[:n])
+                if cand in real_ids:
+                    found.add(cand)
+                    break
+        return found
+
     for fn in DOCS:
-        ids = set(re.findall(r"\b(?:php|py|java|js)\.[a-z0-9_.]+\b", _doc_text(fn)))
-        bad = sorted(i for i in ids if i not in real_ids)
+        txt = _doc_text(fn)
+        ids = _extract_rule_ids(txt)
+        # 文档里凡是**看起来像 rule_id**（`java.xxx.yyy` 两段以上）但不在集合里的，
+        # 都要求它至少不是「真实 id 的同族拼错」（把 `java.sqli.concat` 写成
+        # `java.sqli.conca` 这类）。做法：取该前缀族里有没有真实 id，有则报错。
+        suspects = []
+        for m in re.finditer(r"\b((?:php|py|java|js)\.[a-z0-9_]+(?:\.[a-z0-9_]+)+)", txt):
+            tok = m.group(1)
+            if tok in real_ids:
+                continue
+            # 漏掉 `@taint` 后仍在真实集合里 → 是合法写法
+            if tok + "@taint" in {f"{i}@taint" for i in real_ids}:
+                continue
+            head = ".".join(tok.split(".")[:2])
+            if any(i.startswith(head + ".") for i in real_ids):
+                suspects.append(tok)
         check(f"{fn} 里的 rule_id 全部存在",
-              not bad, f"不存在的：{bad}" if bad else f"提到 {len(ids)} 条：{sorted(ids)}")
+              not suspects, f"疑似拼错：{sorted(set(suspects))}" if suspects else
+              f"提到 {len(ids)} 条：{sorted(ids)}")
+        # `@taint` 只能加在**有 call_pattern 的**规则上（否则那个通道根本不会触发，
+        # 文档却告诉读的人「这条会有跨行命中」—— 是另一种文档漂移）
+        taint_doc = set(re.findall(r"\b([a-z][a-z0-9_]*\.[a-z0-9_.]+)@taint\b", txt))
+        no_call = sorted(i for i in taint_doc
+                         if (S.by_id(i) is not None and not S.by_id(i).call_pattern))
+        wrong = sorted(i for i in taint_doc if S.by_id(i) is None)
+        check(f"{fn} 里写了 `@taint` 的规则都真实存在且有跨行通道",
+              not no_call and not wrong,
+              f"不存在：{wrong}；无 call_pattern：{no_call}" if (no_call or wrong) else "")
 
     # ------------------------------------------------------ ④ kind 数与代码一致
     print("\n=== ④ 篇目里写的「N 个 kind」与规则库实际一致 ===")
