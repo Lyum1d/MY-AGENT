@@ -11,7 +11,7 @@
 | 工具 | target | args |
 |---|---|---|
 | `code_list` | 可空 | 忽略 |
-| `code_ingest` | **本机目录路径** | 可选：`dry_run` / `register_only` / `source=authorized` / `id=<自定义 id>` |
+| `code_ingest` | **本机目录路径** | 可选：`dry_run` / `register_only` / `source=authorized` / `id=<自定义 id>` / `exclude=a,b`（显式跳过目录） |
 | `code_index` | codebase_id | 忽略 |
 | `code_search` | codebase_id | `<mode> [查询]`，mode ∈ `sink` / `regex` / `symbol` / `string` / `deps` |
 | `code_read` | codebase_id | `<相对路径>[:行号] [上下行数]` |
@@ -102,12 +102,16 @@ def _h_ingest(target: str, args: str) -> str:
     opts = _kv(args)
     dry = "dry_run" in opts or opts.get("dry_run") in ("1", "true", "yes")
     reg = "register_only" in opts or opts.get("register_only") in ("1", "true", "yes")
+    # exclude=a,b：**显式**跳过目录（相对路径前缀或裸目录名）。
+    # 审「带数据目录的应用」时必须给 —— 否则 data/、logs/、uploads/ 会被当源码全扫进来。
+    exc = [x.strip() for x in (opts.get("exclude") or "").split(",") if x.strip()]
     res = G.ingest(target,
                    codebase_id=opts.get("id") or None,
                    source_kind=opts.get("source") or "opensource",
                    note=opts.get("note") or "",
                    register_only=reg,
-                   dry_run=dry)
+                   dry_run=dry,
+                   exclude=exc)
     head = "【入库预览（dry_run，未落盘、未写记录）】" if dry else "【入库完成】"
     tail = ("" if dry else
             f"\n下一步：code_index(target=\"{res.codebase_id}\") 建索引，"

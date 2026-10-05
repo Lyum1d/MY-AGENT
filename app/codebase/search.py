@@ -85,25 +85,24 @@ def _collect(codebase_id: str, langs: set[str] | None) -> _Target:
     if not root.is_dir():
         raise P.CodebaseNotFound(f"受控根不存在：{root}")
 
-    import os
     t = _Target(root=root)
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in G.SKIP_DIRS]
-        for fn in sorted(filenames):
-            lang = G.LANG_BY_EXT.get(pathlib.Path(fn).suffix.lower())
-            if lang not in G.SUPPORTED_LANGS:
+    # 遍历走 `ingest.walk_source`（**三层共用同一份判据**）——
+    # 排除同样是 codebase 的属性；以前这里自己又写了一遍 os.walk，
+    # 于是 `exclude` 漏了这一层（v076 实测：报告说排除了、检索里一个都没少）。
+    for _rel_dir, fn, fp in G.walk_source(root, exclude=cb.extra.get("exclude") or ()):
+        lang = G.LANG_BY_EXT.get(pathlib.Path(fn).suffix.lower())
+        if lang not in G.SUPPORTED_LANGS:
+            continue
+        if langs and lang not in langs:
+            continue
+        try:
+            if fp.stat().st_size > I.MAX_INDEX_FILE_BYTES:
                 continue
-            if langs and lang not in langs:
-                continue
-            fp = pathlib.Path(dirpath) / fn
-            try:
-                if fp.stat().st_size > I.MAX_INDEX_FILE_BYTES:
-                    continue
-            except OSError:
-                continue
-            rel = fp.relative_to(root).as_posix()
-            t.files.append(fp)
-            t.lang_of[rel] = lang
+        except OSError:
+            continue
+        rel = fp.relative_to(root).as_posix()
+        t.files.append(fp)
+        t.lang_of[rel] = lang
     return t
 
 

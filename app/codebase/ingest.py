@@ -111,6 +111,7 @@ class Scan:
     oversized: list[str] = field(default_factory=list)
     binary_only_hint: int = 0          # 只有二进制产物、没有对应源码的计数
     truncated: bool = False            # 是否因 MAX_FILES 提前停止
+    excluded_dirs: Counter = field(default_factory=Counter)   # 调用方**显式** exclude 掉的目录
 
 
 @dataclass
@@ -129,6 +130,7 @@ class IngestResult:
     truncated: bool = False          # 是否因 MAX_FILES 提前停止（summary 里要显示）
     dry_run: bool = False
     warnings: list[str] = field(default_factory=list)
+    excluded_dirs: dict[str, int] = field(default_factory=dict)   # 调用方显式 exclude 掉的目录
 
     def summary(self) -> str:
         langs = "、".join(f"{k}×{v}" for k, v in
@@ -145,6 +147,11 @@ class IngestResult:
         if self.skipped_dirs:
             lines.append("跳过目录    : " + "、".join(
                 f"{k}×{v}" for k, v in sorted(self.skipped_dirs.items())))
+        if self.excluded_dirs:
+            lines.append("排除目录    : " + "、".join(
+                f"{k}×{v}" for k, v in sorted(self.excluded_dirs.items())))
+            lines.append("              ↑ **这是调用方显式指定的**（不是自动判断）——"
+                         "结论只在这份范围内成立，报告里要一起写出来。")
         if self.oversized:
             lines.append(f"超大文件    : {len(self.oversized)} 个不进索引（不影响语言统计）")
         if self.truncated:
@@ -156,49 +163,122 @@ class IngestResult:
 
 # ---------------------------------------------------------------- 扫描
 
-def scan_tree(root, *, max_files: int = MAX_FILES) -> Scan:
-    """遍历代码树，产出语言分布 / 构建文件 / 大小统计。**只读，不改任何东西。**"""
+def walk_source(root, *, exclude=(), skipped=None, excluded=None):
+    """遍历受控根，产出 `(rel_dir, filename, abs_path)`。**唯一的目录遍历入口。**
+
+    ## 为什么必须收口成一个函数（v076 实测教训）
+
+    「走哪些目录」这条判据以前被**三层各写了一遍** `os.walk` + `SKIP_DIRS`：
+    `ingest.scan_tree`（统计）/ `index.build`（建索引）/ `search._collect`（检索）。
+    v076 给 `exclude` 加支持时只在 `ingest` 里加了，另两层就漏了 ——
+    结果是**入库报告打印「已排除 data/」，而索引和检索里那些文件一个都没少**。
+    这比不修更坏：报告在撒谎。
+
+    → **同一个判据只留一份实现**，三层都走这里。
+
+    `skipped` / `excluded`：传入 Counter 就顺手统计跳过的通用噪音目录 / 显式排除的目录。
+    """
+    root_p = pathlib.Path(root)
+    if not root_p.is_dir():
+        raise IngestError(f"来源不是目录：{root_p}")
+    excl = _norm_exclude(exclude)
+    if skipped is None:
+        skipped = Counter()
+    if excluded is None:
+        excluded = Counter()
+
+    for dirpath, dirnames, filenames in os.walk(root_p):
+        rel_dir = pathlib.Path(dirpath).relative_to(root_p).as_posix()
+        if rel_dir == ".":
+            rel_dir = ""
+        keep = []
+        for d in dirnames:
+            if d in SKIP_DIRS:
+                skipped[d] += 1
+            elif _is_excluded(rel_dir, d, excl):
+                excluded[(f"{rel_dir}/{d}" if rel_dir else d)] += 1
+            else:
+                keep.append(d)
+        dirnames[:] = keep
+        for fn in sorted(filenames):        # 排序：让三层的结果都可复现
+            yield rel_dir, fn, pathlib.Path(dirpath) / fn
+
+
+def _norm_exclude(exclude) -> tuple[str, ...]:
+    """把调用方给的 `exclude` 归一化成一组干净的「相对路径 / 裸目录名」。"""
+    out: list[str] = []
+    for raw in (exclude or ()):
+        if not isinstance(raw, str):
+            continue
+        e = raw.strip().replace("\\", "/").strip("/")
+        while e.startswith("./"):
+            e = e[2:]
+        if e and e not in out:
+            out.append(e)
+    return tuple(out)
+
+
+def _is_excluded(rel_dir: str, name: str, exclude: tuple[str, ...]) -> bool:
+    """`rel_dir/name` 是否该被排除。
+
+    两种写法都支持（**都是调用方显式给出的**，不存在自动猜测）：
+      · 含 `/` → 按**相对路径前缀**匹配（`data/scripts` 命中 `data/scripts/exec/x.py`）
+      · 不含 `/` → 按**目录名**匹配（`help` 命中任意深度的 `help/`）
+    """
+    if not exclude:
+        return False
+    child = f"{rel_dir}/{name}" if rel_dir else name
+    for e in exclude:
+        if "/" in e:
+            if child == e or child.startswith(e + "/"):
+                return True
+        elif name == e:
+            return True
+    return False
+
+
+def scan_tree(root, *, max_files: int = MAX_FILES, exclude=()) -> Scan:
+    """遍历代码树，产出语言分布 / 构建文件 / 大小统计。**只读，不改任何东西。**
+
+    `exclude`：**调用方显式指定**要跳过的目录（相对根路径前缀，或裸目录名）。
+
+    为什么**不**加进 `SKIP_DIRS`：那个集合是「**任何项目都该跳**的通用噪音」
+    （`.git` / `node_modules` / `__pycache__`），而 `data/`、`help/`、`uploads/`
+    这类**是不是源码完全取决于项目** —— 有的项目 `data/` 就是源码目录。
+    塞进全局集合会**静默隐藏真实代码**（"没命中"变得不可解释）；
+    交给调用方显式给出，才会在 `IngestResult.summary()` 里被打印出来，
+    让「这份结论是在什么范围内得出的」有据可查。
+    """
     root_p = pathlib.Path(root)
     if not root_p.is_dir():
         raise IngestError(f"来源不是目录：{root_p}")
 
     s = Scan(root=root_p)
-    for dirpath, dirnames, filenames in os.walk(root_p):
-        # 原地过滤，避免走进去（比 walk 完再筛快得多，也避免被 node_modules 拖死）
-        keep = []
-        for d in dirnames:
-            if d in SKIP_DIRS:
-                s.skipped_dirs[d] += 1
-            else:
-                keep.append(d)
-        dirnames[:] = keep
-
-        for fn in filenames:
-            p = pathlib.Path(dirpath) / fn
-            rel = p.relative_to(root_p).as_posix()
-            if len(s.files) >= max_files:
-                s.truncated = True
-                break
-            try:
-                size = p.stat().st_size
-            except OSError:
-                continue
-            s.files.append(rel)
-            s.total_bytes += size
-            if size > MAX_FILE_BYTES:
-                s.oversized.append(rel)
-
-            ext = p.suffix.lower()
-            lang = LANG_BY_EXT.get(ext)
-            if lang:
-                s.by_lang[lang] += 1
-            if fn in BUILD_FILES:
-                if fn not in s.build_files:
-                    s.build_files.append(fn)
-            if ext in BINARY_ARTIFACT_EXT:
-                s.binary_only_hint += 1
-        if s.truncated:
+    for _rel_dir, fn, p in walk_source(root_p, exclude=exclude,
+                                       skipped=s.skipped_dirs,
+                                       excluded=s.excluded_dirs):
+        rel = p.relative_to(root_p).as_posix()
+        if len(s.files) >= max_files:
+            s.truncated = True
             break
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        s.files.append(rel)
+        s.total_bytes += size
+        if size > MAX_FILE_BYTES:
+            s.oversized.append(rel)
+
+        ext = p.suffix.lower()
+        lang = LANG_BY_EXT.get(ext)
+        if lang:
+            s.by_lang[lang] += 1
+        if fn in BUILD_FILES:
+            if fn not in s.build_files:
+                s.build_files.append(fn)
+        if ext in BINARY_ARTIFACT_EXT:
+            s.binary_only_hint += 1
     return s
 
 
@@ -257,11 +337,16 @@ def make_codebase_id(source, extra: str = "") -> str:
     return f"{slug}-{h}"
 
 
-def _copy_tree(src: pathlib.Path, dst: pathlib.Path, skip: set[str]) -> int:
-    """把源码复制进受控根（跳过依赖/产物目录与超大文件之外的一切照抄）。"""
+def _copy_tree(src: pathlib.Path, dst: pathlib.Path, skip: set[str],
+               exclude: tuple[str, ...] = ()) -> int:
+    """把源码复制进受控根（跳过依赖/产物目录，以及调用方显式排除的目录）。"""
     n = 0
     for dirpath, dirnames, filenames in os.walk(src):
-        dirnames[:] = [d for d in dirnames if d not in skip]
+        rel_dir = pathlib.Path(dirpath).relative_to(src).as_posix()
+        if rel_dir == ".":
+            rel_dir = ""
+        dirnames[:] = [d for d in dirnames
+                       if d not in skip and not _is_excluded(rel_dir, d, exclude)]
         rel = pathlib.Path(dirpath).relative_to(src)
         (dst / rel).mkdir(parents=True, exist_ok=True)
         for fn in filenames:
@@ -277,13 +362,16 @@ def _copy_tree(src: pathlib.Path, dst: pathlib.Path, skip: set[str]) -> int:
 def ingest(source, *, codebase_id: str | None = None, source_kind: str = "opensource",
            note: str = "", layer_override: str | None = None,
            override_reason: str = "", dry_run: bool = False,
-           register_only: bool = False) -> IngestResult:
+           register_only: bool = False, exclude=None) -> IngestResult:
     """把一份代码入库。
 
     - 默认**复制**进受控根 `data/codebases/<id>/`（§4.1「落盘到受控根」）；
     - `register_only=True` 时不复制，只把**来源目录本身**登记为受控根
       —— 给「仓库太大/就在本机且不打算动它」的场景留一条路，但**要自己承担
       "这个目录可能被外部改动「的后果**，所以会在 warnings 里写明；
+    - `exclude`：**显式**要跳过的目录（相对根路径前缀如 `data/scripts`，或裸目录名如 `help`）。
+      审「带数据目录的应用」时用它 —— 否则 `data/`、`logs/`、`uploads/` 会被当源码全扫进来。
+      ⚠️ 与 `SKIP_DIRS` 的分工：那个是「所有项目都该跳」，这个是「只有你知道该不该跳」。
     - `dry_run=True` 只扫描并返回元数据，**不复制、不写记录**（先用它预览）。
     """
     src = pathlib.Path(source).expanduser()
@@ -294,9 +382,10 @@ def ingest(source, *, codebase_id: str | None = None, source_kind: str = "openso
     if kind not in P.SOURCES:
         raise IngestError(f"source 只能是 {P.SOURCES}，收到：{source_kind!r}")
 
-    scan = scan_tree(src)
+    scan = scan_tree(src, exclude=exclude)
     if not scan.files:
-        raise IngestError(f"来源里没有可读文件：{src}")
+        raise IngestError(f"来源里没有可读文件：{src}"
+                          + ("（检查 exclude 是不是把全部内容都排除了）" if exclude else ""))
     if scan.total_bytes > MAX_TOTAL_BYTES and not register_only:
         raise IngestError(
             f"来源总量 {scan.total_bytes/1024/1024:.0f} MB 超过上限 "
@@ -323,7 +412,8 @@ def ingest(source, *, codebase_id: str | None = None, source_kind: str = "openso
         build_files=list(scan.build_files), total_bytes=scan.total_bytes,
         skipped_dirs=dict(scan.skipped_dirs), oversized=scan.oversized[:20],
         supported=supported, truncated=scan.truncated,
-        dry_run=dry_run, warnings=warnings)
+        dry_run=dry_run, warnings=warnings,
+        excluded_dirs=dict(scan.excluded_dirs))
 
     if dry_run:
         return res
@@ -335,7 +425,7 @@ def ingest(source, *, codebase_id: str | None = None, source_kind: str = "openso
             # 同一 id 重复入库：先清掉旧的，避免新旧文件混在一起（那会让索引结果无法解释）
             shutil.rmtree(dst, ignore_errors=True)
         dst.mkdir(parents=True, exist_ok=True)
-        copied = _copy_tree(src, dst, SKIP_DIRS)
+        copied = _copy_tree(src, dst, SKIP_DIRS, _norm_exclude(exclude))
         if copied == 0:
             raise IngestError(f"复制失败：{src} → {dst}（0 个文件）")
         root = dst.resolve()
@@ -348,7 +438,11 @@ def ingest(source, *, codebase_id: str | None = None, source_kind: str = "openso
         note=(note.strip() or "") + (f"｜{override_reason.strip()}" if override_reason else ""),
         added_at=_now(), extra={"file_count": res.file_count,
                                 "by_lang": res.by_lang,
-                                "build_files": res.build_files}))
+                                "build_files": res.build_files,
+                                # ⭐ 排除是 **codebase 的属性**，必须落盘 ——
+                                # `index.build()` 会自己再走一遍受控根，若读不到这份排除，
+                                # 就会出「入库报告说排除了、索引里其实还在」的自相矛盾（v076 实测踩到）。
+                                "exclude": list(_norm_exclude(exclude))}))
     P.save_codebases(items)
     return res
 

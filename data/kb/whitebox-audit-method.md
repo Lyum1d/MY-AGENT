@@ -31,6 +31,12 @@ code_ingest <本机目录绝对路径>
 - `args` 加 `dry_run` 先看会收多少（**大仓先 dry_run**）；
 - 加 `register_only` = **就地登记不复制**（推荐，省磁盘且保持与工作树同步）；
 - 只支持**目录** —— 压缩包请先解压（**Zip Slip 防护未做**，别拿不信任的包直接喂）；
+- ⭐ **审「带数据目录的应用」时一定要加 `exclude=`** —— 例 `exclude=data/scripts,logs,uploads`。
+  `data/`、`logs/`、`uploads/` 是不是源码**取决于项目**（有的项目 `data/` 就是源码目录），
+  所以它们**不在**全局跳过名单里。不给 `exclude` 的后果是实测过的：
+  源目录 677 个文件里 479 个不是源码，sink 命中 **36% 落在数据目录里 = 纯噪声**。
+  `exclude` 会**落进 codebase 记录**，所以**建索引与检索都照它办**（不是只影响一行报告文字）。
+  被排除的目录会打印进 `summary()` —— **「这份结论在什么范围内成立」要跟着结论一起写**；
 - 拿到 `codebase_id`，之后所有查询都用它。
 
 **0.3 建索引**：
@@ -267,7 +273,7 @@ PoC：
 
 | 阶段 | 工具 | 一句话 |
 |---|---|---|
-| 0 授权+入库 | `code_ingest` | 先 `dry_run`；`register_only` 就地登记；只收目录 |
+| 0 授权+入库 | `code_ingest` | 先 `dry_run`；`register_only` 就地登记；只收目录；**带数据目录的应用要加 `exclude=`** |
 | 0 索引 | `code_index` | 不建索引 = 还没看 |
 | 1 心智模型 | `code_list` / `code_search symbol` | 信任边界与权限模型 |
 | 2 变体 | `code_search regex` | 读修复 commit → 全库搜同模式 |

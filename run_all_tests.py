@@ -118,6 +118,7 @@ PY_TESTS = [
     ("白盒批量基准（v070）", "test_070_batch_benchmark.py", False),
     ("白盒容器污染与口径（v072）", "test_072_container_taint.py", False),
     ("白盒变体分析（v074）", "test_074_variants.py", False),
+    ("白盒入库显式排除（v076）", "test_076_ingest_exclude.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

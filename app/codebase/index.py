@@ -312,34 +312,32 @@ def build(codebase_id: str, *, persist: bool = True, max_files: int = MAX_INDEX_
                 built_at=time.strftime("%Y-%m-%d %H:%M:%S"), file_count=0)
 
     from collections import Counter as _C
-    for dirpath, dirnames, filenames in __import__("os").walk(root):
-        dirnames[:] = [d for d in dirnames if d not in G.SKIP_DIRS]
-        for fn in sorted(filenames):
-            if idx.file_count >= max_files:
-                idx.skipped.append(f"（达到文件数上限 {max_files}，其余未索引）")
-                break
-            lang = G.LANG_BY_EXT.get(pathlib.Path(fn).suffix.lower())
-            if lang not in G.SUPPORTED_LANGS:
-                continue                       # 首批只分析四种语言（决策②）
-            fp = pathlib.Path(dirpath) / fn
-            try:
-                if fp.stat().st_size > MAX_INDEX_FILE_BYTES:
-                    idx.skipped.append(f"{fp.relative_to(root).as_posix()}（超过单文件上限）")
-                    continue
-                text = fp.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+    # ⚠️ 排除是 **codebase 的属性**（`ingest` 时记进 extra），不是一次性参数 ——
+    # 不读它就会「入库报告说已排除、索引里其实还在」，那比不修更坏（v076 实测踩到）。
+    # 遍历本身走 `ingest.walk_source`：**三层共用同一份「走哪些目录」的判据**
+    # （以前 ingest/index/search 各写一遍 os.walk，加 exclude 时漏了两层）。
+    for _rel_dir, fn, fp in G.walk_source(root, exclude=cb.extra.get("exclude") or ()):
+        if idx.file_count >= max_files:
+            idx.skipped.append(f"（达到文件数上限 {max_files}，其余未索引）")
+            break
+        lang = G.LANG_BY_EXT.get(pathlib.Path(fn).suffix.lower())
+        if lang not in G.SUPPORTED_LANGS:
+            continue                       # 首批只分析四种语言（决策②）
+        try:
+            if fp.stat().st_size > MAX_INDEX_FILE_BYTES:
+                idx.skipped.append(f"{fp.relative_to(root).as_posix()}（超过单文件上限）")
                 continue
-            rel = fp.relative_to(root).as_posix()
-            idx.file_count += 1
-            idx.lang_files[lang] = idx.lang_files.get(lang, 0) + 1
-            idx.extractors[lang] = "ast" if lang == "python" else "lexical"
-            s, st, im = extract(text, rel, lang)
-            idx.symbols.extend(s)
-            idx.strings.extend(st)
-            idx.imports.extend(im)
-        else:
+            text = fp.read_text(encoding="utf-8", errors="replace")
+        except OSError:
             continue
-        break
+        rel = fp.relative_to(root).as_posix()
+        idx.file_count += 1
+        idx.lang_files[lang] = idx.lang_files.get(lang, 0) + 1
+        idx.extractors[lang] = "ast" if lang == "python" else "lexical"
+        s, st, im = extract(text, rel, lang)
+        idx.symbols.extend(s)
+        idx.strings.extend(st)
+        idx.imports.extend(im)
 
     # ---- 确定性：排序 + 去重（同一份代码任何时候结果相同，才能进回归）----
     idx.symbols.sort(key=lambda x: (x.file, x.line, x.kind, x.name))
