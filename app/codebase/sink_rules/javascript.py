@@ -41,7 +41,12 @@ RULES: list[SinkRule] = [
     rule("js.xss.innerhtml", "javascript", "xss",
          r"\.innerHTML\s*=|\.outerHTML\s*=|document\s*\.\s*write\s*\(",
          "直接写入 HTML —— 内容来自用户输入时是 DOM XSS",
-         "赋值来源；有无用 textContent 或框架的转义"),
+         "赋值来源；有无用 textContent 或框架的转义。"
+         "⚠️ 这是**宽口径**规则（`.innerHTML =` 在任何前端项目里都太普遍 —— "
+         "实测在某真实仓库命中 92 处、占该次扫描总量的 45%，而**全部是假阳性**："
+         "插值都过了项目自己的 `esc()` / `md()` 转义）。"
+         "它是为「DOM XSS 的注入点**没有它就全漏**」而留的，"
+         "命中请当**低置信候选**看待 —— 必须逐个插值确认有没有过转义，再下结论。"),
     rule("js.xss.react_dangerous", "javascript", "xss",
          r"dangerouslySetInnerHTML",
          "React 里显式绕过转义 —— 名字就说明了它在做什么",

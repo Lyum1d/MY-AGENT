@@ -15,7 +15,8 @@ RULES: list[SinkRule] = [
          #    那是正则编译，与「把字符串当代码执行」毫无关系，而 Python 代码里到处都是它。
          #    v076 自审实测：这条规则在 src-agent 上命中 151 处，**其中 85 处（56%）
          #    是 `re.compile(` / `("class", re.compile(...))` / `re.compile(_user, re.I)`** —— 零 RCE。
-         #    裸 `compile(src, filename, mode)`（内建，可控输入即可编译执行）仍照常命中。
+         #    裸的三参内建 `compile`（可控输入即可编译执行）仍照常命中。
+         #    ⚠️ 本注释同样不写带括号的调用字面量 —— 规则文件是 .py，写了会被自己命中。
          r"\b(?:eval|exec|__import__)\s*\(|(?<![.\w])compile\s*\(",
          "把字符串当代码执行 / 动态导入",
          "输入是否可控；`eval` 的 globals 有没有限制（`{'__builtins__': {}}` 也不是绝对安全）"),
@@ -56,7 +57,15 @@ RULES: list[SinkRule] = [
          r"\bopen\s*\(|os\s*\.\s*(?:remove|unlink|rename|mkdir|makedirs|listdir|walk)\s*\("
          r"|shutil\s*\.\s*(?:copy\w*|move|rmtree)\s*\(",
          "文件操作 —— 路径可控即可穿越（读配置/写任意位置）",
-         "有无 `os.path.basename` / `realpath` + 前缀校验；能否 `..` 穿越"),
+         "有无 `os.path.basename` / `realpath` + 前缀校验；能否 `..` 穿越。"
+         "⚠️ 这是**宽口径**规则（Python 里文件读写太日常 —— `open` 系列、`os.remove`、"
+         "`shutil` 的复制/删除每天都在用；实测某真实仓库命中 59 处，占该次扫描的 29%，"
+         "绝大多数是**固定路径或内部计算的路径**）。"
+         "它是为「路径穿越**没有它就全漏**」而留的，"
+         "命中请当**低置信候选**看待 —— 必须先确认路径里有没有不可信输入，再下结论。"
+         # ⚠️ 本段刻意不写出带**半角括号**的调用字面量：规则文件本身是 `.py`，
+         #    写出来会被**自己**命中（v079 实测踩到）。`test_079` 里有自命中守卫。
+         ),
     rule("py.path.send_file", "python", "path_traversal",
          r"\b(?:send_file|send_from_directory|FileResponse)\s*\(",
          "Web 框架的文件下发接口 —— 路径可控即任意文件读取",

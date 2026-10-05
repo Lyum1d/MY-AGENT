@@ -62,14 +62,17 @@ class SinkRule:
     # ## 第三类结构性漏报：sink 的**调用者本身**是个变量
     #
     #     Runtime r = Runtime.getRuntime();
-    #     Process p = r.exec(cmd + param);        // ← `_CMD_CALL` 完全匹配不到
+    #     Process p = r.exec（cmd + param）;      // ← `_CMD_CALL` 完全匹配不到
+    #
+    # ⚠️ 上面刻意用**全角括号**：规则文件本身是 `.py`，写半角 `(` 会被 `py.rce.eval`
+    # 自己命中（v079 实测踩到）。`test_079` 里加了「规则库自命中必须为 0」的守卫。
     #
     # `call_pattern` 解决的是「**参数**是变量」（值在别处拼好）；
     # 这里解决的是「**调用者**是变量」（执行器在别处取得）。两者正交：
     # 前者靠「括号里有没有污点变量」判，后者靠「调用者是不是执行器变量」判。
     #
-    # ⚠️ 为什么不放宽 `pattern`：把 `Runtime.getRuntime().exec(` 改成 `.exec(`
-    # 会匹配任意对象的 `exec` 方法 → 裸奔（v069 删宽口径 `.load(` 的同族教训）。
+    # ⚠️ 为什么不放宽 `pattern`：把带 `Runtime.getRuntime()` 前缀的写法改成裸方法名
+    # 会匹配任意对象的 `exec` 方法 → 裸奔（v069 删宽口径 `.load` 的同族教训）。
     # 正确做法是**变量层面的类型判定** —— 由 `search.py` 配合 `taint.py` 的
     # `runners` 集合完成。
     runner_pattern: str = ""
