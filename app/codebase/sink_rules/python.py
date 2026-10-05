@@ -11,7 +11,12 @@ from .base import SinkRule, rule
 RULES: list[SinkRule] = [
     # ---------- 代码执行 ----------
     rule("py.rce.eval", "python", "rce",
-         r"\b(?:eval|exec|compile|__import__)\s*\(",
+         # ⚠️ `compile` 必须排除**方法调用**形态（`re.compile(pat)`）：
+         #    那是正则编译，与「把字符串当代码执行」毫无关系，而 Python 代码里到处都是它。
+         #    v076 自审实测：这条规则在 src-agent 上命中 151 处，**其中 85 处（56%）
+         #    是 `re.compile(` / `("class", re.compile(...))` / `re.compile(_user, re.I)`** —— 零 RCE。
+         #    裸 `compile(src, filename, mode)`（内建，可控输入即可编译执行）仍照常命中。
+         r"\b(?:eval|exec|__import__)\s*\(|(?<![.\w])compile\s*\(",
          "把字符串当代码执行 / 动态导入",
          "输入是否可控；`eval` 的 globals 有没有限制（`{'__builtins__': {}}` 也不是绝对安全）"),
     rule("py.rce.pickle", "python", "deserialization",
