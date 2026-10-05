@@ -111,7 +111,7 @@ def main() -> int:
         check("ingest(...).excluded_dirs 带出来了",
               set(res.excluded_dirs) == {"data", "logs"}, f"{res.excluded_dirs}")
         txt = res.summary()
-        check("summary() 打印「排除目录」", "排除目录" in txt)
+        check("summary() 打印「排除项」", "排除项" in txt)
         check("summary() 明确写着这是调用方指定的（不可当自动判断）",
               "显式指定" in txt)
 
@@ -158,11 +158,14 @@ def main() -> int:
 
         # ---------------------------------------------------------- ⑥ 边界
         print("\n=== ⑥ 边界 ===")
-        # `exclude` 的语义是**目录**：传文件路径不生效（这是刻意的，避免误以为能按文件排除）
+        # ⚠️ 语义变更（v078）：无通配符的条目现在**同时**认目录与精确文件名
+        #    —— 所以「传文件路径」是生效的（v076 时只认目录）。详见 test_078。
         s_file = IG.scan_tree(root, exclude=["app/main.py"])
-        check("`exclude` 只作用于目录 —— 传文件路径不生效",
-              s_file.excluded_dirs == {} and len(s_file.files) == n_all,
-              f"{dict(s_file.excluded_dirs)}")
+        check("`exclude` 认精确文件名（v078 起，见 test_078）",
+              list(s_file.excluded_dirs) == ["app/main.py"] and len(s_file.files) == n_all - 1,
+              f"{dict(s_file.excluded_dirs)} / {n_all} → {len(s_file.files)}")
+        check("排掉一个文件不影响同目录其它文件",
+              any(f == "app/util.py" for f in s_file.files))
 
         top_dirs = sorted({rel.split("/")[0] for rel in FIXTURE})
         s_all = IG.scan_tree(root, exclude=top_dirs)
@@ -181,7 +184,7 @@ def main() -> int:
         # ---------------------------------------------------------- ⑦ 工具接线
         print("\n=== ⑦ code_ingest handler 能传 exclude ===")
         out = T.handle("code_ingest", str(root), "dry_run exclude=data,logs")
-        check("handler 输出里出现「排除目录」", "排除目录" in out)
+        check("handler 输出里出现「排除项」", "排除项" in out)
         check("handler 输出里点了 `data` 与 `logs`",
               "data" in out and "logs" in out)
 
@@ -194,7 +197,7 @@ def main() -> int:
         try:
             r2 = IG.ingest(root, codebase_id=cid, register_only=True,
                            exclude=["data/scripts"])
-            check("ingest 报告确实写了「排除目录」", "排除目录" in r2.summary())
+            check("ingest 报告确实写了「排除项」", "排除项" in r2.summary())
             check("排除项落进了 codebase 记录（index/search 才读得到）",
                   P.get_codebase(cid) is not None
                   and "data/scripts" in (P.get_codebase(cid).extra.get("exclude") or []),

@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import os
 import pathlib
 import re
@@ -148,7 +149,8 @@ class IngestResult:
             lines.append("跳过目录    : " + "、".join(
                 f"{k}×{v}" for k, v in sorted(self.skipped_dirs.items())))
         if self.excluded_dirs:
-            lines.append("排除目录    : " + "、".join(
+            # 目录与文件都记在这里（v078 起 `exclude` 也支持 `test_*.py` 这类文件模式）
+            lines.append("排除项      : " + "、".join(
                 f"{k}×{v}" for k, v in sorted(self.excluded_dirs.items())))
             lines.append("              ↑ **这是调用方显式指定的**（不是自动判断）——"
                          "结论只在这份范围内成立，报告里要一起写出来。")
@@ -201,6 +203,9 @@ def walk_source(root, *, exclude=(), skipped=None, excluded=None):
                 keep.append(d)
         dirnames[:] = keep
         for fn in sorted(filenames):        # 排序：让三层的结果都可复现
+            if _file_matches(rel_dir, fn, excl):    # 文件级排除（`test_*.py` 这类）
+                excluded[(f"{rel_dir}/{fn}" if rel_dir else fn)] += 1
+                continue
             yield rel_dir, fn, pathlib.Path(dirpath) / fn
 
 
@@ -218,17 +223,54 @@ def _norm_exclude(exclude) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _has_glob(s: str) -> bool:
+    """含通配符 → 这条 `exclude` 是**文件模式**（`test_*.py` / `*.min.js` / `src/gen/*.java`）。"""
+    return any(ch in s for ch in "*?[")
+
+
+def _file_matches(rel_dir: str, fn: str, exclude: tuple[str, ...]) -> bool:
+    """文件名是否命中某条 `exclude`（**精确名**或**含通配符的模式**）。
+
+    - 含通配符（`test_*.py` / `*.min.js` / `src/gen/*.java`）→ 按 `fnmatchcase` 匹配；
+    - 不含通配符（`_classify_step.py` / `src/gen.py`）→ 按**精确文件名 / 相对路径**匹配。
+
+    匹配同时试**文件名**与**相对路径**：`test_*.py` 能命中任意深度，
+    `src/gen/*.java` 则只在那个目录下命中。
+
+    ⚠️ 用 `fnmatchcase`（**大小写敏感**）而非 `fnmatch` —— 后者在 Windows 上
+    会按平台做大小写归一，导致同一份代码在 Windows/Linux 上排出不同的文件集合，
+    **回归就不可复现了**。大小写敏感是可预期的那一个。
+
+    ⚠️ 一个条目**同时**可能匹配到同名目录与文件 —— 这是刻意的：
+    这样「`data` 排掉 data/」与「`_classify_step.py` 排掉那个文件」用同一套语法就够，
+    不需要调用方区分「我写的是目录还是文件」。
+    """
+    if not exclude:
+        return False
+    rel = f"{rel_dir}/{fn}" if rel_dir else fn
+    for e in exclude:
+        if _has_glob(e):
+            if fnmatch.fnmatchcase(fn, e) or fnmatch.fnmatchcase(rel, e):
+                return True
+        elif fn == e or rel == e:
+            return True
+    return False
+
+
 def _is_excluded(rel_dir: str, name: str, exclude: tuple[str, ...]) -> bool:
     """`rel_dir/name` 是否该被排除。
 
     两种写法都支持（**都是调用方显式给出的**，不存在自动猜测）：
       · 含 `/` → 按**相对路径前缀**匹配（`data/scripts` 命中 `data/scripts/exec/x.py`）
       · 不含 `/` → 按**目录名**匹配（`help` 命中任意深度的 `help/`）
+      · ⚠️ **含通配符的条目不走这里** —— 那是文件模式，见 `_file_matches`
     """
     if not exclude:
         return False
     child = f"{rel_dir}/{name}" if rel_dir else name
     for e in exclude:
+        if _has_glob(e):                    # 文件模式（`test_*.py`）不参与目录判定
+            continue
         if "/" in e:
             if child == e or child.startswith(e + "/"):
                 return True
@@ -240,7 +282,8 @@ def _is_excluded(rel_dir: str, name: str, exclude: tuple[str, ...]) -> bool:
 def scan_tree(root, *, max_files: int = MAX_FILES, exclude=()) -> Scan:
     """遍历代码树，产出语言分布 / 构建文件 / 大小统计。**只读，不改任何东西。**
 
-    `exclude`：**调用方显式指定**要跳过的目录（相对根路径前缀，或裸目录名）。
+    `exclude`：**调用方显式指定**要跳过的**目录**（相对根路径前缀，或裸目录名）
+    或**文件**（含通配符，如 `test_*.py` / `*.min.js` / `src/gen/*.java`）。
 
     为什么**不**加进 `SKIP_DIRS`：那个集合是「**任何项目都该跳**的通用噪音」
     （`.git` / `node_modules` / `__pycache__`），而 `data/`、`help/`、`uploads/`
@@ -369,9 +412,12 @@ def ingest(source, *, codebase_id: str | None = None, source_kind: str = "openso
     - `register_only=True` 时不复制，只把**来源目录本身**登记为受控根
       —— 给「仓库太大/就在本机且不打算动它」的场景留一条路，但**要自己承担
       "这个目录可能被外部改动「的后果**，所以会在 warnings 里写明；
-    - `exclude`：**显式**要跳过的目录（相对根路径前缀如 `data/scripts`，或裸目录名如 `help`）。
+    - `exclude`：**显式**要跳过的**目录**（相对根路径前缀如 `data/scripts`，或裸目录名如 `help`）
+      或**文件模式**（含通配符，如 `test_*.py` / `*.min.js`）。
       审「带数据目录的应用」时用它 —— 否则 `data/`、`logs/`、`uploads/` 会被当源码全扫进来。
       ⚠️ 与 `SKIP_DIRS` 的分工：那个是「所有项目都该跳」，这个是「只有你知道该不该跳」。
+      ⚠️ **`test_*.py` 这类**：测试文件里内嵌的代码样本会被当源码命中（实测占噪声大头），
+      审计生产代码时应把它们排掉。
     - `dry_run=True` 只扫描并返回元数据，**不复制、不写记录**（先用它预览）。
     """
     src = pathlib.Path(source).expanduser()
