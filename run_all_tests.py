@@ -122,6 +122,7 @@ PY_TESTS = [
     ("白盒规则误报修正（v077）", "test_077_rule_compile_fp.py", False),
     ("白盒文件级排除（v078）", "test_078_exclude_glob.py", False),
     ("白盒宽口径规则标注（v079）", "test_079_rule_wide_marking.py", False),
+    ("规格勾选框↔代码事实 守卫（v084）", "test_084_spec_checklist_sync.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),
