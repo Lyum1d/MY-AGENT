@@ -1,8 +1,8 @@
-> 白盒**怎么读命中**（分类篇）。检索层给你一堆 `文件:行号`，**那全是候选不是漏洞** —— 本篇讲怎么把命中分成「真候选 / 需补链 / 已知误报」三类，以及每条规则能信到几分。查完怎么走流程见 `whitebox-audit-method`。一句话：**`sink` 命中的意思是「这里有个危险调用」，不是「有漏洞」。**
+> 白盒**怎么读命中**（分类篇）。姊妹篇：`whitebox-targeting`（**打哪个目标**）、`whitebox-audit-method`（**拿到代码之后怎么审**）。检索层给你一堆 `文件:行号`，**那全是候选不是漏洞** —— 本篇讲怎么把命中分成「真候选 / 需补链 / 已知误报」三类，以及每条规则能信到几分。查完怎么走流程见 `whitebox-audit-method`。一句话：**`sink` 命中的意思是「这里有个危险调用」，不是「有漏洞」。**
 
 # Sink 命中分类手册
 
-## 一、规则库的全貌（用来估"我是不是漏看了"）
+## 一、规则库全貌
 
 | 语言 | 条数 | 抽取方式 |
 |---|---|---|
@@ -33,8 +33,9 @@ Process p = r.exec("echo " + param); // ← @runner 命中打在这一行
 ```
 
 ⚠️ 三个通道**可能同时命中同一行** —— 不是重复，是**性质不同的线索**。
-⚠️ **两个间接通道各自只覆盖 4 条 / 1 条规则**：`@taint` 只在 `java.rce.runtime_exec` / `java.sqli.concat` / `java.path.file` / `java.ssrf.url`（`call_pattern` 非空）；`@runner` 只在 `java.rce.runtime_exec`（`runner_pattern` 非空）。**别的规则没有这些通道**，对应写法在其他 kind 上仍会漏（**已知边界，不当"规则坏了"**）。
-⚠️ 且 `java.rce.runtime_exec` / `java.path.file` 的 `call_pattern` 与 `pattern` **逐字节相同** → 那条 `@taint` 是**纯冗余**（永远与行级同生共死）。**已知项**，见 `test_072`。
+⚠️ **两个间接通道只覆盖 4 条 / 1 条规则**：`@taint` 仅 `java.rce.runtime_exec`/`java.sqli.concat`/`java.path.file`/`java.ssrf.url`；
+`@runner` 仅 `java.rce.runtime_exec`。**其余规则无这两条通道**，同样写法在别类上仍会漏（**已知边界**）。
+⚠️ `java.rce.runtime_exec`/`java.path.file` 的 `call_pattern` 与 `pattern` **逐字节相同** → 那条 `@taint` **纯冗余**（**已知项**，见 `test_072`）。
 ⚠️ **`@runner` 不做成「放宽 `\.exec\(`」**：那会匹配**任意对象**的同名 `exec`，是裸奔。正确做法是**变量层面的类型判定** —— 只有调用者确实来自 `Runtime.getRuntime()` / `new ProcessBuilder(...)` 才算。
 
 **13 个 `kind`**（用 `code_search sink <kind>` 收窄）：

@@ -5,7 +5,7 @@
 ## 使用约定
 
 - 进站先读 `打穿短表.md`；对得上再打开对应模块看细节。文件不长就整篇开；超长篇可先开点名节，不够就继续开。禁止每站通读本目录
-- **白盒（有源码）另走**：先 `whitebox-audit-method.md`（流程：入库→索引→查 sink→逆向→四问闸门），命中读不懂再 `whitebox-sink-triage.md`（分类与已知误报）。黑盒那套类型矩阵不适用源码审计。
+- **白盒（有源码）另走**：先 `whitebox-targeting.md`（**打哪个目标**：必要条件→OSV 反查→GitHub 复核→代码自检守卫；**选靶决定产出上限**），再 `whitebox-audit-method.md`（**拿到代码之后怎么审**：入库→索引→查 sink→逆向→四问闸门），命中读不懂再 `whitebox-sink-triage.md`（分类与已知误报）。黑盒那套类型矩阵不适用源码审计。
 - 磁盘有 `*src经验.md` 才开专篇，没有不算缺。开 `SKILL.md` 不会再带集团日记
 - 短表和「注入/SSRF/XSS/RCE」都不是上限。本站过全类型矩阵；四件套打在有差分面上（防空窗），不是只测这四类，也不是每个 path 喷 `'`。有会话时越权/逻辑与四件套同硬（`dig-scope` §4.2.3）
 - 方便和能力优先；省 token 是顺带，不挡开模块
@@ -64,6 +64,7 @@
 | `subdomain-takeover-test.md` | 专题知识（hack-skills 导入或融合） |
 | `type-juggling-test.md` | 专题知识（hack-skills 导入或融合） |
 | `waf-bypass.md` | WAF 绕过 |
+| `whitebox-targeting.md` | **白盒选靶**：六轮实测战绩；「0 CVE」的两种含义；**四步流水线**（必要条件→OSV 反查→GitHub 复核→代码自检守卫）；候选出来要**查它在哪个版本被修** |
 | `whitebox-audit-method.md` | **白盒流程**：Phase 0~6 落到 `code_*` 工具（入库/索引/查 sink/逆向/四问闸门） |
 | `whitebox-sink-triage.md` | **白盒命中分类**：13 个 kind + 三类归宿；跨文件链路归判定层、`impossible.php` 当负样本 |
 | `websocket-test.md` | WebSocket（原有+补充） |
@@ -71,4 +72,4 @@
 | `xss-test.md` | XSS（中文开场 + 冷门事件 + XSS→RCE / 自定义协议） |
 | `xxe-test.md` | 专题知识（hack-skills 导入或融合） |
 
-**合计：51 个知识文件**（不含本 README）。SRC 报告版式不在本库：见 `~/.grok/rules/vuln-report-format.md`。定级只认 format，本库不定级。
+**合计：52 个知识文件**（不含本 README）。SRC 报告版式不在本库：见 `~/.grok/rules/vuln-report-format.md`。定级只认 format，本库不定级。

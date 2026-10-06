@@ -36,7 +36,17 @@ from app import registry as REG                              # noqa: E402
 from app.codebase import sink_rules as S                     # noqa: E402
 
 KB_DIR = REPO / "data" / "kb"
-DOCS = ["whitebox-audit-method.md", "whitebox-sink-triage.md"]
+#: 白盒三篇（v085 拆出第三篇：**选靶**独立成篇）
+#: ⚠️ 拆篇的动因：`kb.read()` 默认 `max_chars=8000`，**超了就静默截断**，
+#: 而分类篇/流程篇曾双双贴到 7998/7996 —— 再不拆就没法记录新教训了。
+DOCS = ["whitebox-targeting.md", "whitebox-audit-method.md", "whitebox-sink-triage.md"]
+
+#: 三篇各管一件事，**必须互相指得到**（否则拆完就散了，模型只会读到一篇）
+CROSS_REF = {
+    "whitebox-targeting.md": ["whitebox-audit-method", "whitebox-sink-triage"],
+    "whitebox-audit-method.md": ["whitebox-targeting", "whitebox-sink-triage"],
+    "whitebox-sink-triage.md": ["whitebox-targeting", "whitebox-audit-method"],
+}
 
 ok, fail = [], []
 
@@ -90,6 +100,20 @@ def main() -> int:
         for m in re.finditer(r"[A-Za-z]:\\Users\\[^\s`\"]+", txt):
             bad_path.append(f"{fn}:{m.group(0)}")
     check("篇目里不含本机绝对路径（C:\\Users\\…）", not bad_path, str(bad_path[:3]))
+
+    # ⭐ v085：拆成三篇之后，**三篇必须互相指得到**
+    # 动因：拆篇若不留指针，模型只会读到"打开的那一篇"，另外两篇等于不存在。
+    print("\n=== ①b ⭐ 三篇互相有指针（拆了不能散）===")
+    for fn, others in CROSS_REF.items():
+        txt = _doc_text(fn)
+        miss = [o for o in others if o not in txt]
+        check(f"{fn} 指向另外两篇", not miss,
+              f"未提到：{miss}" if miss else "")
+    # 反向：篇与篇的**分工**要在标题/首行说清（防「三篇写同一件事」）
+    for fn, kw in (("whitebox-targeting.md", "选靶"),
+                   ("whitebox-audit-method.md", "流程"),
+                   ("whitebox-sink-triage.md", "分类")):
+        check(f"{fn} 自我定位含「{kw}」", kw in _doc_text(fn)[:400], "")
 
     # ------------------------------------------------- ② 提到的 code_* 工具真实存在
     print("\n=== ② 篇目提到的每个 code_* 工具都真实存在于 registry ===")
