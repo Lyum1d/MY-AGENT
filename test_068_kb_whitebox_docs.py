@@ -36,16 +36,21 @@ from app import registry as REG                              # noqa: E402
 from app.codebase import sink_rules as S                     # noqa: E402
 
 KB_DIR = REPO / "data" / "kb"
-#: 白盒三篇（v085 拆出第三篇：**选靶**独立成篇）
-#: ⚠️ 拆篇的动因：`kb.read()` 默认 `max_chars=8000`，**超了就静默截断**，
-#: 而分类篇/流程篇曾双双贴到 7998/7996 —— 再不拆就没法记录新教训了。
-DOCS = ["whitebox-targeting.md", "whitebox-audit-method.md", "whitebox-sink-triage.md"]
+#: 白盒四篇（v085 拆出「选靶」；**v086 拆出「召回」**）
+#: ⚠️ 拆篇的动因：`kb.read()` 默认 `max_chars=8000`，**超了就静默截断**。
+#: 分类篇曾贴到 7998 —— 拆出选靶后回到 7979；**v086 加召回分析又到 8602**，
+#: 于是按同一原则**再拆一次**（而不是逐字压缩）。
+#: ⭐ **规律：满了就拆，别压。** 压缩会把「为什么」压掉，只留下结论。
+DOCS = ["whitebox-targeting.md", "whitebox-audit-method.md",
+        "whitebox-sink-triage.md", "whitebox-recall.md"]
 
-#: 三篇各管一件事，**必须互相指得到**（否则拆完就散了，模型只会读到一篇）
+#: 四篇各管一件事，**必须互相指得到**（否则拆完就散了，模型只会读到一篇）
+#: ⚠️ 拆篇这种「只是挪个内容」的改动最容易漏引用 —— 人眼复核靠不住，所以写成断言。
 CROSS_REF = {
-    "whitebox-targeting.md": ["whitebox-audit-method", "whitebox-sink-triage"],
-    "whitebox-audit-method.md": ["whitebox-targeting", "whitebox-sink-triage"],
-    "whitebox-sink-triage.md": ["whitebox-targeting", "whitebox-audit-method"],
+    "whitebox-targeting.md": ["whitebox-audit-method", "whitebox-sink-triage", "whitebox-recall"],
+    "whitebox-audit-method.md": ["whitebox-targeting", "whitebox-sink-triage", "whitebox-recall"],
+    "whitebox-sink-triage.md": ["whitebox-targeting", "whitebox-audit-method", "whitebox-recall"],
+    "whitebox-recall.md": ["whitebox-targeting", "whitebox-audit-method", "whitebox-sink-triage"],
 }
 
 ok, fail = [], []

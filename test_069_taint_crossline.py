@@ -379,6 +379,12 @@ def main() -> int:                                   # noqa: C901（分支多但
     print("\n=== ⑦ 白盒 KB 篇目已反映 v069/v071（防文档漂移）===")
     kb_dir = REPO / "data" / "kb"
     triage = (kb_dir / "whitebox-sink-triage.md").read_text(encoding="utf-8")
+    # ⚠️ v086 拆出 `whitebox-recall` —— 召回/口径类结论**搬到那里去了**。
+    # 断言的本意是「这些教训必须白纸黑字写着」，**不是**「必须写在这一篇里」
+    # （`test_068` 负责管「写在哪一篇」，两者分工不同，别互相顶）。
+    # 所以召回类断言改查**两篇的并集** —— 谁搬家都不会误报。
+    recall = (kb_dir / "whitebox-recall.md").read_text(encoding="utf-8")
+    recall_kb = triage + "\n" + recall
     for kw, desc in (("@taint", "跨行命中的可区分标记"),
                      ("@runner", "执行器变量命中的可区分标记（v071）"),
                      ("runner", "执行器通道本身（v071）"),
@@ -388,18 +394,22 @@ def main() -> int:                                   # noqa: C901（分支多但
         check(f"分类篇写了「{kw}」（{desc}）", kw in triage)
     # ⚠️ v071 更正了分母口径 —— 文档若还留着旧的 20.4% 当结论，就是在骗模型。
     # 允许提到旧数字（要讲清它为什么错），但**必须**同时给出正确口径。
-    check("分类篇写了真实项目的召回（不是只有 DVWA 的 100%）",
-          "Benchmark" in triage and "83.0%" in triage, "")
-    check("分类篇写明了「标尺本身也会错」这条教训（v071）",
-          "标尺" in triage and ("分母" in triage or "可命中" in triage), "")
-    check("分类篇写明了「精确性会被口径骗」（v071）",
-          "文件级" in triage and ("kind" in triage or "别类" in triage), "")
+    # ⚠️ v086：这里原先硬编码 `83.0%`（v071 的文件级值）。但**文件级数字会随召回改善而变**
+    # （v086 已达 85.8%）—— 硬编码它等于**让守卫自己变成漂移源**：数字一变，断言就假红，
+    # 而它想防的其实是「文档只写 DVWA 的 100%、不写真实项目」。所以改成查**任一真实召回数字**
+    # 的形态（`N/N = P%`），既保住本意、又不会因为召回提升而误报。
+    check("写了真实项目的召回（不是只有 DVWA 的 100%）",
+          "Benchmark" in recall_kb and re.search(r"\d+/\d+\s*=\s*\d+(?:\.\d+)?%", recall_kb), "")
+    check("写明了「标尺本身也会错」这条教训（v071）",
+          "标尺" in recall_kb and ("分母" in recall_kb or "可命中" in recall_kb), "")
+    check("写明了「精确性会被口径骗」（v071）",
+          "文件级" in recall_kb and ("kind" in recall_kb or "别类" in recall_kb), "")
     # ⚠️ 关键：文档必须说清「正确分母」是「标注 ∩ 检出」，否则模型会照旧口径读召回。
     # 不强求出现「旧口径」三个字（那是措辞），要的是**语义必须写明白**。
-    check("分类篇写明正确分母 = 「标注 ∩ 检出」（不是标注总数）",
-          "标注 ∩ 检出" in triage, "")
-    check("分类篇提醒「别把 100% 读成规则完美」（防过度乐观）",
-          "别把 100%" in triage, "")
+    check("写明正确分母 = 「标注 ∩ 检出」（不是标注总数）",
+          "标注 ∩ 检出" in recall_kb, "")
+    check("提醒「别把 100% 读成规则完美」（防过度乐观）",
+          "别把 100%" in recall_kb, "")
     # 「别信命中总数」这条教训
     check("分类篇写了「别信命中总数」这条教训",
           "总数" in triage and "骗人" in triage, "")
