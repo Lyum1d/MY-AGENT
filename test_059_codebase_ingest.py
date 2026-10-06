@@ -219,12 +219,24 @@ def test_limits():
               f"{len(s.files)}/{s.truncated}")
     with mock.patch.object(I, "MAX_TOTAL_BYTES", 10):
         store = TMP / "store2"
-        with mock.patch.object(I, "CODEBASE_STORE", store):
+        rec = TMP / "codebases2.json"
+        # ⚠️ v088：**必须同时 mock `CODEBASES_FILE`**。
+        #   这里两次 `ingest()` 都是**真入库**路径 —— 只 mock `CODEBASE_STORE` 时，
+        #   `register_only=True` 那条仍会往**真** `data/codebases.json` 写一条 `proj1-xxxxxx`，
+        #   而本模块结尾只删 `TMP` 目录、**不注销登记** → 每跑一次测试多一条垃圾记录
+        #   （实测累积 46 条，`code_list` 被污染）。与 v088 `codebase_testkit` 同一类问题：
+        #   **凡是真跑 `ingest()` 的测试，落盘与登记两处都要隔离**。
+        with mock.patch.object(I, "CODEBASE_STORE", store), \
+             mock.patch.object(P, "CODEBASES_FILE", rec):
             check("总量超限且要复制 → 拒绝（并提示 register_only）",
                   _raises(I.IngestError, lambda: I.ingest(repo)))
             r = I.ingest(repo, register_only=True)
             check("register_only 时总量超限不拦（因为不复制）",
                   r.codebase_id and not store.exists())
+            check("登记写进了 mock 的记录文件（没碰真 data/codebases.json）",
+                  rec.exists() and any(c.codebase_id == r.codebase_id
+                                       for c in P.load_codebases()),
+                  f"rec={rec.name}")
 
 
 def main() -> int:

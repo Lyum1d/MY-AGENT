@@ -114,7 +114,11 @@ def _make_codebase(tmp: pathlib.Path, name: str) -> str:
 
 
 def _cleanup(cid: str) -> None:
-    """把测试造的 codebase 从记录里摘掉（**不留垃圾**：它会被 `code_list` 看见）。"""
+    """⚠️ v088 起**不再使用** —— 清理已收口到 `codebase_testkit.cleanup_codebase()`。
+
+    保留（而非删掉）是为了让「这里曾有一份私有实现、且它漏了删目录」这件事在代码里留痕：
+    与 `test_069` 同一件事写了两遍，是本版要根除的形态（v076 教训）。
+    """
     items = [c for c in P.load_codebases() if c.codebase_id != cid]
     P.save_codebases(items)
 
@@ -469,15 +473,18 @@ def main() -> int:                                    # noqa: C901
 
     finally:
         # ---- 清理：登记与落盘都不留垃圾 ----
-        _cleanup(cid)
+        # ⚠️ v088：`CODEBASE_STORE` 定义在 `ingest`（`I`），**不在** `paths`（`P`）。
+        #   这里原本写 `P.CODEBASE_STORE` → 抛 `AttributeError`，又被下面的
+        #   `except Exception: pass` **静默吞掉** → 连带 `shutil.rmtree(tmp)` 一起没执行
+        #   （`tmp` 里有 3 条真源码，每次跑测试都留一个 `variants_test_*` 目录）。
+        #   已改用 `codebase_testkit.cleanup_codebase()` 统一收口 —— 与 `test_069` 一份实现。
+        from codebase_testkit import cleanup_codebase
+        cleanup_codebase(cid)
         try:
             import shutil
-            dst = P.CODEBASE_STORE / cid
-            if dst.exists():
-                shutil.rmtree(dst, ignore_errors=True)
             shutil.rmtree(tmp, ignore_errors=True)
-        except Exception:                                   # noqa: BLE001
-            pass
+        except Exception as e:                              # noqa: BLE001
+            print(f"  [清理] 删除临时源码目录失败（不影响测试）：{e}")
 
     print("\n" + "=" * 68)
     print(f"结果：{len(ok)} 通过 / {len(fail)} 失败")
