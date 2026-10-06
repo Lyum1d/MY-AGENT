@@ -43,6 +43,8 @@ def set_scope(domains) -> None:
     p = _TMP / "scope.json"
     if domains == "BROKEN":                   # 内容不是合法 JSON
         p.write_text("{ this is not json", encoding="utf-8")
+    elif isinstance(domains, dict):           # 完整 dict（测 targets / excluded_hosts）
+        p.write_text(json.dumps(domains, ensure_ascii=False), encoding="utf-8")
     else:
         p.write_text(json.dumps({"domains": domains}, ensure_ascii=False),
                      encoding="utf-8")
@@ -279,6 +281,48 @@ check("未授权时 loopback 依然被拒（fail-closed 没被放宽）",
       check_scope("127.0.0.1") is not None)
 check("未授权时本地临时服务地址同样被拒",
       check_scope("localhost") is not None)
+
+config.SCOPE_FILE = _ORIG_SCOPE
+
+# ---------------------------------------------------------------------------
+# ⭐ 6. `excluded_hosts` 绝不能进入白名单（2026-10-06 实测踩到的坑）
+#
+# 起因：把「范围外、明确不测」的域名留痕时，第一版写成了 `targets` 里一条
+# `excluded: true` 的条目 —— 但 `_allowed_hosts()` 只读 `domains` + `targets[].host`，
+# **不区分 excluded** → 那个本该被拒的域名**反而被放行了**（check_scope 返回 None）。
+# 正确做法是放进独立的 `excluded_hosts`，它不参与白名单合并。
+#
+# 本组断言把这个教训钉死：两边的行为都要测，否则改回去也没人发现。
+print("=== 6. excluded_hosts 语义（排除留痕不得变成授权）===")
+
+set_scope({
+    "domains": ["example.com"],
+    "excluded_hosts": [{"host": "out-of-scope.example.net",
+                        "reason": "范围外，明确不测"}],
+})
+check("excluded_hosts 里的域名**被拒**（它是留痕，不是授权）",
+      check_scope("out-of-scope.example.net") is not None)
+check("excluded_hosts 不影响真正的授权域名",
+      check_scope("example.com") is None)
+check("excluded_hosts 的域名**不在**白名单视图（load_scope）里",
+      "out-of-scope.example.net" not in load_scope())
+
+# 反向：targets 里的条目**确实**进白名单（这是既有设计，不能因为上面那条被误改）
+set_scope({
+    "domains": [],
+    "targets": [{"host": "in-scope.example.com", "include_subdomains": True}],
+})
+check("targets[].host 进白名单（既有设计，未被误改）",
+      check_scope("in-scope.example.com") is None)
+
+# ⚠️ 把「排除项写进 targets」这个错误做法本身也钉住 —— 说明它确实会放行，
+#    这正是当初踩坑的原因，写下来防下次有人"顺手简化"。
+set_scope({
+    "domains": [],
+    "targets": [{"host": "wrongly-listed.example.net", "excluded": True}],
+})
+check("⚠️ 排除项若写进 targets 就会被放行（已知陷阱：所以必须用 excluded_hosts）",
+      check_scope("wrongly-listed.example.net") is None)
 
 config.SCOPE_FILE = _ORIG_SCOPE
 

@@ -38,7 +38,24 @@ from app.codebase import sink_rules as S      # noqa: E402
 from app.codebase import search as Q          # noqa: E402
 from app.codebase import taint as T           # noqa: E402
 
+# ⭐ v088：测试造的 codebase **必须用完就清** —— `ingest()` 默认会把源码复制到
+# `data/codebases/<id>/` 并写进 `data/codebases.json`，而 `code_list` 会**读那份记录**。
+# 本文件原先三处 `ingest` 都不清理：实测累积 44 个 tmp 目录、把登记表污染到 96 条里 95 条是假的。
+# 清理实现**收口在 `codebase_testkit`**（不再抄第 N 份 `_cleanup()`，见 v076 的判据）。
+from codebase_testkit import cleanup_codebase      # noqa: E402
+
 ok, fail = [], []
+
+#: 本文件建过的临时 codebase —— 统一在 `finally` 里清（异常路径也清）
+_CREATED_CIDS: list[str] = []
+
+
+def _ingest_temp(src) -> str:
+    """入库一个临时目录，并**登记到待清理表**（调用方不必自己管）。"""
+    from app.codebase import ingest as G                # noqa: PLC0415
+    cid = G.ingest(str(src), source_kind="opensource").codebase_id
+    _CREATED_CIDS.append(cid)
+    return cid
 
 
 def check(name, cond, extra=""):
@@ -215,8 +232,7 @@ def main() -> int:                                   # noqa: C901（分支多但
             "}",
         ]) + "\n", encoding="utf-8")
 
-        res_ing = G.ingest(str(d), source_kind="opensource")
-        cid = res_ing.codebase_id
+        cid = _ingest_temp(d)
         I.build(cid)
         hits = Q.search_sinks(cid, limit=500)
 
@@ -275,7 +291,7 @@ def main() -> int:                                   # noqa: C901（分支多但
             "  }",
             "}",
         ]) + "\n", encoding="utf-8")
-        cid3 = G.ingest(str(d), source_kind="opensource").codebase_id
+        cid3 = _ingest_temp(d)
         I.build(cid3)
         hits3 = Q.search_sinks(cid3, limit=500)
 
@@ -339,7 +355,7 @@ def main() -> int:                                   # noqa: C901（分支多但
             "  }",
             "}",
         ]) + "\n", encoding="utf-8")
-        cid2 = G.ingest(str(d), source_kind="opensource").codebase_id
+        cid2 = _ingest_temp(d)
         I.build(cid2)
         hits2 = Q.search_sinks(cid2, limit=500)
         safe_taint = [h for h in hits2
@@ -422,5 +438,17 @@ def main() -> int:                                   # noqa: C901（分支多但
     return 0 if not fail else 1
 
 
+def _run() -> int:
+    """跑 `main()`，**无论成败都清掉本次建的临时 codebase**（v088）。"""
+    try:
+        return main()
+    finally:
+        for _cid in _CREATED_CIDS:
+            cleanup_codebase(_cid)
+        if _CREATED_CIDS:
+            print(f"  [清理] 已注销并删除 {len(_CREATED_CIDS)} 个临时 codebase"
+                  f"（否则会污染 code_list 与 data/codebases/）")
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_run())
