@@ -149,15 +149,11 @@ def _scan(codebase_id: str, matcher, *, langs=None, limit=MAX_HITS,
 
 # ---------------------------------------------------------------- sink 检索
 
-#: 调用参数的括号区（取第一对括号内的内容，够用于本层判断）。
-#: ⚠️ `[^()]` 之外的字符类是 `[\s\S]` 的语义 —— 由调用方把**多行拼成一段**再喂进来，
-#: 这样「调用名一行、参数在下一行」的写法（Benchmark 里大量存在）才判得了：
-#:
-#:     connection.prepareStatement(          ← 调用名在这里
-#:         sql, ResultSet.TYPE_SCROLL_INSENSITIVE);   ← 参数在下一行
-_CALL_ARGS = re.compile(r"\(([^()]*(?:\([^()]*\)[^()]*)*)\)")
-
 #: 跨行找参数时最多往后看多少行（够覆盖格式化后的多行调用，又不会吃到别处的代码）
+#:
+#: ⚠️ **v093 实测：不要顺手放大这个窗口。** 配平之后放大到 20 行在 Benchmark 上
+#: **一个指标都不变**（`F1w20` = `F1w40` = `F1w80`），但窗口越大、
+#: 越可能把**无关代码里的污点变量**算进这次调用的参数区 —— 属于"没买到东西就不要买"。
 _CALL_LOOKAHEAD = 6
 
 
@@ -170,9 +166,54 @@ def _name_in(name: str, text: str) -> bool:
     return bool(re.search(rf"\$?{re.escape(name)}(?![A-Za-z0-9_])", text))
 
 
+def _arg_region(lines: list[str], lineno: int, col: int,
+                max_lines: int = _CALL_LOOKAHEAD) -> str | None:
+    """从「第 `lineno` 行的第 `col` 列」起，**按括号深度配平**取第一个括号区的内容。
+
+    ## 为什么不用正则（v093 修的正确性缺陷）
+
+    原实现是 `re.compile(r"\\(([^()]*(?:\\([^()]*\\)[^()]*)*)\\)")` —— 它只能配**一层**嵌套。
+    遇到**嵌套 lambda / 匿名类**的参数区（Benchmark 的 JdbcTemplate 就是）：
+
+        JDBCtemplate.query(
+            sql,
+            new org.springframework.jdbc.core.RowMapper<String>() { @Override … });
+
+    正则配不平 → `search()` **退化成匹配到后面那个碰巧闭合的 `()`** →
+    `group(1)` 是**空字符串** → 判「括号里没有污点变量」→ **漏报**。
+    实测（OWASP BenchmarkJava v1.2）：`BenchmarkTest00431`、`BenchmarkTest00038` 卡在这里。
+
+    ⚠️ 更坏的是那个退化**不只是漏报**：它匹配到的是**别处的括号**，
+    若那里恰好出现一个污点变量，就会产出**张冠李戴的命中**。配平后不可能再错配。
+
+    ⚠️ **窗口内配不平就返回 `None`（保守判否）**，绝不退化成"匹配下一对括号"。
+
+    ## 增量（诚实记录）
+
+    单独上这一条，Benchmark 上**指标一个都不变**（918 → 918 条命中）——
+    **它修的是正确性，不是召回**。与 v072 的「容器 `add` 通道」（增量 0）同族。
+    """
+    if lineno < 1 or lineno > len(lines):
+        return None
+    text = "\n".join([lines[lineno - 1][col:]] + lines[lineno:lineno + max_lines])
+    start = text.find("(")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:i]
+    return None                                              # 窗口内没配平 → 判否
+
+
 def _tainted_in_args(lines: list[str], lineno: int, col: int,
                      tainted: set[str]) -> bool:
-    """从「第 `lineno` 行的第 `col` 列」起，**最近的括号区**内是否出现污点变量。
+    """从「第 `lineno` 行的第 `col` 列」起，**这次调用的括号区**内是否出现污点变量。
 
     `col` 由 `call_pattern` 的匹配起点给出 —— 因此判的**一定是这次调用**的括号，
     不会把同一行里无关调用的参数算进来。
@@ -184,15 +225,13 @@ def _tainted_in_args(lines: list[str], lineno: int, col: int,
 
     —— 调用名和参数**不在同一行**。只在单行里找括号会直接判否，
     实测 247 个漏报的 sqli 用例里 20 个属于这一类（占「本该命中」的全部）。
+
+    ⚠️ **v093 起括号区按深度配平**（见 `_arg_region`）：嵌套 lambda 也判得了，
+    且配不平就判否，不再"退化成匹配后面那对括号"。
     """
-    if lineno < 1 or lineno > len(lines):
+    args = _arg_region(lines, lineno, col)
+    if args is None:
         return False
-    # 把「本行的 col 之后」+「后面几行」拼成一段，再找第一对括号
-    chunk = "\n".join([lines[lineno - 1][col:]] + lines[lineno:lineno + _CALL_LOOKAHEAD])
-    am = _CALL_ARGS.search(chunk)
-    if not am:
-        return False
-    args = am.group(1)
     return any(_name_in(v, args) for v in tainted)
 
 

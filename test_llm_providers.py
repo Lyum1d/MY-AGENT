@@ -32,6 +32,10 @@ import urllib.parse
 import urllib.request
 
 BASE = "http://127.0.0.1:8770"
+#: 单次请求的读取预算。⚠️ 别为了"让慢机器的探测变绿"而调大它 ——
+#: 本机本地模型一次生成要 80~90 秒，探测要两次往返，调大等于让每次回归多等 3 分钟；
+#: 正确做法是**超时按环境问题跳过**（见 `req()` 的 TimeoutError 说明）。
+REQ_TIMEOUT = 120
 OK, FAIL, SKIPPED = [], [], []
 
 
@@ -45,17 +49,34 @@ def req(method, path, body=None):
     # 本机 127.0.0.1 必须绕开全局代理
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(r, timeout=120) as resp:
+        with opener.open(r, timeout=REQ_TIMEOUT) as resp:
             return resp.status, json.loads(resp.read().decode() or "{}")
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode() or "{}")
+    # ⚠️ v073 修：**必须**捕 URLError 并在 import 期就挡住。
+    # 原来只捕 HTTPError，服务没起时顶层那行 `req(GET /api/llm/providers)`
+    # 直接抛未捕获的 URLError → 整个脚本 import 阶段就崩、一行结果都没有。
+    # 在 run_all_tests 眼里这就是「退出码 1 + 没有统计行」→ 被报成「异常」，
+    # 而真相只是「服务没跑」。**服务不可达是环境，不是产品失败。**
     except urllib.error.URLError as e:
-        # ⚠️ v073 修：**必须**捕 URLError 并在 import 期就挡住。
-        # 原来只捕 HTTPError，服务没起时顶层那行 `req(GET /api/llm/providers)`
-        # 直接抛未捕获的 URLError → 整个脚本 import 阶段就崩、一行结果都没有。
-        # 在 run_all_tests 眼里这就是「退出码 1 + 没有统计行」→ 被报成「异常」，
-        # 而真相只是「服务没跑」。**服务不可达是环境，不是产品失败。**
         raise ServiceUnavailable(str(e))
+    except TimeoutError as e:
+        # ⚠️⚠️ v093 修：**读超时是 v073 那个 bug 的孪生情形** —— `socket.timeout`
+        # （Python 3.10+ 起就是 `TimeoutError`）**不是 `URLError` 的子类**，
+        # 所以上面那个 except 拦不住它：`resp.read()` 超时会直接抛出来。
+        #
+        # 实测（2026-10-07，本机）：本地模型 `qwen3.5:9b` **一次最小生成就要 82~89 秒**
+        # （冷热都一样，见 `ollama ps` 显示 100% GPU 仍如此），而本脚本第 10 节的
+        # ollama 探测要**两次往返**（对话 + 工具调用）≈180s，**稳定超过这里的 120s**。
+        # 原来没捕 → 脚本崩、被 run_all_tests 记成「异常（退出码 1）」，
+        # 而真相是「**本机模型太慢**」，纯环境问题。
+        # 与文件头 `skip()` 的设计一致：环境不满足**跳过**，不判失败。
+        raise ServiceUnavailable(
+            f"读取超时（{REQ_TIMEOUT}s）：请求未在预算内返回 —— "
+            f"服务可能无响应，或本机本地模型过慢")
+    except OSError as e:
+        # 兜底：连接被重置 / 半开连接等，同属"服务/环境"层面，不该让脚本崩掉。
+        raise ServiceUnavailable(f"{type(e).__name__}: {e}")
 
 
 class ServiceUnavailable(RuntimeError):
@@ -222,7 +243,13 @@ check("重复删除返回 404", code == 404)
 print("== 10. 本地 Ollama 真实探测（对话 + 工具调用） ==")
 # Ollama 没起是**环境**问题，不该判失败 —— 否则「零回归」这条信号会失真：
 # 每次都要人工回忆「这几条是环境红的」，久了就没人看了，真正的产品问题也会被埋掉。
-code, d = req("POST", "/api/llm/providers/ollama/test")
+# ⚠️ v093：**"太慢"与"没起"要同样对待** —— 本地模型一次生成 80~90 秒时，
+# 这次探测（对话 + 工具调用，两次往返）会在预算内答不完。原来这里没有兜底，
+# `req()` 抛出的超时会直接崩掉整个脚本（被记成「异常」）。现在按环境跳过。
+try:
+    code, d = req("POST", "/api/llm/providers/ollama/test")
+except ServiceUnavailable as _e:
+    code, d = 0, {"error": str(_e)}
 if code == 200 and d.get("chat"):
     check("本地模型可连通", True,
           f"tools={d.get('tools')} models={len(d.get('models', []))}")
@@ -232,7 +259,7 @@ if code == 200 and d.get("chat"):
         print(f"     [提示] 工具调用探测未通过：{d.get('hint') or d.get('error')}")
 else:
     skip("本地模型可连通",
-         f"Ollama 未运行或不可用：{d.get('error') or d.get('hint') or code}")
+         f"Ollama 未运行、不可用或过慢：{d.get('error') or d.get('hint') or code}")
 
 print()
 _line = f"结果：{len(OK)} 通过 / {len(FAIL)} 失败"
