@@ -125,6 +125,7 @@ PY_TESTS = [
     ("规格勾选框↔代码事实 守卫（v084）", "test_084_spec_checklist_sync.py", False),
     ("白盒控制流前缀污染（v086）", "test_086_taint_prefixed_assign.py", False),
     ("白盒控制流前缀清除与跨行赋值（v090）", "test_090_taint_ctrl_and_crossline.py", False),
+    ("白盒 sink 调用名覆盖（v091）", "test_091_sql_sink_names.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),

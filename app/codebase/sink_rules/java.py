@@ -44,11 +44,36 @@ _FS_CLASSES = r"(?:File|FileInputStream|FileOutputStream|FileReader|FileWriter" 
 
 #: 文件/流类的「调用名」pattern（跨行污染用：只认调用，不要求参数里有 `+`）
 _FS_CALL = rf"\bnew\s+(?:[\w.]+\.)?{_FS_CLASSES}\s*\("
-#: JDBC / JPA 语句执行类的**调用名**（不含开头括号 —— 行级 pattern 要在其后接参数要求）
-_SQL_CALL_BARE = (r"\.(?:executeQuery|executeUpdate|execute|prepareStatement|prepareCall"
-                  r"|nativeSQL|createQuery|createNativeQuery)")
-#: 同上 + 开头括号（跨行污染用：只认调用，不要求参数里有 `+`）
-_SQL_CALL = _SQL_CALL_BARE + r"\s*\("
+#: JDBC / JPA 语句执行的**调用名清单**（行级 pattern 与跨行通道共用这一份）
+_SQL_CALL_NAMES = (r"executeQuery|executeUpdate|execute|prepareStatement|prepareCall"
+                   r"|nativeSQL|createQuery|createNativeQuery")
+#: ⚠️ v091 补：**Spring `JdbcTemplate` 家族 + JDBC 批处理**。**只进跨行通道**，见 `_SQL_CALL`。
+_SQL_CALL_NAMES_EXTRA = (r"queryForObject|queryForList|queryForMap|queryForRowSet"
+                         r"|queryForLong|queryForInt|batchUpdate|executeBatch")
+#: 行级用：调用名（不含开头括号 —— 其后要接「参数里有 `+`」的要求）
+_SQL_CALL_BARE = r"\.(?:" + _SQL_CALL_NAMES + r")"
+#: 跨行污染用：调用名 + 开头括号（只认调用，不要求参数里有 `+`）
+#:
+#: ## ⚠️ v091：为什么 Spring 家族**只**加在这里，不加进行级 `pattern`
+#:
+#: 实测（OWASP BenchmarkJava v1.2，2026-10-07）：sqli 的 34 例漏报里 **21 例（62%）**
+#: 走 Spring `DatabaseHelper.JDBCtemplate.*`：
+#:
+#:     JDBCtemplate.queryForObject(sql, Long.class);   // BenchmarkTest00025
+#:     JDBCtemplate.batchUpdate(sql);                  // BenchmarkTest00194
+#:     JDBCtemplate.query(sql, rowMapper);             // BenchmarkTest00431
+#:
+#: 它们**一个都不在**旧白名单里 —— 这不是「多行调用」问题，是**sink 调用名没覆盖**。
+#:
+#: **只挂跨行通道**（要求括号内有**污点变量**）的理由：
+#: ① 行级形态（同行有 `+`）**没有实测过**，别顺手放宽；
+#: ② 两个通道**证据强度不同**（"同行拼接" vs "变量来自别处"），合在一起就分不清了 ——
+#:    与 v072「两个方向都会骗人」同族：**能分开的证据就别合并。**
+#:
+#: ⚠️ 刻意**不收**裸 `query` / `update`：实测把它们一起收进来，
+#: Benchmark 上的召回与误报**一个都没变**（54/64、误报 30/43 完全相同）——
+#: 即"更宽"在这里**没有买到任何东西**，那就不买（v069 删宽口径 `.load(` 的同一判据）。
+_SQL_CALL = r"\.(?:" + _SQL_CALL_NAMES + r"|" + _SQL_CALL_NAMES_EXTRA + r")\s*\("
 #: 命令执行的「调用名」pattern
 #:
 #: ## v071：调用者变量盲区（实测驱动，**不是**猜的）

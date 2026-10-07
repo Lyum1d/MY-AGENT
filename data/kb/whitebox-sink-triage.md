@@ -38,6 +38,31 @@ Process p = r.exec("echo " + param); // ← @runner 命中打在这一行
 ⚠️ `java.rce.runtime_exec`/`java.path.file` 的 `call_pattern` 与 `pattern` **逐字节相同** → 那条 `@taint` **纯冗余**（**已知项**，见 `test_072`）。
 ⚠️ **`@runner` 不做成「放宽 `\.exec\(`」**：那会匹配**任意对象**的同名 `exec`，是裸奔。正确做法是**变量层面的类型判定** —— 只有调用者确实来自 `Runtime.getRuntime()` / `new ProcessBuilder(...)` 才算。
 
+### ⚠️ 调用名白名单：覆盖的**第三个维度**（v091）
+
+一条规则能不能命中，取决于三件事：① 行级 `pattern` 写没写对；② 有没有 `call_pattern` 通道；
+③ **`call_pattern` 里枚举了哪些「调用名」**。第三点最容易被忘掉 ——
+它的失效**不是"规则写错了"，而是"那批 sink 名压根不在名单里"**，看代码不容易显形。
+
+实测（OWASP BenchmarkJava v1.2，2026-10-07）：`java.sqli.concat` 的 **34 例漏报里 21 例（62%）**
+走 **Spring `JdbcTemplate`**，而名单里当时只有 JDBC/JPA 的 8 个名字：
+
+| 曾漏（v091 补上） | 形态 |
+|---|---|
+| `queryForObject` / `queryForList` / `queryForMap` / `queryForRowSet` / `queryForLong` / `queryForInt` | Spring `JdbcTemplate` 查询 |
+| `batchUpdate` / `executeBatch` | 批处理 |
+
+⚠️ **补上后只挂 `@taint` 通道，不加进行级 `pattern`** —— 两个通道**证据强度不同**
+（"同行拼接" vs "变量来自别处"），合并就分不清了。**能分开的证据就别合并。**
+⚠️ **刻意不收裸 `query` / `update`**：实测把它们一起收进来，召回与误报**一个都没变**
+（54/64、误报 30/43 完全相同）—— "更宽"在这里**没买到任何东西**，那就不买
+（与 v069 删掉宽口径 `\.load\s*\(` 同一判据）。
+
+⭐ **诊断法（可复用）**：某类召回低时，先问「**这批漏报用例到底调用了什么**」——
+把漏报文件的 sink 行捞出来看调用名，通常一眼就能分出是**"名字没覆盖"**还是**"值没传进来"**。
+⚠️ 别急着归因成"多行调用"这类含糊说法：**调用侧**（v069 已修）与**赋值侧**（v090 才修）是两回事，
+量之前必须说清是哪一侧（详见 `whitebox-recall` §三第 2 条）。
+
 **13 个 `kind`**（用 `code_search sink <kind>` 收窄）：
 
 | kind | 数 | 说明 |
@@ -142,6 +167,7 @@ code_search <codebase_id> sink rce php   # 收窄到 rce + php
 | `why` 写"宽口径" | 规则自己在提示会误报 | 追数据来源再定 |
 | `scope` 空+文件无函数 / 输入输出分处两文件 | include 片段 / 输入输出分离 | **正常**不是漏抽 / **判定层补链** |
 | 真实代码写全限定名（`java.io.File`） | 曾是**全库级盲区**（522 处） | 已修；别的语言先想这一步 |
+| 某类**整体**召回低，但代码看着没问题 | 可能是**调用名白名单没覆盖**（第三维度） | 捞漏报用例的 sink 行看**调用名**（本文 §一） |
 | `impossible.php` 里命中 | 安全实现版 | 拿去当**负样本**（配 `forbid_in`） |
 | 命中在测例/文档/注释里 | 噪音 | 单列，不阻塞 |
 | **总数变好看/变难看** | 可能只是宽口径规则在抖 | **按 `rule_id`/`extractor` 拆开看** |
