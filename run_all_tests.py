@@ -124,6 +124,7 @@ PY_TESTS = [
     ("白盒宽口径规则标注（v079）", "test_079_rule_wide_marking.py", False),
     ("规格勾选框↔代码事实 守卫（v084）", "test_084_spec_checklist_sync.py", False),
     ("白盒控制流前缀污染（v086）", "test_086_taint_prefixed_assign.py", False),
+    ("白盒控制流前缀清除与跨行赋值（v090）", "test_090_taint_ctrl_and_crossline.py", False),
     ("情报库与报告生成", "test_intel_report.py", False),
     ("启动器与版本一致性", "test_launcher.py", False),
     ("线索图后端", "test_graph.py", False),
@@ -166,6 +167,40 @@ STALE_TESTS: list[tuple[str, str]] = [
 ]
 # 已下线脚本的文件名集合（执行时直接跳过，理由见上）
 RETIRED_SCRIPTS = {s for s, _ in STALE_TESTS}
+
+
+def unclassified_tests() -> list[str]:
+    """根目录里**没有被显式分类**的测试脚本（v090 新增守卫）。
+
+    ## 为什么需要它（v090 实测撞上的）
+
+    本文件的套件清单是**显式登记**的 —— 新加的 `test_*.py` **不会自动被跑**。
+    v090 加 `test_090_taint_ctrl_and_crossline.py` 时就是这样：全套跑完显示
+    「3006 项通过 / 0 项失败」，而那个文件**一次都没执行**。
+
+    ⚠️ 这与 v084 的「规格勾选框**必然会**漂移」同族：**没有守卫的事实，迟早会静默漂移。**
+    而且这里的失效模式更坏 —— 它伪装成**绿灯**（"0 失败"）而不是红灯。
+
+    判据：每个 `test_*.py` / `test_*.js` 必须落进下列之一：
+    ① `PY_TESTS` ② `NODE_TESTS` ③ `MANUAL_TESTS` ④ `STALE_TESTS`。
+    落在外面 = 它永远不会被执行，却仍在给人"测过了"的错觉。
+    """
+    known = ({s for _n, s, _srv in PY_TESTS}
+             | {s for _n, s in NODE_TESTS}
+             | {s for s, _w in MANUAL_TESTS}
+             | {s for s, _w in STALE_TESTS})
+    out: list[str] = []
+    for pat in ("test_*.py", "test_*.js"):
+        for fp in sorted(ROOT.glob(pat)):
+            if fp.name not in known:
+                out.append(fp.name)
+    return out
+
+
+def registered_count() -> int:
+    """已登记的套件总数（供自检输出用）。"""
+    return len(PY_TESTS) + len(NODE_TESTS) + len(MANUAL_TESTS) + len(STALE_TESTS)
+
 
 RE_COUNT_CN = re.compile(r"通过\s*(\d+)\s*项，失败\s*(\d+)\s*项")
 RE_COUNT_SMOKE = re.compile(r"结果：(\d+)\s*通过\s*/\s*(\d+)\s*失败")
@@ -386,6 +421,18 @@ def main() -> int:
         return 2
     print("  [环境自检] 临时目录可写 ✓"
           if not _pre else "  [环境自检] 未通过，但 --ignore-env 已指定，继续……")
+
+    # 套件登记自检（v090）：未登记的 test_*.py **不会被执行**，
+    # 而"0 失败"的绿灯会让人以为它跑过了 —— 宁可直接停下并说清是哪个文件。
+    _unclassed = unclassified_tests()
+    if _unclassed:
+        print("\n  [套件登记自检] 未通过 —— 下列脚本**没有被登记**，因此永远不会被执行：")
+        for _f in _unclassed:
+            print(f"    - {_f}")
+        print("  请把它加进 PY_TESTS / NODE_TESTS / MANUAL_TESTS / STALE_TESTS 之一。")
+        print("  ⚠️ 不静默通过：否则「0 失败」会掩盖「压根没跑」。")
+        return 2
+    print(f"  [套件登记自检] {registered_count()} 个脚本均已登记 ✓")
 
     need_server = not args.quick
     if need_server:

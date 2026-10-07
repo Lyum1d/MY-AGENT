@@ -228,6 +228,47 @@ _ASSIGN = re.compile(
     r"\s*=\s*(?!=)(.+?);?\s*$"
 )
 
+#: ⚠️ v090 实测发现：`_ASSIGN` 的「带类型声明」分支会把**控制流前缀**一起当成左值。
+#:
+#:     else bar = "This should never happen";     ← 抠出的左值是 `else bar`
+#:
+#: 为什么 `if` 没事、`else` 出事：该分支的字符类 `[A-Za-z_][\w.<>\[\],\s]*?` **不含括号**，
+#: 于是 `if ((500 / 42) + num > 200) bar = param;` 匹配失败（条件里有括号）→ 落到
+#: `_PREFIXED_ASSIGN`、走 v086 的不对称判据；而 `else bar = ...` 不含括号 → **被 `_ASSIGN` 吞下**
+#: → 走「覆盖即净化」。
+#:
+#: 后果正是 v086 明令禁止的那一种：**右值安全 → 清除**。实测 `BenchmarkTest00606` 因此漏报 ——
+#: `else bar = "This should never happen";` 把上一行 `if (...) bar = param;` 刚标好的脏**清掉**了，
+#: 于是 `sql` 不脏、`statement.executeUpdate(sql)` 连 `@taint` 都产不出来。
+#:
+#: **修法**：这类行交给 v086 的不对称判据（脏 → 标脏；安全 → **不清除**），不让 `_ASSIGN` 判。
+#: ⚠️⚠️ **不要"整个忽略"这类行** —— 那会把 `else bar = param;` 该标的脏一起丢掉。
+#: v090 测量时第一版就是"忽略"，结果是**误报与召回同时下降**；而"只加污点"不可能让误报下降，
+#: 这个矛盾当场暴露了它是**用一个回归换来的假收益**（改成不对称语义后才采信数字）。
+_CTRL_IN_LHS = re.compile(
+    r"\b(?:else|if|while|for|switch|case|default|do|try|catch|finally|return)\b")
+
+#: ⚠️ v090：**跨行赋值** —— 左值与 `=` 在本行、右值在**续行**（真实代码格式化后极常见）：
+#:
+#:     bar =
+#:         new String(Base64.decodeBase64(Base64.encodeBase64(param.getBytes())));
+#:
+#: `_ASSIGN` 的右值要求 `.+?`（至少一个字符），于是 `bar =` 这一行**整行匹配失败** ——
+#: 续行里的污点变量看不见，变量**从未被判脏**（实测 `BenchmarkTest00604` 漏报）。
+#:
+#: ⚠️ 这与「跨行**调用**」是两件事，后者 v069 已修（`search.py:_tainted_in_args`）。
+#: **同一个"跨行"盲区在赋值侧又犯了一次** —— 与 v072「修一处后要问：同类判据还有几处」同族。
+_ASSIGN_OPEN = re.compile(
+    r"^\s*("
+    r"\$?[A-Za-z_][\w.]*"                                          # 变量名（PHP 可带 `$`）
+    r"|(?:var|let|const)\s+\$?[A-Za-z_]\w*"                         # var/let/const 声明
+    r"|(?:final\s+)?[A-Za-z_][\w.<>\[\],\s]*?\s+\$?[A-Za-z_]\w*"    # 带类型声明
+    r")\s*=\s*$"
+)
+
+#: 跨行赋值往下看多少行（够覆盖格式化后的续行，又不会吃到别处的代码）
+_ASSIGN_LOOKAHEAD = 6
+
 #: 从赋值左值里抠出**变量名**
 _LHS_NAME = re.compile(
     r"(?:^|\s)(\$?[A-Za-z_]\w*)\s*$|(\$?[A-Za-z_]\w*)\s*(?:\.\w+|\s*\[[^\]]*\])*\s*$"
@@ -426,6 +467,29 @@ def analyze(lines: list[str], lang: str) -> TaintResult:
     runners: set[str] = set()
     for i, line in enumerate(lines, 1):
         m = _ASSIGN.match(line)
+        # ⚠️ v090：控制流前缀（`else bar` / `case 'A': bar`）**不许**当左值走 `_ASSIGN` ——
+        # 那里是「覆盖即净化」，会清除掉 v086 刚标好的脏。改走 v086 的不对称判据
+        # （脏 → 标脏；安全 → **不清除**）。详见 `_CTRL_IN_LHS` 的长注释。
+        if m is not None and _CTRL_IN_LHS.search(m.group(1)):
+            cf_lhs, cf_rhs = m.group(1), m.group(2)
+            m = None
+            cf_name = _lhs_name(cf_lhs)
+            if cf_name and cf_name not in _STOPWORDS:
+                if _is_source(lang, cf_rhs) or (_names(cf_rhs) & cur):
+                    cur = cur | {cf_name}
+                # ⚠️ else 分支**故意为空** —— 同 v086：分支执行与否词法层判不出，
+                # 清除 = 制造**不可恢复的漏报**。
+                if _RUNNER_RHS.search(cf_rhs):
+                    runners = runners | {cf_name}
+        # ⚠️ v090：跨行赋值（`bar =` 后换行）—— `_ASSIGN` 看不见续行里的右值，
+        # 于是「本行没有右值」被当成了「右值无污点成分」。往后并几行再判。
+        if m is None and _ASSIGN_OPEN.match(line):
+            chunk = [line]
+            for j in range(i, min(i + _ASSIGN_LOOKAHEAD, len(lines))):
+                chunk.append(lines[j])
+                if lines[j].rstrip().endswith(";"):
+                    break
+            m = _ASSIGN.match(" ".join(chunk))
         if m:
             lhs_raw, rhs = m.group(1), m.group(2)
             name = _lhs_name(lhs_raw)
