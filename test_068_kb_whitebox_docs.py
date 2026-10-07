@@ -36,21 +36,30 @@ from app import registry as REG                              # noqa: E402
 from app.codebase import sink_rules as S                     # noqa: E402
 
 KB_DIR = REPO / "data" / "kb"
-#: 白盒四篇（v085 拆出「选靶」；**v086 拆出「召回」**）
+#: 白盒五篇（v085 拆出「选靶」；**v086 拆出「召回」**；**v092 把「漏报归因」从召回篇再拆出来**）
 #: ⚠️ 拆篇的动因：`kb.read()` 默认 `max_chars=8000`，**超了就静默截断**。
-#: 分类篇曾贴到 7998 —— 拆出选靶后回到 7979；**v086 加召回分析又到 8602**，
-#: 于是按同一原则**再拆一次**（而不是逐字压缩）。
+#: 分类篇曾贴到 7998 —— 拆出选靶后回到 7979；v086 加召回分析又到 8602，于是再拆一次；
+#: **v091 往召回篇写完内容后到 8028（已超限，被本文件的长度断言当场报红）** →
+#: v092 按「读者何时读」第三次拆：**数字怎么读**（recall）与**漏报怎么归因**（miss-attribution）。
 #: ⭐ **规律：满了就拆，别压。** 压缩会把「为什么」压掉，只留下结论。
 DOCS = ["whitebox-targeting.md", "whitebox-audit-method.md",
-        "whitebox-sink-triage.md", "whitebox-recall.md"]
+        "whitebox-sink-triage.md", "whitebox-recall.md",
+        "whitebox-miss-attribution.md"]
 
-#: 四篇各管一件事，**必须互相指得到**（否则拆完就散了，模型只会读到一篇）
+#: 五篇各管一件事，**必须互相指得到**（否则拆完就散了，模型只会读到一篇）
 #: ⚠️ 拆篇这种「只是挪个内容」的改动最容易漏引用 —— 人眼复核靠不住，所以写成断言。
+#: ⚠️ 每拆一篇，**已有各篇的指针也要跟着补**（v085/v086/v092 各拆一次，每次都要动全部条目）。
 CROSS_REF = {
-    "whitebox-targeting.md": ["whitebox-audit-method", "whitebox-sink-triage", "whitebox-recall"],
-    "whitebox-audit-method.md": ["whitebox-targeting", "whitebox-sink-triage", "whitebox-recall"],
-    "whitebox-sink-triage.md": ["whitebox-targeting", "whitebox-audit-method", "whitebox-recall"],
-    "whitebox-recall.md": ["whitebox-targeting", "whitebox-audit-method", "whitebox-sink-triage"],
+    "whitebox-targeting.md": ["whitebox-audit-method", "whitebox-sink-triage",
+                              "whitebox-recall", "whitebox-miss-attribution"],
+    "whitebox-audit-method.md": ["whitebox-targeting", "whitebox-sink-triage",
+                                 "whitebox-recall", "whitebox-miss-attribution"],
+    "whitebox-sink-triage.md": ["whitebox-targeting", "whitebox-audit-method",
+                                "whitebox-recall", "whitebox-miss-attribution"],
+    "whitebox-recall.md": ["whitebox-targeting", "whitebox-audit-method",
+                           "whitebox-sink-triage", "whitebox-miss-attribution"],
+    "whitebox-miss-attribution.md": ["whitebox-targeting", "whitebox-audit-method",
+                                     "whitebox-sink-triage", "whitebox-recall"],
 }
 
 ok, fail = [], []
@@ -108,16 +117,18 @@ def main() -> int:
 
     # ⭐ v085：拆成三篇之后，**三篇必须互相指得到**
     # 动因：拆篇若不留指针，模型只会读到"打开的那一篇"，另外两篇等于不存在。
-    print("\n=== ①b ⭐ 三篇互相有指针（拆了不能散）===")
+    print("\n=== ①b ⭐ 各篇互相有指针（拆了不能散）===")
     for fn, others in CROSS_REF.items():
         txt = _doc_text(fn)
         miss = [o for o in others if o not in txt]
-        check(f"{fn} 指向另外两篇", not miss,
+        check(f"{fn} 指向另外四篇", not miss,
               f"未提到：{miss}" if miss else "")
-    # 反向：篇与篇的**分工**要在标题/首行说清（防「三篇写同一件事」）
+    # 反向：篇与篇的**分工**要在标题/首行说清（防「几篇写同一件事」）
     for fn, kw in (("whitebox-targeting.md", "选靶"),
                    ("whitebox-audit-method.md", "流程"),
-                   ("whitebox-sink-triage.md", "分类")):
+                   ("whitebox-sink-triage.md", "分类"),
+                   ("whitebox-recall.md", "数字"),
+                   ("whitebox-miss-attribution.md", "归因")):
         check(f"{fn} 自我定位含「{kw}」", kw in _doc_text(fn)[:400], "")
 
     # ------------------------------------------------- ② 提到的 code_* 工具真实存在

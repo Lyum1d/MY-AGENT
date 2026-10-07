@@ -1,4 +1,4 @@
-> 白盒**打哪个目标**（选靶篇）。姊妹篇：`whitebox-audit-method`（怎么审）、`whitebox-sink-triage`（命中怎么分类）、`whitebox-recall`（召回数字怎么读）。
+> 白盒**打哪个目标**（选靶篇）。姊妹篇：`whitebox-audit-method`（怎么审）、`whitebox-sink-triage`（命中怎么分类）、`whitebox-recall`（召回数字怎么读）、`whitebox-miss-attribution`（漏报怎么归因）。
 > 本篇回答的是「**值不值得打**」—— 它决定产出的**数量级**，与工具能力同等重要（六轮实测，见 §〇）。
 
 # 白盒选靶与产出策略

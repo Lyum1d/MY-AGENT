@@ -400,7 +400,10 @@ def main() -> int:                                   # noqa: C901（分支多但
     # （`test_068` 负责管「写在哪一篇」，两者分工不同，别互相顶）。
     # 所以召回类断言改查**两篇的并集** —— 谁搬家都不会误报。
     recall = (kb_dir / "whitebox-recall.md").read_text(encoding="utf-8")
-    recall_kb = triage + "\n" + recall
+    # ⚠️ v092 又把「漏报归因」从召回篇拆成 `whitebox-miss-attribution` —— 同上，
+    # 并集再并一篇。**照这条注释的做法办**：每次拆篇，把新篇加进这个并集即可。
+    missattr = (kb_dir / "whitebox-miss-attribution.md").read_text(encoding="utf-8")
+    recall_kb = triage + "\n" + recall + "\n" + missattr
     for kw, desc in (("@taint", "跨行命中的可区分标记"),
                      ("@runner", "执行器变量命中的可区分标记（v071）"),
                      ("runner", "执行器通道本身（v071）"),
