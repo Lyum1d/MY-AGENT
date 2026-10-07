@@ -172,4 +172,5 @@ code_search <codebase_id> sink rce php   # 收窄到 rce + php
 | 某类**整体**召回低，但代码看着没问题 | 可能是**调用名白名单没覆盖**（第三维度） | 捞漏报用例的 sink 行看**调用名**（本文 §一） |
 | `impossible.php` 里命中 | 安全实现版 | 拿去当**负样本**（配 `forbid_in`） |
 | 命中在测例/文档/注释里 | 噪音 | 单列，不阻塞 |
+| 命中处**有 `getCanonicalPath()` + 前缀校验** | **"校验写对没有"是另一回事** | 看它补没补**分隔符**：`startsWith(base)` = 兄弟目录逃逸（v094 实测 jlhttp，PoC 跑通） |
 | **总数变好看/变难看** | 可能只是宽口径规则在抖 | **按 `rule_id`/`extractor` 拆开看** |
