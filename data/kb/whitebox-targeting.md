@@ -1,4 +1,4 @@
-> 白盒**打哪个目标**（选靶篇）。姊妹篇：`whitebox-audit-method`（怎么审）、`whitebox-sink-triage`（命中怎么分类）、`whitebox-recall`（召回数字怎么读）、`whitebox-miss-attribution`（漏报怎么归因）、`whitebox-disclosure-gate`（**找到之后能不能报**）。
+> 白盒**打哪个目标**（选靶篇）。姊妹篇：`whitebox-guard-review`（守卫写对没有/我的脚本对不对）、`whitebox-audit-method`（怎么审）、`whitebox-sink-triage`（命中怎么分类）、`whitebox-recall`（召回数字怎么读）、`whitebox-miss-attribution`（漏报怎么归因）、`whitebox-disclosure-gate`（**找到之后能不能报**）。
 > 本篇回答的是「**值不值得打**」—— 它决定产出的**数量级**，与工具能力同等重要（六轮实测，见 §〇）。
 
 # 白盒选靶与产出策略
@@ -55,6 +55,9 @@
 | **守卫集中在单一入口** | 结构性安全 | ❌ 排除（POI 五类工厂全硬化在**一个文件**里） |
 
 ⭐ **守卫的「位置」也是信号**：集中在一个文件 = 结构性安全；散落/缺失 = 有戏。
+
+⭐ **「0 CVE」共四种含义、「守卫写对没有」、以及「我自己脚本判据写错」→ `whitebox-guard-review`。**
+（另一种最阴的：**包没有安全断言 ⇒ 没有可审的东西**，`mkdirp`/`tempy` 属此类。）
 
 ⭐⭐ **但"有守卫"还要看守卫**写对没有** —— ⚠️「做了规范化」≠「校验写对」（v094 实测，jlhttp）**
 
@@ -133,25 +136,15 @@
 
 ---
 
-### 二·六、⭐ 判守卫：**`startsWith` 比较的是「字符串」还是「路径」**（v096 扩散扫实测）
+### 二·六、⭐ 判守卫：**`startsWith` 比较的是「字符串」还是「路径」**
 
 ⚠️ **「有没有守卫」不能只看关键词。** jlhttp **同时**做了 `getCanonicalFile()`（看着像"规范化过了"）
 **和** `startsWith` 校验 —— 结果**两个都没拦住**：因为 `startsWith` 是**字符串**前缀比较，
 base `…/www` 会放行兄弟目录 `…/www-secret`（CWE-22；**1.3~3.2 共 11 版未修**）。
 
-| 写法 | 比较语义 | 判定 |
-|---|---|---|
-| `a.getPath().startsWith(b.getPath())` | **字符串** | ⚠️ 未补 `File.separator` ⇒ 可被「同名前缀兄弟目录」绕过 |
-| `a.toPath().startsWith(b.toPath())` | **路径元素** | ✅ 正确 |
-| `!path.contains("..")` | 黑名单 | ⚠️ 挡不住编码/绝对路径变体；但至少是**显式**守卫，可作「真排除」依据 |
-
-⭐ **反面教材（重要）**：**通用安全指南给的 Java 示例恰好就是 `!canonicalPath.startsWith(basePath)`** ——
-也就是**这个错误写法本身就是"标准建议"**。所以「它是行业惯例写法」**不能**当作已加固的证据。
-
-**扩散扫（本机全语料，三种结局各一例）**：
-- **jlhttp** `HTTPServer:3216` —— 字符串，🔴 **本案**；
-- **zt-zip** `ZipUtil:1208` —— `Path.startsWith`，✅ **已修**（注释还写明"用 Path 以免把尾部斜杠误判为逃逸"），**正面样板**；
-- **ESAPI** `SecurityWrapperRequest:587` —— 字符串（默认 `allowableContentRoot="WEB-INF"`），⚠️ **疑似，前提严苛、待定**。
+⭐ **判守卫写法（Java / JS 对照表）、四种「0 CVE」形态、以及「我自己的验证脚本判据写错」
+（`startsWith('..')` 假阳性 170→0）→ 全部见 `whitebox-guard-review`。**
+**一句话**：守卫要按**路径元素**比，不按**字符串前缀**比。
 
 ---
 
