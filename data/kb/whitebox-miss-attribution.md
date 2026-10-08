@@ -1,4 +1,4 @@
-> 白盒**漏报怎么归因**（归因篇）。姊妹篇：`whitebox-targeting`（**打哪个目标**）、`whitebox-audit-method`（**拿到代码之后怎么审**）、`whitebox-sink-triage`（**命中怎么分类**）、`whitebox-recall`（**召回数字怎么读**）。
+> 白盒**漏报怎么归因**（归因篇）。姊妹篇：`whitebox-targeting`（**打哪个目标**）、`whitebox-audit-method`（**拿到代码之后怎么审**）、`whitebox-sink-triage`（**命中怎么分类**）、`whitebox-recall`（**召回数字怎么读**）、`whitebox-disclosure-gate`（**找到之后能不能报**）。
 > 一句话：**看到漏报，先问"这条判断量过吗"** —— 下面七条里，有四条的"最大缺口"结论曾被**推断**带偏过一整轮。
 > ⚠️ **本篇只管"漏在哪、为什么漏"**；"这个数字能不能信"→ `whitebox-recall`。
 

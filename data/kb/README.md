@@ -5,7 +5,7 @@
 ## 使用约定
 
 - 进站先读 `打穿短表.md`；对得上再打开对应模块看细节。文件不长就整篇开；超长篇可先开点名节，不够就继续开。禁止每站通读本目录
-- **白盒（有源码）另走**：先 `whitebox-targeting.md`（**打哪个目标**：必要条件→OSV 反查→GitHub 复核→代码自检守卫；**选靶决定产出上限**），再 `whitebox-audit-method.md`（**拿到代码之后怎么审**：入库→索引→查 sink→逆向→四问闸门），命中读不懂再 `whitebox-sink-triage.md`（分类与已知误报），**看到召回/精确性数字先读 `whitebox-recall.md`**（口径不对数字就没意义），**想改规则提召回、或要判"漏在哪"先读 `whitebox-miss-attribution.md`**。黑盒那套类型矩阵不适用源码审计。
+- **白盒（有源码）另走**：先 `whitebox-targeting.md`（**打哪个目标**：必要条件→OSV 反查→**前置公开记录检查**→GitHub 复核→代码自检守卫；**选靶决定产出上限**），再 `whitebox-audit-method.md`（**拿到代码之后怎么审**：入库→索引→查 sink→逆向→四问闸门），命中读不懂再 `whitebox-sink-triage.md`（分类与已知误报），**看到召回/精确性数字先读 `whitebox-recall.md`**（口径不对数字就没意义），**想改规则提召回、或要判"漏在哪"先读 `whitebox-miss-attribution.md`**，**找到东西后要判"能不能报"先读 `whitebox-disclosure-gate.md`**（四道闸：契约/层级/公开/落地）。黑盒那套类型矩阵不适用源码审计。
 - 磁盘有 `*src经验.md` 才开专篇，没有不算缺。开 `SKILL.md` 不会再带集团日记
 - 短表和「注入/SSRF/XSS/RCE」都不是上限。本站过全类型矩阵；四件套打在有差分面上（防空窗），不是只测这四类，也不是每个 path 喷 `'`。有会话时越权/逻辑与四件套同硬（`dig-scope` §4.2.3）
 - 方便和能力优先；省 token 是顺带，不挡开模块
@@ -69,9 +69,10 @@
 | `whitebox-sink-triage.md` | **白盒命中分类**：13 个 kind + 三类归宿；跨文件链路归判定层、`impossible.php` 当负样本 |
 | `whitebox-recall.md` | **白盒召回口径**：先确认分母（「标注 ∩ 检出」）→ 再确认 kind 级/文件级 → 最后看结果；**还要确认自己写的探针在测东西**（cmdi 22.9% 那次是探针 bug） |
 | `whitebox-miss-attribution.md` | **白盒漏报归因**：七条结构性漏报原因（跨行/调用者变量/全限定名/容器/前缀清除/跨行赋值…）；**「数组传播」实测被推翻**；有意不修的边界（`switch` 分支）；改动后按 `rule_id` 拆开比对 |
+| `whitebox-disclosure-gate.md` | **披露判定（四道闸）**：契约（「没守卫」≠「有洞」）/ 层级（守卫可能在底层依赖）/ **公开记录（必须查到 issue/PR 层，只看 OSV 会误判成"新发现"）** / 落地（「已修」≠「已修到用户手上」）；**公开记录检查要前移到选靶阶段** |
 | `websocket-test.md` | WebSocket（原有+补充） |
 | `xslt-injection-test.md` | 几乎不交（已收成一行） |
 | `xss-test.md` | XSS（中文开场 + 冷门事件 + XSS→RCE / 自定义协议） |
 | `xxe-test.md` | 专题知识（hack-skills 导入或融合） |
 
-**合计：54 个知识文件**（不含本 README）。SRC 报告版式不在本库：见 `~/.grok/rules/vuln-report-format.md`。定级只认 format，本库不定级。
+**合计：55 个知识文件**（不含本 README）。SRC 报告版式不在本库：见 `~/.grok/rules/vuln-report-format.md`。定级只认 format，本库不定级。

@@ -36,30 +36,41 @@ from app import registry as REG                              # noqa: E402
 from app.codebase import sink_rules as S                     # noqa: E402
 
 KB_DIR = REPO / "data" / "kb"
-#: 白盒五篇（v085 拆出「选靶」；**v086 拆出「召回」**；**v092 把「漏报归因」从召回篇再拆出来**）
+#: 白盒六篇（v085 拆出「选靶」；**v086 拆出「召回」**；**v092 把「漏报归因」从召回篇再拆出来**；
+#: **v097 拆出「披露判定」**）
 #: ⚠️ 拆篇的动因：`kb.read()` 默认 `max_chars=8000`，**超了就静默截断**。
 #: 分类篇曾贴到 7998 —— 拆出选靶后回到 7979；v086 加召回分析又到 8602，于是再拆一次；
 #: **v091 往召回篇写完内容后到 8028（已超限，被本文件的长度断言当场报红）** →
 #: v092 按「读者何时读」第三次拆：**数字怎么读**（recall）与**漏报怎么归因**（miss-attribution）。
+#: **v097 第四次拆**：选靶篇到 7115 后，第八~十一轮的四道闸放不进去
+#:（只剩 885 字符）→ 拆出**披露判定**（disclosure-gate），选靶篇只留「前置公开记录」那一步。
 #: ⭐ **规律：满了就拆，别压。** 压缩会把「为什么」压掉，只留下结论。
 DOCS = ["whitebox-targeting.md", "whitebox-audit-method.md",
         "whitebox-sink-triage.md", "whitebox-recall.md",
-        "whitebox-miss-attribution.md"]
+        "whitebox-miss-attribution.md", "whitebox-disclosure-gate.md"]
 
 #: 五篇各管一件事，**必须互相指得到**（否则拆完就散了，模型只会读到一篇）
 #: ⚠️ 拆篇这种「只是挪个内容」的改动最容易漏引用 —— 人眼复核靠不住，所以写成断言。
 #: ⚠️ 每拆一篇，**已有各篇的指针也要跟着补**（v085/v086/v092 各拆一次，每次都要动全部条目）。
 CROSS_REF = {
     "whitebox-targeting.md": ["whitebox-audit-method", "whitebox-sink-triage",
-                              "whitebox-recall", "whitebox-miss-attribution"],
+                              "whitebox-recall", "whitebox-miss-attribution",
+                              "whitebox-disclosure-gate"],
     "whitebox-audit-method.md": ["whitebox-targeting", "whitebox-sink-triage",
-                                 "whitebox-recall", "whitebox-miss-attribution"],
+                                 "whitebox-recall", "whitebox-miss-attribution",
+                                 "whitebox-disclosure-gate"],
     "whitebox-sink-triage.md": ["whitebox-targeting", "whitebox-audit-method",
-                                "whitebox-recall", "whitebox-miss-attribution"],
+                                "whitebox-recall", "whitebox-miss-attribution",
+                                "whitebox-disclosure-gate"],
     "whitebox-recall.md": ["whitebox-targeting", "whitebox-audit-method",
-                           "whitebox-sink-triage", "whitebox-miss-attribution"],
+                           "whitebox-sink-triage", "whitebox-miss-attribution",
+                           "whitebox-disclosure-gate"],
     "whitebox-miss-attribution.md": ["whitebox-targeting", "whitebox-audit-method",
-                                     "whitebox-sink-triage", "whitebox-recall"],
+                                     "whitebox-sink-triage", "whitebox-recall",
+                                     "whitebox-disclosure-gate"],
+    "whitebox-disclosure-gate.md": ["whitebox-targeting", "whitebox-audit-method",
+                                    "whitebox-sink-triage", "whitebox-recall",
+                                    "whitebox-miss-attribution"],
 }
 
 ok, fail = [], []
@@ -128,7 +139,8 @@ def main() -> int:
                    ("whitebox-audit-method.md", "流程"),
                    ("whitebox-sink-triage.md", "分类"),
                    ("whitebox-recall.md", "数字"),
-                   ("whitebox-miss-attribution.md", "归因")):
+                   ("whitebox-miss-attribution.md", "归因"),
+                   ("whitebox-disclosure-gate.md", "披露")):
         check(f"{fn} 自我定位含「{kw}」", kw in _doc_text(fn)[:400], "")
 
     # ------------------------------------------------- ② 提到的 code_* 工具真实存在
