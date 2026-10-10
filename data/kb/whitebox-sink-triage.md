@@ -1,4 +1,5 @@
 > 白盒**怎么读命中**（分类篇）。姊妹篇：`whitebox-targeting`（**打哪个目标**）、`whitebox-guard-review`（**守卫写对没有/我的脚本对不对**）、`whitebox-audit-method`（**拿到代码之后怎么审**）、`whitebox-recall`（**召回数字怎么读**）、`whitebox-miss-attribution`（**漏报怎么归因**）、`whitebox-disclosure-gate`（**找到之后能不能报**）。检索层给你一堆 `文件:行号`，**那全是候选不是漏洞** —— 本篇讲怎么把命中分成「真候选 / 需补链 / 已知误报」三类，以及每条规则能信到几分。查完怎么走流程见 `whitebox-audit-method`。一句话：**`sink` 命中的意思是「这里有个危险调用」，不是「有漏洞」。**
+> ⭐ npm/JS 生态另见 `whitebox-targeting-npm`（选靶）、`whitebox-toolchain-npm`（工具链）。
 
 # Sink 命中分类手册
 

@@ -1,4 +1,8 @@
-> 白盒**打哪个目标**（选靶篇）。姊妹篇：`whitebox-guard-review`（守卫写对没有/我的脚本对不对）、`whitebox-audit-method`（怎么审）、`whitebox-sink-triage`（命中怎么分类）、`whitebox-recall`（召回数字怎么读）、`whitebox-miss-attribution`（漏报怎么归因）、`whitebox-disclosure-gate`（**找到之后能不能报**）。
+> 白盒**打哪个目标**（选靶篇 · **Java/Maven 生态**）。
+> ⭐ **靶子在 npm/JS 生态请另读 `whitebox-targeting-npm.md`**（23 轮 npm 实测：**「结构性张力」**、
+> **判据修正**（别找"宣称安全"的）、**四问筛子**）。
+> ⭐ **npm 工具链与判据另读 `whitebox-toolchain-npm`**（pattern-first 两段式 / 新代码 diff 流水线 / 交付坑 / 高频假阳性 / 不烧清单）。
+> 姊妹篇：`whitebox-guard-review`（守卫写对没有/我的脚本对不对）、`whitebox-audit-method`（怎么审）、`whitebox-sink-triage`（命中怎么分类）、`whitebox-recall`（召回数字怎么读）、`whitebox-miss-attribution`（漏报怎么归因）、`whitebox-disclosure-gate`（**找到之后能不能报**）。
 > 本篇回答的是「**值不值得打**」—— 它决定产出的**数量级**，与工具能力同等重要（六轮实测，见 §〇）。
 
 # 白盒选靶与产出策略

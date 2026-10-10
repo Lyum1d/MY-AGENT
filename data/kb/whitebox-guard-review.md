@@ -1,4 +1,5 @@
 > 白盒**怎么判一个守卫写对没有**（守卫复核篇）。姊妹篇：`whitebox-targeting`（打哪个目标）、`whitebox-audit-method`（怎么审）、`whitebox-sink-triage`（命中怎么分类）、`whitebox-recall`（召回数字怎么读）、`whitebox-miss-attribution`（漏报怎么归因）、`whitebox-disclosure-gate`（**找到之后能不能报**）。
+> ⭐ npm/JS 生态另见 `whitebox-targeting-npm`（选靶）、`whitebox-toolchain-npm`（工具链）。
 > 本篇回答的是「**这个守卫是真守卫还是样子货**」，以及「**我自己的验证脚本有没有写错**」。
 
 # 守卫复核：判「有没有守卫」与「守卫写对没有」

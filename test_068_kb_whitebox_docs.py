@@ -47,11 +47,15 @@ KB_DIR = REPO / "data" / "kb"
 #: **v098 第五次拆**：第十四轮往选靶篇补「0 CVE 的第三/四种含义」与「我自己的脚本判据写错」
 #: 后到 8656（**又被长度断言当场报红**）→ 按「读者何时需要」拆出**守卫复核**（guard-review）：
 #: 讲**怎么判一个守卫写对没有**，以及**判据本身写错的同族坑**。
+#: ⭐ **v100 第六次拆篇**：npm/JS 生态那一段实测太长（8,828 字符，**又被长度断言当场报红**）
+#: → 按「读者何时需要」拆成 **选靶**（`whitebox-targeting-npm`）与 **工具链**（`whitebox-toolchain-npm`）两篇。
+#: ⚠️ 拆篇时务必记得：**老篇也要回头指向新篇**（`CROSS_REF` 会双向断言）。
 #: ⭐ **规律：满了就拆，别压。** 压缩会把「为什么」压掉，只留下结论。
 DOCS = ["whitebox-targeting.md", "whitebox-guard-review.md",
         "whitebox-audit-method.md", "whitebox-sink-triage.md",
         "whitebox-recall.md", "whitebox-miss-attribution.md",
-        "whitebox-disclosure-gate.md"]
+        "whitebox-disclosure-gate.md",
+        "whitebox-targeting-npm.md", "whitebox-toolchain-npm.md"]
 
 #: 七篇各管一件事，**必须互相指得到**（否则拆完就散了，模型只会读到一篇）
 #: ⚠️ 拆篇这种「只是挪个内容」的改动最容易漏引用 —— 人眼复核靠不住，所以写成断言。
@@ -129,7 +133,9 @@ def main() -> int:
                    ("whitebox-sink-triage.md", "分类"),
                    ("whitebox-recall.md", "数字"),
                    ("whitebox-miss-attribution.md", "归因"),
-                   ("whitebox-disclosure-gate.md", "披露")):
+                   ("whitebox-disclosure-gate.md", "披露"),
+                   ("whitebox-targeting-npm.md", "选靶"),
+                   ("whitebox-toolchain-npm.md", "工具链")):
         check(f"{fn} 自我定位含「{kw}」", kw in _doc_text(fn)[:400], "")
 
     # ------------------------------------------------- ② 提到的 code_* 工具真实存在

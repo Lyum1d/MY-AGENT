@@ -5,7 +5,7 @@
 ## 使用约定
 
 - 进站先读 `打穿短表.md`；对得上再打开对应模块看细节。文件不长就整篇开；超长篇可先开点名节，不够就继续开。禁止每站通读本目录
-- **白盒（有源码）另走**：先 `whitebox-targeting.md`（**打哪个目标**：必要条件→OSV 反查→**前置公开记录检查**→GitHub 复核→代码自检守卫；**选靶决定产出上限**），**判「守卫写对没有 / 我自己的脚本对不对」读 `whitebox-guard-review.md`**，再 `whitebox-audit-method.md`（**拿到代码之后怎么审**：入库→索引→查 sink→逆向→四问闸门），命中读不懂再 `whitebox-sink-triage.md`（分类与已知误报），**看到召回/精确性数字先读 `whitebox-recall.md`**（口径不对数字就没意义），**想改规则提召回、或要判"漏在哪"先读 `whitebox-miss-attribution.md`**，**找到东西后要判"能不能报"先读 `whitebox-disclosure-gate.md`**（四道闸：契约/层级/公开/落地）。黑盒那套类型矩阵不适用源码审计。
+- **白盒（有源码）另走**：先 `whitebox-targeting.md`（**打哪个目标**：必要条件→OSV 反查→**前置公开记录检查**→GitHub 复核→代码自检守卫；**选靶决定产出上限**），**靶子在 npm/JS 生态另读 `whitebox-targeting-npm.md`（选靶）与 `whitebox-toolchain-npm.md`（工具链）**（⚠️ 至少先看选靶篇 §一「结构性张力」与工具链篇 §五「不烧清单」，否则会在头部生态白跑），**判「守卫写对没有 / 我自己的脚本对不对」读 `whitebox-guard-review.md`**，再 `whitebox-audit-method.md`（**拿到代码之后怎么审**：入库→索引→查 sink→逆向→四问闸门），命中读不懂再 `whitebox-sink-triage.md`（分类与已知误报），**看到召回/精确性数字先读 `whitebox-recall.md`**（口径不对数字就没意义），**想改规则提召回、或要判"漏在哪"先读 `whitebox-miss-attribution.md`**，**找到东西后要判"能不能报"先读 `whitebox-disclosure-gate.md`**（四道闸：契约/层级/公开/落地）。黑盒那套类型矩阵不适用源码审计。
 - 磁盘有 `*src经验.md` 才开专篇，没有不算缺。开 `SKILL.md` 不会再带集团日记
 - 短表和「注入/SSRF/XSS/RCE」都不是上限。本站过全类型矩阵；四件套打在有差分面上（防空窗），不是只测这四类，也不是每个 path 喷 `'`。有会话时越权/逻辑与四件套同硬（`dig-scope` §4.2.3）
 - 方便和能力优先；省 token 是顺带，不挡开模块
@@ -65,6 +65,8 @@
 | `type-juggling-test.md` | 专题知识（hack-skills 导入或融合） |
 | `waf-bypass.md` | WAF 绕过 |
 | `whitebox-targeting.md` | **白盒选靶**：六轮实测战绩；「0 CVE」的两种含义；**四步流水线**（必要条件→OSV 反查→GitHub 复核→代码自检守卫）；候选出来要**查它在哪个版本被修** |
+| `whitebox-targeting-npm.md` | **白盒选靶 · npm/JS 生态篇**（23 轮实测）：⭐⭐ **「结构性张力」实证**（未审计⟺下载量小⟺闸 4 不过 ／ 下载量大⟺已被审计⟺找不到东西 ⇒ **头部找老代码产出率趋零**）；**判据修正**（别找"宣称安全"的，找**隐含不变量**——附命中记录）；**四问筛子**（下载量／失败方向是否"多放行"／防护对象是否"攻击者"／公开记录） |
+| `whitebox-toolchain-npm.md` | **白盒 · npm 工具链篇**：pattern-first **两段式**（描述捞池→本地 grep）＋**新代码 diff 流水线**（依赖并集建池→找新发布→diff＋新增行关键词判据；⚠️ **必须排除打包产物**）；npm 侧三类高频假阳性；⚠️ **交付坑**（`Sent`≠送达要查退信、Gmail 别附 `.js`/`.mjs`）；**不烧清单**（20+ 项）；三条"看着像洞但不是"的形态 |
 | `whitebox-guard-review.md` | **守卫复核**：判「有没有守卫」与「守卫写对没有」；`startsWith` 比的是字符串还是路径元素（Java/JS 对照）；**「0 CVE」的四种含义**（含「没有可审的东西」）；⚠️ **我自己的验证脚本也会犯同族错**（`startsWith('..')` 假阳性 170→0）——**结论异常先验判据** |
 | `whitebox-audit-method.md` | **白盒流程**：Phase 0~6 落到 `code_*` 工具（入库/索引/查 sink/逆向/四问闸门） |
 | `whitebox-sink-triage.md` | **白盒命中分类**：13 个 kind + 三类归宿；跨文件链路归判定层、`impossible.php` 当负样本 |
@@ -76,4 +78,4 @@
 | `xss-test.md` | XSS（中文开场 + 冷门事件 + XSS→RCE / 自定义协议） |
 | `xxe-test.md` | 专题知识（hack-skills 导入或融合） |
 
-**合计：56 个知识文件**（不含本 README）。SRC 报告版式不在本库：见 `~/.grok/rules/vuln-report-format.md`。定级只认 format，本库不定级。
+**合计：58 个知识文件**（不含本 README）。SRC 报告版式不在本库：见 `~/.grok/rules/vuln-report-format.md`。定级只认 format，本库不定级。

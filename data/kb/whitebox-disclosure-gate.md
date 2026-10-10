@@ -1,4 +1,5 @@
 > 白盒**找到之后能不能报出去**（披露篇）。姊妹篇：`whitebox-targeting`（**打哪个目标**）、`whitebox-guard-review`（**守卫写对没有/我的脚本对不对**）、`whitebox-audit-method`（**拿到代码之后怎么审**）、`whitebox-sink-triage`（**命中怎么分类**）、`whitebox-recall`（**召回数字怎么读**）、`whitebox-miss-attribution`（**漏报怎么归因**）。
+> ⭐ npm/JS 生态另见 `whitebox-targeting-npm`（选靶）、`whitebox-toolchain-npm`（工具链）。
 > 一句话：**「洞真」与「能报」是两件事** —— 中间隔着四道**互相独立**的闸，**别用一道的结论去顶另一道**。
 > ⚠️ **本篇只管「这个能不能报」**；「打哪个」「怎么审」「怎么分类」见上面五篇。
 

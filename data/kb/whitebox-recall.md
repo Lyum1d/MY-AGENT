@@ -1,4 +1,5 @@
 > 白盒**召回数字怎么读**（召回篇）。姊妹篇：`whitebox-targeting`（**打哪个目标**）、`whitebox-guard-review`（**守卫写对没有/我的脚本对不对**）、`whitebox-audit-method`（**拿到代码之后怎么审**）、`whitebox-sink-triage`（**命中怎么分类**）、`whitebox-miss-attribution`（**漏报怎么归因**）、`whitebox-disclosure-gate`（**找到之后能不能报**）。
+> ⭐ npm/JS 生态另见 `whitebox-targeting-npm`（选靶）、`whitebox-toolchain-npm`（工具链）。
 > 一句话：**召回数字本身也会骗人** —— 先确认**分母**、再确认**口径**、最后才看结果。
 > ⚠️ **本篇只管"这个数字能不能信"**；"漏在哪、为什么漏"→ `whitebox-miss-attribution`。
 
