@@ -571,6 +571,21 @@ python test_tree.py
 > 它会被迁移进供应商配置使 deepseek 变为可用，任务文案里的「验证 / 注入」就会触发路由，
 > 把测试注入的假后端换成真实云端模型，导致断言随机失败。
 
+### ⚠️ 已删除的文件：**不要读取，也不要重建**
+
+本仓库作为「**公开模板**」发布时做过一次脱敏（2026-09-03），以下文件是**有意删除**的，
+因为它们内嵌**真实授权靶标**或真实发现 —— 请勿尝试读取、恢复或重建：
+
+| 已删除 | 原因 |
+|---|---|
+| `test_jiaoyu.py`（及 `verify_phase4.py` / `api_auth_test.py` / `probe2.py` / `probe_tools.py` / `build_target_forms.py`） | 脚本内嵌真实靶标域名/URL |
+| `SESSION_HISTORY_SUMMARY.md`、`实靶测试报告-*.md`、`data/artifacts/*.md` | 含真实目标与漏洞发现 |
+| 真实域名本身 | `data/scope.json` 等已脱敏为 `example.com`；该文件**不入库**（见 `.gitignore`），本机使用时由使用者自行填写 |
+
+⇒ **回归验证请用上表的 `test_*.py` 系列**（改 `data/kb/` 另跑 `python test_068_kb_whitebox_docs.py`）。
+若看到「跑 `test_jiaoyu.py` 回归」「先读 `SESSION_HISTORY_SUMMARY.md`」这类说法，
+那是**脱敏前的旧流程**，**以本节为准**。
+
 ## 已知限制
 
 1. **ENScan 需要过验证码** —— 爱企查数据源会要求浏览器验证，未验证时工具会重试报错。
